@@ -51,6 +51,42 @@ export interface EventPage {
   limit: number;
 }
 
+/** Opaque cursor token for cursor-based pagination. */
+export type PageCursor = string;
+
+/** Maximum number of items returned per page (capped at 100). */
+export type PageLimit = number;
+
+/** Maximum allowed page size for paginated queries. */
+export const MAX_PAGE_LIMIT = 100;
+
+/** Status of a SupTech rule. */
+export enum RuleStatus {
+  Active = 'Active',
+  Inactive = 'Inactive',
+  Pending = 'Pending',
+  Suspended = 'Suspended',
+}
+
+/** Multi-predicate filter for SupTech rule queries. */
+export interface RuleQueryFilter {
+  /** Inclusive lower bound on ledger timestamp. */
+  ledger_timestamp_min?: number;
+  /** Inclusive upper bound on ledger timestamp. */
+  ledger_timestamp_max?: number;
+  /** Restrict results to a single rule status. */
+  status?: RuleStatus;
+  /** Restrict results to a single submitter address. */
+  submitter?: string;
+}
+
+/** A single page of SupTech rule query results. */
+export interface RulePage {
+  items: Event[];
+  /** Cursor to pass to the next query, or null when the end has been reached. */
+  next_cursor: PageCursor | null;
+}
+
 export interface CacheStats {
   hits: number;
   misses: number;

@@ -14,6 +14,10 @@ pub enum RbacError {
     InsufficientRole = 403,
     CannotRevokeLastAdmin = 409,
     InvalidRoleAssignment = 422,
+    /// The submitter DID has been suspended and may not mutate state.
+    SubmitterSuspended = 423,
+    /// The caller DID is not authorized to perform the requested mutation.
+    UnauthorizedSubmitter = 424,
 }
 
 #[contracttype]
@@ -34,6 +38,8 @@ pub enum Role {
 pub enum RbacStorageKey {
     Role(Address),
     AdminCount,
+    /// Marks a submitter DID as suspended, blocking all state mutations.
+    Suspended(Address),
 }
 
 pub struct RbacManager;
@@ -114,5 +120,87 @@ impl RbacManager {
         env.storage()
             .persistent()
             .set(&RbacStorageKey::AdminCount, &1u32);
+    }
+
+    /// Marks a submitter DID as suspended. Caller must have Admin role.
+    ///
+    /// Suspended submitters are rejected by [`Self::require_active_submitter`]
+    /// with the stable [`RbacError::SubmitterSuspended`] code.
+    pub fn suspend_submitter(
+        env: &Env,
+        caller: &Address,
+        target: &Address,
+    ) -> Result<(), RbacError> {
+        caller.require_auth();
+
+        if !Self::has_role_min(env, caller, Role::Admin) {
+            return Err(RbacError::InsufficientRole);
+        }
+
+        let key = RbacStorageKey::Suspended(target.clone());
+        env.storage().persistent().set(&key, &true);
+
+        Ok(())
+    }
+
+    /// Clears the suspension flag for a submitter DID. Caller must have Admin role.
+    pub fn reinstate_submitter(
+        env: &Env,
+        caller: &Address,
+        target: &Address,
+    ) -> Result<(), RbacError> {
+        caller.require_auth();
+
+        if !Self::has_role_min(env, caller, Role::Admin) {
+            return Err(RbacError::InsufficientRole);
+        }
+
+        let key = RbacStorageKey::Suspended(target.clone());
+        env.storage().persistent().remove(&key);
+
+        Ok(())
+    }
+
+    /// Returns `true` if the given submitter DID is currently suspended.
+    pub fn is_suspended(env: &Env, address: &Address) -> bool {
+        let key = RbacStorageKey::Suspended(address.clone());
+        env.storage().persistent().get(&key).unwrap_or(false)
+    }
+
+    /// Enforces that the caller is authenticated, holds at least `min_role`,
+    /// and is not a suspended submitter DID.
+    ///
+    /// Returns stable RBAC error codes:
+    /// - [`RbacError::InsufficientRole`] when the role hierarchy check fails
+    /// - [`RbacError::SubmitterSuspended`] when the DID is suspended
+    pub fn require_active_role_min(
+        env: &Env,
+        address: &Address,
+        min_role: Role,
+    ) -> Result<(), RbacError> {
+        address.require_auth();
+
+        if Self::is_suspended(env, address) {
+            return Err(RbacError::SubmitterSuspended);
+        }
+
+        Self::require_role_min(env, address, min_role)
+    }
+
+    /// Enforces that the caller is an authenticated, non-suspended submitter
+    /// (or higher) DID, returning [`RbacError::UnauthorizedSubmitter`] when the
+    /// caller holds no qualifying role at all.
+    pub fn require_active_submitter(env: &Env, address: &Address) -> Result<(), RbacError> {
+        address.require_auth();
+
+        if Self::is_suspended(env, address) {
+            return Err(RbacError::SubmitterSuspended);
+        }
+
+        if Self::get_role(env, address).is_none() {
+            return Err(RbacError::UnauthorizedSubmitter);
+        }
+
+        Self::require_role_min(env, address, Role::Submitter)
     }
 }

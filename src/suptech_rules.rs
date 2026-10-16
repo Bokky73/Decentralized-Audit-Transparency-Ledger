@@ -4,6 +4,187 @@ use crate::suptech_types::{SupervisionRule, ComplianceAlert, AlertStatus, Regula
 use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, Vec};
 use soroban_sdk::xdr::ToXdr;
 
+/// Hard cap on the number of items returned in a single page.
+pub const MAX_PAGE_LIMIT: u32 = 100;
+
+/// Cursor token used for deterministic cursor-based pagination.
+///
+/// The cursor encodes the composite sort key `(ledger_sequence, id)` of the
+/// last item returned on the previous page. Ordering on this composite key is
+/// stable across ledger upgrades and archival restores, so traversal is
+/// reproducible.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PageCursor {
+    /// Ledger sequence of the last returned item.
+    pub ledger_sequence: u32,
+    /// Tie-breaking identifier of the last returned item.
+    pub id: BytesN<32>,
+}
+
+/// Requested page size, capped at [`MAX_PAGE_LIMIT`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PageLimit {
+    /// Requested number of items.
+    pub limit: u32,
+}
+
+impl PageLimit {
+    /// Construct a page limit, rejecting zero and clamping to the hard cap.
+    pub fn new(limit: u32) -> Result<Self, &'static str> {
+        if limit == 0 {
+            return Err("Page limit must be greater than zero");
+        }
+        Ok(Self {
+            limit: if limit > MAX_PAGE_LIMIT {
+                MAX_PAGE_LIMIT
+            } else {
+                limit
+            },
+        })
+    }
+
+    /// Effective (capped) limit.
+    pub fn effective(&self) -> u32 {
+        if self.limit > MAX_PAGE_LIMIT {
+            MAX_PAGE_LIMIT
+        } else {
+            self.limit
+        }
+    }
+}
+
+/// Multi-predicate filter for rule/log collection queries.
+///
+/// All predicates are optional; `None` means "no constraint". When several
+/// predicates are supplied they are combined with logical AND.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuleQueryFilter {
+    /// Inclusive lower bound on ledger timestamp.
+    pub min_timestamp: Option<u64>,
+    /// Inclusive upper bound on ledger timestamp.
+    pub max_timestamp: Option<u64>,
+    /// Required alert status (when filtering alerts).
+    pub status: Option<u32>,
+    /// Required submitter / subject address.
+    pub submitter: Option<Address>,
+}
+
+impl RuleQueryFilter {
+    /// Empty filter matching every item.
+    pub fn none() -> Self {
+        Self {
+            min_timestamp: None,
+            max_timestamp: None,
+            status: None,
+            submitter: None,
+        }
+    }
+
+    /// Validate the filter, returning a typed error for invalid ranges.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if let (Some(min), Some(max)) = (self.min_timestamp, self.max_timestamp) {
+            if min > max {
+                return Err("Invalid timestamp range: min exceeds max");
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns true when `timestamp` satisfies the timestamp predicates.
+    pub fn matches_timestamp(&self, timestamp: u64) -> bool {
+        if let Some(min) = self.min_timestamp {
+            if timestamp < min {
+                return false;
+            }
+        }
+        if let Some(max) = self.max_timestamp {
+            if timestamp > max {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Returns true when `status` satisfies the status predicate.
+    pub fn matches_status(&self, status: u32) -> bool {
+        match self.status {
+            Some(required) => required == status,
+            None => true,
+        }
+    }
+
+    /// Returns true when `submitter` satisfies the submitter predicate.
+    pub fn matches_submitter(&self, submitter: &Address) -> bool {
+        match &self.submitter {
+            Some(required) => required == submitter,
+            None => true,
+        }
+    }
+}
+
+/// A page of results plus the cursor for the next page.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuleExecutionLogPage {
+    /// Items in this page, deterministically ordered.
+    pub items: Vec<RuleExecutionLog>,
+    /// Cursor to pass to the next call, or `None` when exhausted.
+    pub next_cursor: Option<PageCursor>,
+}
+
+/// A page of alert results plus the cursor for the next page.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComplianceAlertPage {
+    /// Items in this page, deterministically ordered.
+    pub items: Vec<ComplianceAlert>,
+    /// Cursor to pass to the next call, or `None` when exhausted.
+    pub next_cursor: Option<PageCursor>,
+}
+
+/// A page of rule results plus the cursor for the next page.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SupervisionRulePage {
+    /// Items in this page, deterministically ordered.
+    pub items: Vec<SupervisionRule>,
+    /// Cursor to pass to the next call, or `None` when exhausted.
+    pub next_cursor: Option<PageCursor>,
+}
+
+/// Compare two composite sort keys `(ledger_sequence, id)`.
+///
+/// Returns `Ordering::Less` when `a` sorts before `b`. Ordering is total and
+/// deterministic, which keeps pagination stable across ledger upgrades and
+/// archival restores.
+fn compare_keys(a: &(u32, BytesN<32>), b: &(u32, BytesN<32>)) -> core::cmp::Ordering {
+    match a.0.cmp(&b.0) {
+        core::cmp::Ordering::Equal => a.1.to_array().cmp(&b.1.to_array()),
+        other => other,
+    }
+}
+
+/// Returns true when `key` sorts strictly after `cursor`.
+fn key_after_cursor(key: &(u32, BytesN<32>), cursor: &PageCursor) -> bool {
+    compare_keys(key, &(cursor.ledger_sequence, cursor.id.clone()))
+        == core::cmp::Ordering::Greater
+}
+
+/// Build the next cursor from the last item of a full page.
+fn next_cursor_for(key: &(u32, BytesN<32>), page_len: u32, limit: u32) -> Option<PageCursor> {
+    if page_len < limit {
+        None
+    } else {
+        Some(PageCursor {
+            ledger_sequence: key.0,
+            id: key.1.clone(),
+        })
+    }
+}
+
 /// Rule evaluation result.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -306,6 +487,168 @@ impl RulesEngine {
         Ok(evaluations)
     }
 
+    /// Paginated, filtered query over rule execution logs.
+    ///
+    /// Results are ordered by the composite key `(ledger_sequence, log_id)`
+    /// which is stable across ledger upgrades and archival restores. Returns
+    /// the page items and a `next_cursor` token, or `None` when exhausted.
+    pub fn query_execution_logs(
+        env: &Env,
+        logs: &Vec<RuleExecutionLog>,
+        filter: &RuleQueryFilter,
+        cursor: &Option<PageCursor>,
+        limit: &PageLimit,
+    ) -> Result<RuleExecutionLogPage, &'static str> {
+        filter.validate()?;
+        let effective = limit.effective();
+
+        // Collect matching keys and sort deterministically.
+        let mut keys: Vec<(u32, BytesN<32>)> = Vec::new(env);
+        for log in logs.iter() {
+            if !filter.matches_timestamp(log.executed_at) {
+                continue;
+            }
+            if !filter.matches_submitter(&log.subject) {
+                continue;
+            }
+            keys.push_back((log.executed_at as u32, log.log_id.clone()));
+        }
+        sort_keys(&mut keys);
+
+        let mut items = Vec::new(env);
+        let mut last_key: Option<(u32, BytesN<32>)> = None;
+        let mut page_len = 0u32;
+
+        for key in keys.iter() {
+            if let Some(c) = cursor {
+                if !key_after_cursor(&key, c) {
+                    continue;
+                }
+            }
+            if page_len >= effective {
+                break;
+            }
+            if let Some(log) = find_log(logs, &key.1) {
+                items.push_back(log);
+                last_key = Some(key.clone());
+                page_len += 1;
+            }
+        }
+
+        let next_cursor = match last_key {
+            Some(k) => next_cursor_for(&k, page_len, effective),
+            None => None,
+        };
+
+        Ok(RuleExecutionLogPage { items, next_cursor })
+    }
+
+    /// Paginated, filtered query over compliance alerts.
+    ///
+    /// Results are ordered by the composite key `(ledger_sequence, alert_id)`.
+    pub fn query_alerts(
+        env: &Env,
+        alerts: &Vec<ComplianceAlert>,
+        filter: &RuleQueryFilter,
+        cursor: &Option<PageCursor>,
+        limit: &PageLimit,
+    ) -> Result<ComplianceAlertPage, &'static str> {
+        filter.validate()?;
+        let effective = limit.effective();
+
+        let mut keys: Vec<(u32, BytesN<32>)> = Vec::new(env);
+        for alert in alerts.iter() {
+            if !filter.matches_timestamp(alert.triggered_at) {
+                continue;
+            }
+            if !filter.matches_status(alert.status) {
+                continue;
+            }
+            if !filter.matches_submitter(&alert.institution) {
+                continue;
+            }
+            keys.push_back((alert.triggered_at as u32, alert.alert_id.clone()));
+        }
+        sort_keys(&mut keys);
+
+        let mut items = Vec::new(env);
+        let mut last_key: Option<(u32, BytesN<32>)> = None;
+        let mut page_len = 0u32;
+
+        for key in keys.iter() {
+            if let Some(c) = cursor {
+                if !key_after_cursor(&key, c) {
+                    continue;
+                }
+            }
+            if page_len >= effective {
+                break;
+            }
+            if let Some(alert) = find_alert(alerts, &key.1) {
+                items.push_back(alert);
+                last_key = Some(key.clone());
+                page_len += 1;
+            }
+        }
+
+        let next_cursor = match last_key {
+            Some(k) => next_cursor_for(&k, page_len, effective),
+            None => None,
+        };
+
+        Ok(ComplianceAlertPage { items, next_cursor })
+    }
+
+    /// Paginated, filtered query over supervision rules.
+    ///
+    /// Results are ordered by the composite key `(ledger_sequence, rule_id)`.
+    pub fn query_rules(
+        env: &Env,
+        rules: &Vec<SupervisionRule>,
+        filter: &RuleQueryFilter,
+        cursor: &Option<PageCursor>,
+        limit: &PageLimit,
+    ) -> Result<SupervisionRulePage, &'static str> {
+        filter.validate()?;
+        let effective = limit.effective();
+
+        let mut keys: Vec<(u32, BytesN<32>)> = Vec::new(env);
+        for rule in rules.iter() {
+            if !filter.matches_timestamp(rule.created_at) {
+                continue;
+            }
+            keys.push_back((rule.created_at as u32, rule.rule_id.clone()));
+        }
+        sort_keys(&mut keys);
+
+        let mut items = Vec::new(env);
+        let mut last_key: Option<(u32, BytesN<32>)> = None;
+        let mut page_len = 0u32;
+
+        for key in keys.iter() {
+            if let Some(c) = cursor {
+                if !key_after_cursor(&key, c) {
+                    continue;
+                }
+            }
+            if page_len >= effective {
+                break;
+            }
+            if let Some(rule) = find_rule(rules, &key.1) {
+                items.push_back(rule);
+                last_key = Some(key.clone());
+                page_len += 1;
+            }
+        }
+
+        let next_cursor = match last_key {
+            Some(k) => next_cursor_for(&k, page_len, effective),
+            None => None,
+        };
+
+        Ok(SupervisionRulePage { items, next_cursor })
+    }
+
     /// Get rule statistics
     pub fn compute_ruleset_stats(
         ruleset: &RuleSet,
@@ -333,6 +676,63 @@ impl RulesEngine {
             version: ruleset.version,
         }
     }
+}
+
+/// Deterministic in-place insertion sort over composite keys.
+///
+/// A simple, allocation-free sort keeps the CPU/memory footprint well within
+/// Soroban single-invocation limits for the capped page sizes used here.
+fn sort_keys(keys: &mut Vec<(u32, BytesN<32>)>) {
+    let len = keys.len();
+    if len < 2 {
+        return;
+    }
+    let mut i = 1u32;
+    while i < len {
+        let mut j = i;
+        while j > 0 {
+            let prev = keys.get(j - 1).unwrap();
+            let cur = keys.get(j).unwrap();
+            if compare_keys(&prev, &cur) == core::cmp::Ordering::Greater {
+                keys.set(j - 1, cur);
+                keys.set(j, prev);
+                j -= 1;
+            } else {
+                break;
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Locate a log by id.
+fn find_log(logs: &Vec<RuleExecutionLog>, id: &BytesN<32>) -> Option<RuleExecutionLog> {
+    for log in logs.iter() {
+        if log.log_id == *id {
+            return Some(log);
+        }
+    }
+    None
+}
+
+/// Locate an alert by id.
+fn find_alert(alerts: &Vec<ComplianceAlert>, id: &BytesN<32>) -> Option<ComplianceAlert> {
+    for alert in alerts.iter() {
+        if alert.alert_id == *id {
+            return Some(alert);
+        }
+    }
+    None
+}
+
+/// Locate a rule by id.
+fn find_rule(rules: &Vec<SupervisionRule>, id: &BytesN<32>) -> Option<SupervisionRule> {
+    for rule in rules.iter() {
+        if rule.rule_id == *id {
+            return Some(rule);
+        }
+    }
+    None
 }
 
 /// Rule set statistics.
@@ -434,5 +834,147 @@ mod tests {
         assert!(ruleset.is_active);
         assert_eq!(ruleset.version, 1);
         assert_eq!(ruleset.rules.len(), 0);
+    }
+
+    fn make_log(env: &Env, seed: u8, executed_at: u64) -> RuleExecutionLog {
+        let mut id = [0u8; 32];
+        id[0] = seed;
+        RuleExecutionLog {
+            log_id: BytesN::from_array(env, &id),
+            rule_id: BytesN::from_array(env, &[1u8; 32]),
+            subject: Address::generate(env),
+            executed_at,
+            trigger_count: 1,
+            max_alert_severity: 3,
+        }
+    }
+
+    #[test]
+    fn test_page_limit_cap() {
+        assert!(PageLimit::new(0).is_err());
+        assert_eq!(PageLimit::new(5).unwrap().effective(), 5);
+        assert_eq!(PageLimit::new(1000).unwrap().effective(), MAX_PAGE_LIMIT);
+    }
+
+    #[test]
+    fn test_filter_validation() {
+        let env = soroban_sdk::Env::default();
+        let bad = RuleQueryFilter {
+            min_timestamp: Some(10),
+            max_timestamp: Some(5),
+            status: None,
+            submitter: None,
+        };
+        let logs: Vec<RuleExecutionLog> = Vec::new(&env);
+        let res = RulesEngine::query_execution_logs(
+            &env,
+            &logs,
+            &bad,
+            &None,
+            &PageLimit::new(10).unwrap(),
+        );
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_pagination_empty_results() {
+        let env = soroban_sdk::Env::default();
+        let logs: Vec<RuleExecutionLog> = Vec::new(&env);
+        let page = RulesEngine::query_execution_logs(
+            &env,
+            &logs,
+            &RuleQueryFilter::none(),
+            &None,
+            &PageLimit::new(10).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(page.items.len(), 0);
+        assert!(page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn test_pagination_single_item_pages() {
+        let env = soroban_sdk::Env::default();
+        let mut logs: Vec<RuleExecutionLog> = Vec::new(&env);
+        logs.push_back(make_log(&env, 3, 30));
+        logs.push_back(make_log(&env, 1, 10));
+        logs.push_back(make_log(&env, 2, 20));
+
+        let limit = PageLimit::new(1).unwrap();
+        let mut cursor: Option<PageCursor> = None;
+        let mut seen = 0u32;
+        let mut last_seq = 0u32;
+
+        loop {
+            let page = RulesEngine::query_execution_logs(
+                &env,
+                &logs,
+                &RuleQueryFilter::none(),
+                &cursor,
+                &limit,
+            )
+            .unwrap();
+            if page.items.len() == 0 {
+                break;
+            }
+            for item in page.items.iter() {
+                assert!(item.executed_at as u32 >= last_seq);
+                last_seq = item.executed_at as u32;
+                seen += 1;
+            }
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(seen, 3);
+    }
+
+    #[test]
+    fn test_pagination_cursor_past_end() {
+        let env = soroban_sdk::Env::default();
+        let mut logs: Vec<RuleExecutionLog> = Vec::new(&env);
+        logs.push_back(make_log(&env, 1, 10));
+
+        let past = PageCursor {
+            ledger_sequence: 999,
+            id: BytesN::from_array(&env, &[9u8; 32]),
+        };
+        let page = RulesEngine::query_execution_logs(
+            &env,
+            &logs,
+            &RuleQueryFilter::none(),
+            &Some(past),
+            &PageLimit::new(10).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(page.items.len(), 0);
+        assert!(page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn test_filter_by_timestamp_range() {
+        let env = soroban_sdk::Env::default();
+        let mut logs: Vec<RuleExecutionLog> = Vec::new(&env);
+        logs.push_back(make_log(&env, 1, 10));
+        logs.push_back(make_log(&env, 2, 20));
+        logs.push_back(make_log(&env, 3, 30));
+
+        let filter = RuleQueryFilter {
+            min_timestamp: Some(15),
+            max_timestamp: Some(25),
+            status: None,
+            submitter: None,
+        };
+        let page = RulesEngine::query_execution_logs(
+            &env,
+            &logs,
+            &filter,
+            &None,
+            &PageLimit::new(10).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items.get(0).unwrap().executed_at, 20);
     }
 }

@@ -21,6 +21,63 @@ from pathlib import Path
 
 TOMBSTONE_KEYWORDS = ("tombstone", "replaced by", "deprecated")
 
+# Storage tier classification keywords. These map a variant's doc comment to a
+# Soroban storage tier so the snapshot can pin the retention SLA of each key.
+TIER_KEYWORDS = {
+    "persistent": ("persistent", "archival", "audit", "settlement", "iso20022", "iso-20022"),
+    "temporary": ("temporary", "temp", "ephemeral", "nonce", "cache"),
+    "instance": ("instance", "config", "admin", "governance", "rbac"),
+}
+
+# Approximate XDR byte cost per primitive type. Used to compute a packed
+# serialized-size estimate for each variant so regressions are caught in CI.
+XDR_TYPE_SIZES = {
+    "u8": 4,
+    "i8": 4,
+    "u16": 4,
+    "i16": 4,
+    "u32": 4,
+    "i32": 4,
+    "u64": 8,
+    "i64": 8,
+    "u128": 16,
+    "i128": 16,
+    "u256": 32,
+    "i256": 32,
+    "bool": 4,
+    "Address": 32,
+    "Bytes": 4,
+    "BytesN": 32,
+    "Symbol": 4,
+    "String": 4,
+    "Vec": 4,
+    "Map": 4,
+}
+
+# XDR enum discriminant width for the DataKey enum.
+ENUM_DISCRIMINANT_BYTES = 4
+
+
+def classify_tier(comment: str, name: str) -> str:
+    """Classify a storage key into a Soroban storage tier from its doc comment."""
+    haystack = f"{comment} {name}".lower()
+    for tier, keywords in TIER_KEYWORDS.items():
+        if any(kw in haystack for kw in keywords):
+            return tier
+    return "persistent"
+
+
+def estimate_xdr_size(fields: list) -> int:
+    """Estimate the packed XDR serialized byte size of a variant's payload."""
+    total = ENUM_DISCRIMINANT_BYTES
+    for field in fields:
+        ftype = (field.get("type") or "").strip()
+        # Strip generic parameters and references to get the base type name.
+        base = re.split(r"[<(\[]", ftype, maxsplit=1)[0].strip()
+        base = base.lstrip("&").strip()
+        total += XDR_TYPE_SIZES.get(base, 4)
+    return total
+
 
 def get_git_commit() -> str:
     """Return the current HEAD SHA, or 'unknown' on failure."""
@@ -228,6 +285,8 @@ def parse_variants(block: str) -> list:
                 "fields": fields,
                 "tombstone": tombstone,
                 "comment": comment,
+                "tier": classify_tier(comment, name),
+                "xdr_size_bytes": estimate_xdr_size(fields),
             })
             ordinal += 1
             i = j
@@ -246,6 +305,8 @@ def parse_variants(block: str) -> list:
                 "fields": fields,
                 "tombstone": tombstone,
                 "comment": comment,
+                "tier": classify_tier(comment, name),
+                "xdr_size_bytes": estimate_xdr_size(fields),
             })
             ordinal += 1
             i = j
@@ -262,6 +323,8 @@ def parse_variants(block: str) -> list:
                 "fields": [],
                 "tombstone": tombstone,
                 "comment": comment,
+                "tier": classify_tier(comment, name),
+                "xdr_size_bytes": estimate_xdr_size([]),
             })
             ordinal += 1
             i = j
@@ -316,13 +379,24 @@ def main() -> int:
 
     tombstone_count = sum(1 for v in variants if v["tombstone"])
 
+    # Aggregate storage tier and XDR footprint statistics so the snapshot can
+    # pin byte budgets for the tiered storage classification.
+    tier_counts = {"persistent": 0, "temporary": 0, "instance": 0}
+    total_xdr_bytes = 0
+    for v in variants:
+        tier = v.get("tier", "persistent")
+        tier_counts[tier] = tier_counts.get(tier, 0) + 1
+        total_xdr_bytes += v.get("xdr_size_bytes", 0)
+
     # Build snapshot
     snapshot = {
-        "version": 1,
+        "version": 2,
         "contract": args.contract,
         "generated_at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "git_commit": get_git_commit(),
         "rust_toolchain": get_rust_toolchain(),
+        "tier_counts": tier_counts,
+        "total_xdr_size_bytes": total_xdr_bytes,
         "variants": variants,
     }
 
@@ -338,6 +412,13 @@ def main() -> int:
     print(
         f"Extracted {len(variants)} variants ({tombstone_count} tombstones) → {output_path}"
     )
+    print(
+        "Storage tiers: "
+        f"persistent={tier_counts['persistent']} "
+        f"temporary={tier_counts['temporary']} "
+        f"instance={tier_counts['instance']}"
+    )
+    print(f"Total estimated XDR size: {total_xdr_bytes} bytes")
     return 0
 
 

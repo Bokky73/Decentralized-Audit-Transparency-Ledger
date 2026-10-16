@@ -12,7 +12,11 @@ pub const LAYOUT_SNAPSHOT_JSON: &str =
 pub const LAYOUT_SCHEMA_VERSION: u32 = 1;
 
 /// Total number of DataKey variants in the current layout (including tombstones).
-pub const DATAKEY_VARIANT_COUNT: u32 = 79; // update when variants are added
+///
+/// Bumped to account for the reordered/packed CBDC interop storage keys
+/// (persistent/temporary/instance tier classification and packed composite
+/// struct fields) introduced for the archival-rent optimization.
+pub const DATAKEY_VARIANT_COUNT: u32 = 87; // update when variants are added
 
 #[cfg(test)]
 mod tests {
@@ -87,6 +91,11 @@ mod tests {
             "\"ContractVersion\"",
             "\"PauseConfig\"",
             "\"WebhookRegistrations\"",
+            "\"CbdcInteropState\"",
+            "\"CbdcSettlementRecord\"",
+            "\"CbdcMessageBridge\"",
+            "\"CbdcAuditRecord\"",
+            "\"CbdcTtlPolicy\"",
         ];
         for name in &must_contain {
             assert!(

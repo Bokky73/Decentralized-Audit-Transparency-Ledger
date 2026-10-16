@@ -8,6 +8,50 @@ import { BatchSigner } from './batch-signing';
 /** Transport function type: sends a Soroban RPC method call and returns the result. */
 export type Transport = (method: string, params: unknown[]) => Promise<unknown>;
 
+/** Maximum number of items a single paginated query may return. */
+export const MAX_PAGE_SIZE = 100;
+
+/**
+ * Opaque cursor token for cursor-based pagination. `null`/`undefined` means
+ * "start from the beginning"; the value returned as `next_cursor` should be
+ * passed back verbatim to fetch the following page.
+ */
+export type PageCursor = string | null;
+
+/** Requested page size. Clamped to `[1, MAX_PAGE_SIZE]` by the client. */
+export type PageLimit = number;
+
+/** Status of a SupTech rule. */
+export type RuleStatus = 'Active' | 'Inactive' | 'Suspended' | 'Archived';
+
+/** Multi-predicate filter for SupTech rule queries. */
+export interface RuleQueryFilter {
+  /** Inclusive lower bound on the ledger timestamp. */
+  startTimestamp?: number;
+  /** Inclusive upper bound on the ledger timestamp. */
+  endTimestamp?: number;
+  /** Restrict results to a single rule status. */
+  status?: RuleStatus;
+  /** Restrict results to rules submitted by this address. */
+  submitter?: string;
+}
+
+/** A single SupTech rule record. */
+export interface Rule {
+  id: string;
+  status: RuleStatus;
+  submitter: string;
+  timestamp: number;
+  [key: string]: unknown;
+}
+
+/** A single page of SupTech rule query results. */
+export interface RulePage {
+  items: Rule[];
+  /** Token to pass as `cursor` for the next page, or `null` when exhausted. */
+  next_cursor: PageCursor;
+}
+
 export interface RetryOptions {
   maxRetries?: number;
   baseDelayMs?: number;
@@ -202,7 +246,7 @@ export class AuditLedgerClient {
 
   async getEvents(offset = 0, limit = 50, cursor?: number): Promise<EventPage> {
     const start = cursor !== undefined ? Math.max(cursor, 0) : Math.max(offset, 0);
-    const safeLimit = Math.max(1, Math.min(limit, this.maxPageSize));
+    const safeLimit = Math.max(1, Math.min(limit, this.maxPageSize, MAX_PAGE_SIZE));
     const total = await this.totalEvents();
     const end = Math.min(start + safeLimit, total);
     const items: Event[] = [];
@@ -289,6 +333,82 @@ export class AuditLedgerClient {
 
   async getEventByOrder(order: number): Promise<Event> {
     return this.callTransport('get_event_by_order', [order]);
+  }
+
+  // ── SupTech rules: cursor-based pagination (#832) ───────────────────────
+
+  /** Clamp a requested page limit into `[1, MAX_PAGE_SIZE]`. */
+  private clampPageLimit(limit?: PageLimit): number {
+    if (limit === undefined || !Number.isFinite(limit)) return MAX_PAGE_SIZE;
+    return Math.max(1, Math.min(Math.floor(limit), MAX_PAGE_SIZE));
+  }
+
+  /**
+   * Query SupTech rules with multi-predicate filtering and deterministic
+   * cursor-based pagination. The returned `next_cursor` is `null` when the
+   * last page has been reached.
+   */
+  async queryRules(
+    filter: RuleQueryFilter = {},
+    cursor: PageCursor = null,
+    limit: PageLimit = MAX_PAGE_SIZE,
+  ): Promise<RulePage> {
+    const safeLimit = this.clampPageLimit(limit);
+    const result = await this.callTransport<RulePage>('query_rules', [
+      filter,
+      cursor,
+      safeLimit,
+    ]);
+    return {
+      items: result?.items ?? [],
+      next_cursor: result?.next_cursor ?? null,
+    };
+  }
+
+  /** Paginated query of rules filtered by ledger timestamp range. */
+  async queryRulesByTimeRange(
+    startTimestamp: number,
+    endTimestamp: number,
+    cursor: PageCursor = null,
+    limit: PageLimit = MAX_PAGE_SIZE,
+  ): Promise<RulePage> {
+    return this.queryRules({ startTimestamp, endTimestamp }, cursor, limit);
+  }
+
+  /** Paginated query of rules filtered by status. */
+  async queryRulesByStatus(
+    status: RuleStatus,
+    cursor: PageCursor = null,
+    limit: PageLimit = MAX_PAGE_SIZE,
+  ): Promise<RulePage> {
+    return this.queryRules({ status }, cursor, limit);
+  }
+
+  /** Paginated query of rules filtered by submitter address. */
+  async queryRulesBySubmitter(
+    submitter: string,
+    cursor: PageCursor = null,
+    limit: PageLimit = MAX_PAGE_SIZE,
+  ): Promise<RulePage> {
+    return this.queryRules({ submitter }, cursor, limit);
+  }
+
+  /**
+   * Iterate every rule matching `filter`, transparently following cursors.
+   * Yields individual rules and stops when the cursor is exhausted.
+   */
+  async *streamRules(
+    filter: RuleQueryFilter = {},
+    limit: PageLimit = MAX_PAGE_SIZE,
+  ): AsyncGenerator<Rule> {
+    const pageSize = this.clampPageLimit(limit);
+    let cursor: PageCursor = null;
+    for (;;) {
+      const page = await this.queryRules(filter, cursor, pageSize);
+      for (const rule of page.items) yield rule;
+      if (page.next_cursor === null || page.items.length === 0) return;
+      cursor = page.next_cursor;
+    }
   }
 
   async listEvents(offset: number, limit: number): Promise<Event[]> {
