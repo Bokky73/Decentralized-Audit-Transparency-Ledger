@@ -252,6 +252,178 @@ proptest! {
         assert_eq!(total, sum, "total_events should remain consistent after governance operations");
     }
 
+    // ── Supply chain invariant tests (issue #873) ────────────────────────────
+
+    #[test]
+    fn prop_supply_chain_custody_continuity(events in capped_event_sequence_strategy()) {
+        let (env, _owner, client) = create_ledger();
+        let mut current_timestamp: u64 = 1000;
+
+        for (event_type, metadata, delta) in events.into_iter() {
+            current_timestamp = current_timestamp.saturating_add(delta.min(MAX_TIMESTAMP_DRIFT_SECONDS));
+            env.ledger().set_timestamp(current_timestamp);
+            let _ = client.try_log_event(
+                &Address::generate(&env),
+                &symbol(&env, &event_type),
+                &bytes(&env, &metadata),
+                &None, &None, &false,
+            );
+        }
+
+        let total = client.total_events();
+        let mut prev_ts = 0u64;
+        for i in 0..total {
+            let evt = client.get_event_by_order(&i);
+            assert_eq!(evt.index, i, "custody handoff index must be contiguous");
+            assert!(evt.timestamp >= prev_ts, "custody timestamps must be monotonic");
+            prev_ts = evt.timestamp;
+            if i > 0 {
+                let prev = client.get_event_by_order(&(i - 1));
+                assert_eq!(
+                    evt.prev_hash, prev.event_hash,
+                    "custody handoff[{i}] must link to previous handoff"
+                );
+            }
+        }
+        assert!(client.verify_integrity(), "custody chain must verify after handoffs");
+    }
+
+    #[test]
+    fn prop_supply_chain_duplicate_submissions_are_idempotent(events in capped_event_sequence_strategy()) {
+        let (env, _owner, client) = create_ledger();
+        let mut current_timestamp: u64 = 1000;
+
+        for (event_type, metadata, delta) in events.into_iter() {
+            current_timestamp = current_timestamp.saturating_add(delta.min(MAX_TIMESTAMP_DRIFT_SECONDS));
+            env.ledger().set_timestamp(current_timestamp);
+            let actor = Address::generate(&env);
+            let _ = client.try_log_event(
+                &actor,
+                &symbol(&env, &event_type),
+                &bytes(&env, &metadata),
+                &None, &None, &false,
+            );
+            // Duplicate submission of the same payload must not corrupt state.
+            let _ = client.try_log_event(
+                &actor,
+                &symbol(&env, &event_type),
+                &bytes(&env, &metadata),
+                &None, &None, &false,
+            );
+        }
+
+        let total = client.total_events();
+        let mut prev_ts = 0u64;
+        for i in 0..total {
+            let evt = client.get_event_by_order(&i);
+            assert_eq!(evt.index, i, "duplicate submissions must not break indexing");
+            assert!(evt.timestamp >= prev_ts, "duplicate submissions must not reorder timestamps");
+            prev_ts = evt.timestamp;
+        }
+        assert!(client.verify_integrity(), "chain must stay valid under duplicate submissions");
+    }
+
+    #[test]
+    fn prop_supply_chain_out_of_order_timestamps_are_normalized(events in capped_event_sequence_strategy()) {
+        let (env, _owner, client) = create_ledger();
+        let mut current_timestamp: u64 = 1000;
+
+        for (event_type, metadata, delta) in events.into_iter() {
+            // Simulate out-of-order submissions by occasionally rewinding the clock.
+            if delta % 2 == 0 {
+                current_timestamp = current_timestamp.saturating_sub(delta.min(MAX_TIMESTAMP_DRIFT_SECONDS));
+            } else {
+                current_timestamp = current_timestamp.saturating_add(delta.min(MAX_TIMESTAMP_DRIFT_SECONDS));
+            }
+            env.ledger().set_timestamp(current_timestamp);
+            let _ = client.try_log_event(
+                &Address::generate(&env),
+                &symbol(&env, &event_type),
+                &bytes(&env, &metadata),
+                &None, &None, &false,
+            );
+        }
+
+        let total = client.total_events();
+        let mut prev_ts = 0u64;
+        for i in 0..total {
+            let evt = client.get_event_by_order(&i);
+            assert!(evt.timestamp >= prev_ts, "stored timestamps must be non-decreasing");
+            prev_ts = evt.timestamp;
+        }
+        assert!(client.verify_integrity(), "chain must stay valid under reordered timestamps");
+    }
+
+    #[test]
+    fn prop_supply_chain_mid_batch_rollback_preserves_invariants(ops in random_event_sequence_strategy()) {
+        let (env, owner, client) = create_ledger();
+        run_random_sequence(&env, &owner, &client, &ops);
+
+        let total = client.total_events();
+        let mut prev_ts = 0u64;
+        let mut seen_types: Vec<String> = Vec::new();
+        for i in 0..total {
+            let evt = client.get_event_by_order(&i);
+            assert_eq!(evt.index, i, "rollback must not leave gaps in the chain");
+            assert!(evt.timestamp >= prev_ts, "rollback must not reorder timestamps");
+            prev_ts = evt.timestamp;
+            if !seen_types.iter().any(|v| v == evt.event_type.as_str()) {
+                seen_types.push(evt.event_type.as_str().to_string());
+            }
+        }
+
+        let mut sum = 0u32;
+        for event_type in seen_types.iter() {
+            sum = sum.saturating_add(client.event_count(&symbol(&env, event_type)));
+        }
+        assert_eq!(total, sum, "counts must remain consistent after mid-batch rollback");
+        assert!(client.verify_integrity(), "chain must verify after mid-batch rollback");
+    }
+
+    #[test]
+    fn prop_supply_chain_merkle_and_hash_chain_integrity_after_recovery(events in capped_event_sequence_strategy()) {
+        let (env, owner, client) = create_ledger();
+        let mut current_timestamp: u64 = 1000;
+
+        for (event_type, metadata, delta) in events.into_iter() {
+            current_timestamp = current_timestamp.saturating_add(delta.min(MAX_TIMESTAMP_DRIFT_SECONDS));
+            env.ledger().set_timestamp(current_timestamp);
+            let _ = client.try_log_event(
+                &Address::generate(&env),
+                &symbol(&env, &event_type),
+                &bytes(&env, &metadata),
+                &None, &None, &false,
+            );
+        }
+
+        // Simulate recovery: recompute hashes via update_event on the first entry.
+        let total = client.total_events();
+        if total > 0 {
+            let _ = client.try_update_event(&owner, &0u32, &bytes(&env, b"recovered"));
+        }
+
+        assert!(client.verify_integrity(), "hash chain must verify after recovery");
+
+        // Re-verify every link after recovery.
+        let total = client.total_events();
+        for i in 1..total {
+            let evt = client.get_event_by_order(&i);
+            let prev = client.get_event_by_order(&(i - 1));
+            assert_eq!(
+                evt.prev_hash, prev.event_hash,
+                "link[{i}] must remain intact after recovery"
+            );
+        }
+        if total > 0 {
+            let genesis = client.get_event_by_order(&0);
+            assert_eq!(
+                genesis.prev_hash,
+                BytesN::from_array(&env, &[0u8; 32]),
+                "genesis prev_hash must remain zero after recovery"
+            );
+        }
+    }
+
     // ── Hash chain invariant tests (issue #111) ──────────────────────────────
 
     #[test]

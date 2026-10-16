@@ -8,6 +8,114 @@ use soroban_sdk::{contractimpl, contracttype, panic_with_error, Address, Bytes, 
 
 use crate::{AuditLedger, AuditLedgerArgs, AuditLedgerClient, ContractError, DataKey};
 
+// Pagination primitives
+
+/// Hard cap on the number of items returned by any single paginated query.
+pub const MAX_PAGE_LIMIT: u32 = 100;
+
+/// Opaque cursor token over a stable, deterministic ordering key.
+///
+/// The token encodes the last-seen ordering key (a monotonically increasing
+/// id) so that traversal is stable across ledger upgrades and archival
+/// restores: ordering never depends on storage iteration order, only on the
+/// immutable id assigned at write time.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PageCursor {
+    /// Last-seen ordering key. The next page starts strictly after this id.
+    pub after_id: u32,
+}
+
+/// Requested page size. Clamped to `MAX_PAGE_LIMIT` at query time.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PageLimit {
+    pub limit: u32,
+}
+
+impl PageLimit {
+    /// Return the effective page size, enforcing the hard cap.
+    pub fn effective(&self) -> u32 {
+        if self.limit == 0 {
+            MAX_PAGE_LIMIT
+        } else if self.limit > MAX_PAGE_LIMIT {
+            MAX_PAGE_LIMIT
+        } else {
+            self.limit
+        }
+    }
+}
+
+/// A single page of results plus the cursor for the following page.
+///
+/// `next_cursor` is `None` when the traversal is exhausted (including when the
+/// supplied cursor is past the end of the collection).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<PageCursor>,
+}
+
+/// Multi-predicate filter applied to paginated collection queries.
+///
+/// All fields are optional; `None` means "no constraint on this predicate".
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryFilter {
+    /// Inclusive lower bound on the record's ledger timestamp.
+    pub min_timestamp: Option<u64>,
+    /// Inclusive upper bound on the record's ledger timestamp.
+    pub max_timestamp: Option<u64>,
+    /// Restrict to a specific workflow status.
+    pub status: Option<WorkflowStatus>,
+    /// Restrict to records submitted/initiated by this address.
+    pub submitter: Option<Address>,
+}
+
+impl QueryFilter {
+    /// An unconstrained filter matching every record.
+    pub fn none() -> Self {
+        QueryFilter {
+            min_timestamp: None,
+            max_timestamp: None,
+            status: None,
+            submitter: None,
+        }
+    }
+
+    /// Returns `true` if `timestamp` satisfies the configured range.
+    pub fn matches_timestamp(&self, timestamp: u64) -> bool {
+        if let Some(min) = self.min_timestamp {
+            if timestamp < min {
+                return false;
+            }
+        }
+        if let Some(max) = self.max_timestamp {
+            if timestamp > max {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Returns `true` if `status` satisfies the configured status predicate.
+    pub fn matches_status(&self, status: WorkflowStatus) -> bool {
+        match &self.status {
+            Some(want) => *want == status,
+            None => true,
+        }
+    }
+
+    /// Returns `true` if `submitter` satisfies the configured address predicate.
+    pub fn matches_submitter(&self, submitter: &Address) -> bool {
+        match &self.submitter {
+            Some(want) => want == submitter,
+            None => true,
+        }
+    }
+}
+
 // Cross-contract event reference
 
 /// A reference to an event that may live on a different contract instance.
@@ -316,38 +424,210 @@ impl AuditLedger {
         env.storage().instance().get(&DataKey::WorkflowExec(execution_id))
     }
 
-    /// Return all workflow definitions (paginated by count starting at 0).
-    pub fn list_workflows(env: Env, start: u32, limit: u32) -> Vec<WorkflowDefinition> {
+    /// Return a page of workflow definitions using deterministic cursor-based
+    /// pagination and multi-predicate filtering.
+    ///
+    /// Ordering is by immutable definition id (ascending), which is stable
+    /// across ledger upgrades and archival restores. At most
+    /// `MAX_PAGE_LIMIT` storage reads are performed per invocation.
+    pub fn list_workflows(
+        env: Env,
+        cursor: Option<PageCursor>,
+        limit: PageLimit,
+        filter: QueryFilter,
+    ) -> Page<WorkflowDefinition> {
         let total: u32 = env.storage().instance().get(&DataKey::WorkflowCount).unwrap_or(0);
-        let mut out: Vec<WorkflowDefinition> = Vec::new(&env);
-        let end = (start.saturating_add(limit)).min(total);
-        for i in start..end {
+        let page_size = limit.effective();
+        let start = match cursor {
+            Some(c) => c.after_id.saturating_add(1),
+            None => 0,
+        };
+
+        let mut items: Vec<WorkflowDefinition> = Vec::new(&env);
+        let mut next_cursor: Option<PageCursor> = None;
+
+        // Cursor past the end: return an empty page with no continuation.
+        if start >= total {
+            return Page { items, next_cursor };
+        }
+
+        let mut scanned: u32 = 0;
+        let mut i = start;
+        while i < total && scanned < page_size {
+            scanned += 1;
             if let Some(wf) = env
                 .storage()
                 .instance()
                 .get::<_, WorkflowDefinition>(&DataKey::WorkflowDef(i))
             {
-                out.push_back(wf);
+                if filter.matches_timestamp(wf.updated_at)
+                    && filter.matches_submitter(&wf.created_by)
+                {
+                    items.push_back(wf);
+                }
             }
+            i += 1;
         }
-        out
+
+        if i < total {
+            next_cursor = Some(PageCursor { after_id: i - 1 });
+        }
+
+        Page { items, next_cursor }
     }
 
-    /// Return cross-contract compositions (paginated).
-    pub fn get_cross_contract_events(env: Env, start: u32, limit: u32) -> Vec<CrossContractEvent> {
+    /// Return a page of cross-contract compositions using deterministic
+    /// cursor-based pagination and multi-predicate filtering.
+    ///
+    /// Ordering is by immutable composition id (ascending). At most
+    /// `MAX_PAGE_LIMIT` storage reads are performed per invocation.
+    pub fn get_cross_contract_events(
+        env: Env,
+        cursor: Option<PageCursor>,
+        limit: PageLimit,
+        filter: QueryFilter,
+    ) -> Page<CrossContractEvent> {
         let total: u32 = env.storage().instance().get(&DataKey::CrossContractCount).unwrap_or(0);
-        let mut out: Vec<CrossContractEvent> = Vec::new(&env);
-        let end = (start.saturating_add(limit)).min(total);
-        for i in start..end {
+        let page_size = limit.effective();
+        let start = match cursor {
+            Some(c) => c.after_id.saturating_add(1),
+            None => 0,
+        };
+
+        let mut items: Vec<CrossContractEvent> = Vec::new(&env);
+        let mut next_cursor: Option<PageCursor> = None;
+
+        // Cursor past the end: return an empty page with no continuation.
+        if start >= total {
+            return Page { items, next_cursor };
+        }
+
+        let mut scanned: u32 = 0;
+        let mut i = start;
+        while i < total && scanned < page_size {
+            scanned += 1;
             if let Some(ev) = env
                 .storage()
                 .instance()
                 .get::<_, CrossContractEvent>(&DataKey::CrossContractEvent(i))
             {
-                out.push_back(ev);
+                if filter.matches_timestamp(ev.composed_at)
+                    && filter.matches_submitter(&ev.composer)
+                {
+                    items.push_back(ev);
+                }
             }
+            i += 1;
         }
-        out
+
+        if i < total {
+            next_cursor = Some(PageCursor { after_id: i - 1 });
+        }
+
+        Page { items, next_cursor }
+    }
+
+    /// Return a page of workflow executions using deterministic cursor-based
+    /// pagination and multi-predicate filtering.
+    ///
+    /// Ordering is by immutable execution id (ascending). At most
+    /// `MAX_PAGE_LIMIT` storage reads are performed per invocation.
+    pub fn list_workflow_executions(
+        env: Env,
+        cursor: Option<PageCursor>,
+        limit: PageLimit,
+        filter: QueryFilter,
+    ) -> Page<WorkflowExecution> {
+        let total: u32 = env.storage().instance().get(&DataKey::WorkflowExecCount).unwrap_or(0);
+        let page_size = limit.effective();
+        let start = match cursor {
+            Some(c) => c.after_id.saturating_add(1),
+            None => 0,
+        };
+
+        let mut items: Vec<WorkflowExecution> = Vec::new(&env);
+        let mut next_cursor: Option<PageCursor> = None;
+
+        // Cursor past the end: return an empty page with no continuation.
+        if start >= total {
+            return Page { items, next_cursor };
+        }
+
+        let mut scanned: u32 = 0;
+        let mut i = start;
+        while i < total && scanned < page_size {
+            scanned += 1;
+            if let Some(exec) = env
+                .storage()
+                .instance()
+                .get::<_, WorkflowExecution>(&DataKey::WorkflowExec(i))
+            {
+                if filter.matches_timestamp(exec.started_at)
+                    && filter.matches_status(exec.status)
+                    && filter.matches_submitter(&exec.initiator)
+                {
+                    items.push_back(exec);
+                }
+            }
+            i += 1;
+        }
+
+        if i < total {
+            next_cursor = Some(PageCursor { after_id: i - 1 });
+        }
+
+        Page { items, next_cursor }
+    }
+
+    /// Return a page of external event anchors using deterministic
+    /// cursor-based pagination and multi-predicate filtering.
+    ///
+    /// Ordering is by immutable external-event id (ascending). At most
+    /// `MAX_PAGE_LIMIT` storage reads are performed per invocation.
+    pub fn list_external_events(
+        env: Env,
+        cursor: Option<PageCursor>,
+        limit: PageLimit,
+        filter: QueryFilter,
+    ) -> Page<ExternalEvent> {
+        let total: u32 = env.storage().instance().get(&DataKey::ExternalEventCount).unwrap_or(0);
+        let page_size = limit.effective();
+        let start = match cursor {
+            Some(c) => c.after_id.saturating_add(1),
+            None => 0,
+        };
+
+        let mut items: Vec<ExternalEvent> = Vec::new(&env);
+        let mut next_cursor: Option<PageCursor> = None;
+
+        // Cursor past the end: return an empty page with no continuation.
+        if start >= total {
+            return Page { items, next_cursor };
+        }
+
+        let mut scanned: u32 = 0;
+        let mut i = start;
+        while i < total && scanned < page_size {
+            scanned += 1;
+            if let Some(ev) = env
+                .storage()
+                .instance()
+                .get::<_, ExternalEvent>(&DataKey::ExternalEventData(i))
+            {
+                if filter.matches_timestamp(ev.anchored_at)
+                    && filter.matches_submitter(&ev.submitter)
+                {
+                    items.push_back(ev);
+                }
+            }
+            i += 1;
+        }
+
+        if i < total {
+            next_cursor = Some(PageCursor { after_id: i - 1 });
+        }
+
+        Page { items, next_cursor }
     }
 
     /// Start a new workflow execution instance.

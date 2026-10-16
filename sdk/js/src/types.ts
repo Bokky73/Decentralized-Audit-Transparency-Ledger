@@ -51,6 +51,62 @@ export interface EventPage {
   limit: number;
 }
 
+/**
+ * Opaque cursor token for deterministic cursor-based pagination.
+ *
+ * Pass the `next_cursor` returned by a previous page back into the next
+ * query to fetch the following page. `null`/`undefined` requests the first
+ * page; a `null` `next_cursor` in a response means the end was reached.
+ */
+export type PageCursor = string;
+
+/** Maximum number of items a single page may contain. */
+export const MAX_PAGE_LIMIT = 100;
+
+/** Requested page size, capped at {@link MAX_PAGE_LIMIT}. */
+export type PageLimit = number;
+
+/** Status of a tracked FinOps / cross-contract record. */
+export enum QueryStatus {
+  Pending = 0,
+  Success = 1,
+  Failed = 2,
+  Cancelled = 3,
+}
+
+/** Inclusive ledger timestamp range filter. */
+export interface TimestampRangeFilter {
+  /** Inclusive lower bound (ledger timestamp, seconds). */
+  from?: number;
+  /** Inclusive upper bound (ledger timestamp, seconds). */
+  to?: number;
+}
+
+/** Multi-predicate filter shared by all paginated collection queries. */
+export interface QueryFilter {
+  /** Filter by ledger timestamp range. */
+  timestamp?: TimestampRangeFilter;
+  /** Filter by record status. */
+  status?: QueryStatus;
+  /** Filter by submitter address. */
+  submitter?: string;
+}
+
+/** Pagination request options shared by all paginated collection queries. */
+export interface PageQuery extends QueryFilter {
+  /** Cursor from a previous page; omit for the first page. */
+  cursor?: PageCursor;
+  /** Requested page size; capped at {@link MAX_PAGE_LIMIT}. */
+  limit?: PageLimit;
+}
+
+/** Generic paginated result carrying the page items and the next cursor. */
+export interface Page<T> {
+  items: T[];
+  /** Cursor for the next page, or `null` when the end has been reached. */
+  next_cursor: PageCursor | null;
+}
+
 export interface CacheStats {
   hits: number;
   misses: number;

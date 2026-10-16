@@ -27,6 +27,106 @@ from layout_utils import load_snapshot, validate_snapshots
 
 
 # ---------------------------------------------------------------------------
+# Storage footprint budgets (serialized XDR byte sizes)
+# ---------------------------------------------------------------------------
+#
+# These budgets pin the serialized XDR byte footprint of records managed by
+# `src/supply_chain.rs`. They are checked against the candidate snapshot and
+# the build fails when a record grows beyond its budget. Update the budgets
+# deliberately (and re-pin the snapshot tests) whenever the layout changes.
+#
+# Structure: { "supply_chain": { "<record>": <max_bytes> } }
+
+STORAGE_FOOTPRINT_BUDGETS: dict[str, dict[str, int]] = {
+    "supply_chain": {
+        # Composite custody-handoff records (packed fields + enum discriminants)
+        "CustodyHandoff": 128,
+        "SupplyChainRecord": 192,
+        "HandoffVerification": 96,
+        # TTL / archival bookkeeping
+        "TtlPolicy": 48,
+        "ArchivalRecord": 64,
+    },
+}
+
+
+def check_storage_footprint(
+    new_snapshot: dict,
+    budgets: dict[str, dict[str, int]] | None = None,
+) -> list:
+    """Return a list of footprint violations for the candidate snapshot.
+
+    Each violation is a dict with keys: ``module``, ``record``, ``actual``,
+    ``budget``. A record is flagged when its serialized XDR byte size exceeds
+    the pinned budget. Missing records are ignored (they may be added later),
+    but records present in the snapshot without a budget are reported as
+    violations so new state keys cannot silently escape the byte budget.
+    """
+    if budgets is None:
+        budgets = STORAGE_FOOTPRINT_BUDGETS
+
+    violations: list = []
+    modules = new_snapshot.get("modules", {})
+
+    for module, record_budgets in budgets.items():
+        module_data = modules.get(module)
+        if not module_data:
+            continue
+
+        records = module_data.get("records", {})
+        for record_name, record in records.items():
+            actual = record.get("xdr_size", record.get("size"))
+            if actual is None:
+                continue
+
+            budget = record_budgets.get(record_name)
+            if budget is None:
+                violations.append(
+                    {
+                        "module": module,
+                        "record": record_name,
+                        "actual": actual,
+                        "budget": None,
+                    }
+                )
+                continue
+
+            if actual > budget:
+                violations.append(
+                    {
+                        "module": module,
+                        "record": record_name,
+                        "actual": actual,
+                        "budget": budget,
+                    }
+                )
+
+    return violations
+
+
+def print_footprint_report(violations: list) -> None:
+    if not violations:
+        print(_green(_bold("✓ Storage footprint within budget.")))
+        print()
+        return
+
+    print(_bold(_red(f"STORAGE FOOTPRINT VIOLATIONS ({len(violations)}):")))
+    for v in violations:
+        if v["budget"] is None:
+            print(
+                f"  {_red('✗')} [{v['module']}] '{v['record']}' "
+                f"xdr_size={v['actual']} has no pinned byte budget"
+            )
+        else:
+            over = v["actual"] - v["budget"]
+            print(
+                f"  {_red('✗')} [{v['module']}] '{v['record']}' "
+                f"xdr_size={v['actual']} exceeds budget={v['budget']} (+{over} bytes)"
+            )
+    print()
+
+
+# ---------------------------------------------------------------------------
 # Colour helpers
 # ---------------------------------------------------------------------------
 
@@ -215,7 +315,10 @@ def main() -> int:
 
     print_report(old_snapshot, new_snapshot, violations, warnings, strict=args.strict)
 
-    if violations:
+    footprint_violations = check_storage_footprint(new_snapshot)
+    print_footprint_report(footprint_violations)
+
+    if violations or footprint_violations:
         return 2
     if warnings and args.strict:
         return 1
