@@ -1,8 +1,52 @@
 #![no_std]
 
+//! CBDC tiered anonymity and selective disclosure guard.
+//!
+//! # Storage footprint (worst case)
+//! Every collection written to state is bounded by an explicit `MAX_*` constant
+//! declared in this module. Worst-case payload sizes:
+//! - `MaskedTransaction.authorized_decrypters`: `MAX_AUTHORIZED_DECRYPTERS` (32) addresses.
+//! - `PrivacyACL.read_access` / `audit_access` / `regulatory_access`: `MAX_ACL_ENTRIES` (64) addresses each.
+//! - `MaskedTransaction.encrypted_data` / `encryption_metadata`: fixed-size hashes / short labels.
+//! Any input exceeding these bounds is rejected with a typed [`CbdcPrivacyError`]
+//! before any state entry is written.
+//!
+//! # CPU instruction bounds (worst case)
+//! - `mask_transaction`: at most 3 SHA-256 invocations plus a bounded number of
+//!   `Bytes::append` calls proportional to the fixed field count of `CBDCTransaction`.
+//! - `create_privacy_acl`: one SHA-256 invocation plus O(MAX_ACL_ENTRIES) length checks.
+//! - `PrivacyStats::record_transaction` / `total_count` / `privacy_ratio`: O(1)
+//!   saturating arithmetic, no loops.
+//! All arithmetic uses `checked_add` / `saturating_add`; no unchecked operations remain.
+
 use crate::cbdc_types::{CBDCTransaction, PrivacyTier};
-use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env};
+use soroban_sdk::{contracterror, contracttype, Address, Bytes, BytesN, Env};
 use soroban_sdk::xdr::ToXdr;
+
+/// Maximum number of authorized decrypters attached to a masked transaction.
+pub const MAX_AUTHORIZED_DECRYPTERS: u32 = 32;
+
+/// Maximum number of entries in any single privacy ACL access list.
+pub const MAX_ACL_ENTRIES: u32 = 64;
+
+/// Deterministic contract errors for the CBDC privacy guard.
+#[contracterror]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum CbdcPrivacyError {
+    /// A collection exceeded its declared `MAX_*` bound.
+    CollectionTooLarge = 1,
+    /// An arithmetic operation overflowed the target type.
+    ArithmeticOverflow = 2,
+    /// The supplied privacy configuration is invalid.
+    InvalidPrivacyConfiguration = 3,
+    /// The access control list has expired.
+    AclExpired = 4,
+    /// The accessor has no permission on the ACL.
+    NoAccessPermission = 5,
+    /// Public transactions must not be encrypted.
+    PublicTransactionEncrypted = 6,
+}
 
 /// Privacy-masked transaction for confidential operations.
 #[contracttype]
@@ -91,7 +135,11 @@ impl PrivacyManager {
         transaction: &CBDCTransaction,
         privacy_tier: PrivacyTier,
         authorized_decrypters: soroban_sdk::Vec<Address>,
-    ) -> Result<MaskedTransaction, &'static str> {
+    ) -> Result<MaskedTransaction, CbdcPrivacyError> {
+        if authorized_decrypters.len() > MAX_AUTHORIZED_DECRYPTERS {
+            return Err(CbdcPrivacyError::CollectionTooLarge);
+        }
+
         let content_hash = Self::compute_transaction_content_hash(env, transaction);
         let now = env.ledger().timestamp();
 
@@ -129,7 +177,7 @@ impl PrivacyManager {
         env: &Env,
         transaction: &CBDCTransaction,
         privacy_tier: PrivacyTier,
-    ) -> Result<Bytes, &'static str> {
+    ) -> Result<Bytes, CbdcPrivacyError> {
         let mut encrypted = Bytes::new(env);
 
         match privacy_tier {
@@ -173,7 +221,7 @@ impl PrivacyManager {
                 Ok(encrypted_hash.to_bytes())
             }
             PrivacyTier::Public => {
-                Err("Public transactions should not be encrypted")
+                Err(CbdcPrivacyError::PublicTransactionEncrypted)
             }
         }
     }
@@ -197,10 +245,20 @@ impl PrivacyManager {
         audit_access: soroban_sdk::Vec<Address>,
         regulatory_access: soroban_sdk::Vec<Address>,
         expiration_secs: u64,
-    ) -> Result<PrivacyACL, &'static str> {
+    ) -> Result<PrivacyACL, CbdcPrivacyError> {
+        if read_access.len() > MAX_ACL_ENTRIES
+            || audit_access.len() > MAX_ACL_ENTRIES
+            || regulatory_access.len() > MAX_ACL_ENTRIES
+        {
+            return Err(CbdcPrivacyError::CollectionTooLarge);
+        }
+
         let acl_id = Self::compute_acl_id(env, &transaction_hash);
         let expires_at = if expiration_secs > 0 {
-            env.ledger().timestamp() + expiration_secs
+            env.ledger()
+                .timestamp()
+                .checked_add(expiration_secs)
+                .ok_or(CbdcPrivacyError::ArithmeticOverflow)?
         } else {
             0
         };
@@ -229,9 +287,9 @@ impl PrivacyManager {
     pub fn validate_privacy_configuration(
         tier: PrivacyTier,
         has_authorized_decrypters: bool,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), CbdcPrivacyError> {
         if tier.requires_encryption() && !has_authorized_decrypters {
-            return Err("Encrypted transactions must have authorized decrypters");
+            return Err(CbdcPrivacyError::InvalidPrivacyConfiguration);
         }
         Ok(())
     }
@@ -241,9 +299,9 @@ impl PrivacyManager {
         acl: &PrivacyACL,
         accessor: &Address,
         current_time: u64,
-    ) -> Result<AccessLevel, &'static str> {
+    ) -> Result<AccessLevel, CbdcPrivacyError> {
         if acl.is_expired(current_time) {
-            return Err("Access control list has expired");
+            return Err(CbdcPrivacyError::AclExpired);
         }
 
         if acl.has_regulatory_access(accessor) {
@@ -256,7 +314,7 @@ impl PrivacyManager {
             return Ok(AccessLevel::AuditOnly);
         }
 
-        Err("No access permission")
+        Err(CbdcPrivacyError::NoAccessPermission)
     }
 }
 
@@ -313,24 +371,39 @@ impl PrivacyStats {
     }
 
     pub fn total_count(&self) -> u32 {
-        self.public_count + self.pseudonymous_count + self.private_count + self.regulatory_count
+        self.public_count
+            .saturating_add(self.pseudonymous_count)
+            .saturating_add(self.private_count)
+            .saturating_add(self.regulatory_count)
     }
 
     pub fn record_transaction(&mut self, tier: PrivacyTier) {
         match tier {
-            PrivacyTier::Public => self.public_count += 1,
-            PrivacyTier::Pseudonymous => self.pseudonymous_count += 1,
-            PrivacyTier::Private => self.private_count += 1,
-            PrivacyTier::RegulatoryConfidential => self.regulatory_count += 1,
+            PrivacyTier::Public => {
+                self.public_count = self.public_count.saturating_add(1);
+            }
+            PrivacyTier::Pseudonymous => {
+                self.pseudonymous_count = self.pseudonymous_count.saturating_add(1);
+            }
+            PrivacyTier::Private => {
+                self.private_count = self.private_count.saturating_add(1);
+            }
+            PrivacyTier::RegulatoryConfidential => {
+                self.regulatory_count = self.regulatory_count.saturating_add(1);
+            }
         }
     }
 
     pub fn privacy_ratio(&self) -> u32 {
-        if self.total_count() == 0 {
+        let total = self.total_count();
+        if total == 0 {
             return 0;
         }
-        let encrypted = self.pseudonymous_count + self.private_count + self.regulatory_count;
-        ((encrypted as u64 * 100) / self.total_count() as u64) as u32
+        let encrypted = self
+            .pseudonymous_count
+            .saturating_add(self.private_count)
+            .saturating_add(self.regulatory_count);
+        ((encrypted as u64).saturating_mul(100) / total as u64) as u32
     }
 }
 
@@ -375,5 +448,119 @@ mod tests {
         assert!(!AccessLevel::None.can_audit());
         assert!(AccessLevel::AuditOnly.can_audit());
         assert!(AccessLevel::Read.can_audit());
+    }
+
+    #[test]
+    fn test_privacy_stats_saturates_at_u32_max() {
+        let mut stats = PrivacyStats::new();
+        stats.public_count = u32::MAX;
+        stats.pseudonymous_count = u32::MAX;
+        stats.private_count = u32::MAX;
+        stats.regulatory_count = u32::MAX;
+
+        assert_eq!(stats.total_count(), u32::MAX);
+
+        stats.record_transaction(PrivacyTier::Public);
+        assert_eq!(stats.public_count, u32::MAX);
+        assert_eq!(stats.total_count(), u32::MAX);
+    }
+
+    #[test]
+    fn test_privacy_ratio_with_max_values() {
+        let mut stats = PrivacyStats::new();
+        stats.public_count = 0;
+        stats.pseudonymous_count = u32::MAX;
+        stats.private_count = u32::MAX;
+        stats.regulatory_count = u32::MAX;
+
+        // Must not panic and must stay within [0, 100].
+        let ratio = stats.privacy_ratio();
+        assert!(ratio <= 100);
+    }
+
+    #[test]
+    fn test_create_privacy_acl_rejects_oversized_lists() {
+        let env = soroban_sdk::Env::default();
+        let mut read_access = soroban_sdk::Vec::new(&env);
+        for _ in 0..=MAX_ACL_ENTRIES {
+            read_access.push_back(Address::generate(&env));
+        }
+
+        let result = PrivacyManager::create_privacy_acl(
+            &env,
+            BytesN::zero(),
+            read_access,
+            soroban_sdk::Vec::new(&env),
+            soroban_sdk::Vec::new(&env),
+            0,
+        );
+        assert_eq!(result, Err(CbdcPrivacyError::CollectionTooLarge));
+    }
+
+    #[test]
+    fn test_create_privacy_acl_expiration_overflow() {
+        let env = soroban_sdk::Env::default();
+        let result = PrivacyManager::create_privacy_acl(
+            &env,
+            BytesN::zero(),
+            soroban_sdk::Vec::new(&env),
+            soroban_sdk::Vec::new(&env),
+            soroban_sdk::Vec::new(&env),
+            u64::MAX,
+        );
+        assert_eq!(result, Err(CbdcPrivacyError::ArithmeticOverflow));
+    }
+
+    #[test]
+    fn test_mask_transaction_rejects_oversized_decrypters() {
+        let env = soroban_sdk::Env::default();
+        let mut decrypters = soroban_sdk::Vec::new(&env);
+        for _ in 0..=MAX_AUTHORIZED_DECRYPTERS {
+            decrypters.push_back(Address::generate(&env));
+        }
+
+        let transaction = CBDCTransaction {
+            tx_id: BytesN::zero(),
+            timestamp: u64::MAX,
+            source_pilot: u32::MAX,
+            dest_pilot: u32::MAX,
+            from: Address::generate(&env),
+            to: Address::generate(&env),
+            amount_source: i128::MAX,
+            amount_dest: i128::MAX,
+            exchange_rate: i128::MAX,
+            metadata: Bytes::new(&env),
+        };
+
+        let result = PrivacyManager::mask_transaction(
+            &env,
+            &transaction,
+            PrivacyTier::Pseudonymous,
+            decrypters,
+        );
+        assert_eq!(result, Err(CbdcPrivacyError::CollectionTooLarge));
+    }
+
+    #[test]
+    fn test_check_access_permission_typed_errors() {
+        let env = soroban_sdk::Env::default();
+        let accessor = Address::generate(&env);
+        let acl = PrivacyACL {
+            acl_id: BytesN::zero(),
+            transaction_hash: BytesN::zero(),
+            read_access: soroban_sdk::Vec::new(&env),
+            audit_access: soroban_sdk::Vec::new(&env),
+            regulatory_access: soroban_sdk::Vec::new(&env),
+            expires_at: 1000,
+        };
+
+        assert_eq!(
+            PrivacyManager::check_access_permission(&acl, &accessor, 1500),
+            Err(CbdcPrivacyError::AclExpired)
+        );
+        assert_eq!(
+            PrivacyManager::check_access_permission(&acl, &accessor, 500),
+            Err(CbdcPrivacyError::NoAccessPermission)
+        );
     }
 }

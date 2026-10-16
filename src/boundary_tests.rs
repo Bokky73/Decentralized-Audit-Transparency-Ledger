@@ -2,6 +2,287 @@ use super::*;
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::{symbol_short, Bytes, BytesN, Env, Vec};
 
+// ── CBDC Privacy Boundary & Adversarial Tests ─────────────────────────────────────
+
+/// Helper: register the CBDC privacy contract and return a client.
+fn create_cbdc() -> (Env, Address, CbdcPrivacyClient<'static>) {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(CbdcPrivacy, ());
+    let client = CbdcPrivacyClient::new(&env, &contract_id);
+    env.mock_all_auths();
+    client.initialize(&admin);
+    (env, admin, client)
+}
+
+#[test]
+fn cbdc_boundary_tier_limit_at_max() {
+    let (env, admin, client) = create_cbdc();
+    env.mock_all_auths();
+    // Setting the tier limit to u64::MAX must not overflow.
+    client.set_tier_limit(&admin, &u64::MAX);
+    assert_eq!(client.tier_limit(), u64::MAX);
+}
+
+#[test]
+fn cbdc_boundary_amount_at_u64_max() {
+    let (env, admin, client) = create_cbdc();
+    env.mock_all_auths();
+    client.set_tier_limit(&admin, &u64::MAX);
+
+    let user = Address::generate(&env);
+    // A deposit of u64::MAX must be accepted without panicking.
+    client.deposit(&user, &u64::MAX);
+    assert_eq!(client.balance(&user), u64::MAX);
+}
+
+#[test]
+fn cbdc_overflow_deposit_beyond_u64_max() {
+    let (env, admin, client) = create_cbdc();
+    env.mock_all_auths();
+    client.set_tier_limit(&admin, &u64::MAX);
+
+    let user = Address::generate(&env);
+    client.deposit(&user, &u64::MAX);
+
+    // A second deposit of 1 would overflow u64; must return a typed error.
+    let result = client.try_deposit(&user, &1);
+    assert!(result.is_err());
+}
+
+#[test]
+fn cbdc_boundary_deposit_exceeds_tier_limit() {
+    let (env, admin, client) = create_cbdc();
+    env.mock_all_auths();
+    client.set_tier_limit(&admin, &100);
+
+    let user = Address::generate(&env);
+    let result = client.try_deposit(&user, &101);
+    assert!(result.is_err());
+}
+
+#[test]
+fn cbdc_boundary_withdraw_at_u64_max() {
+    let (env, admin, client) = create_cbdc();
+    env.mock_all_auths();
+    client.set_tier_limit(&admin, &u64::MAX);
+
+    let user = Address::generate(&env);
+    client.deposit(&user, &u64::MAX);
+    client.withdraw(&user, &u64::MAX);
+    assert_eq!(client.balance(&user), 0);
+}
+
+#[test]
+fn cbdc_overflow_withdraw_beyond_balance() {
+    let (env, admin, client) = create_cbdc();
+    env.mock_all_auths();
+    client.set_tier_limit(&admin, &u64::MAX);
+
+    let user = Address::generate(&env);
+    client.deposit(&user, &10);
+
+    let result = client.try_withdraw(&user, &11);
+    assert!(result.is_err());
+}
+
+#[test]
+fn cbdc_boundary_disclosure_cap_enforced() {
+    let (env, admin, client) = create_cbdc();
+    env.mock_all_auths();
+
+    // Attempt to register more disclosures than the cap allows.
+    let cap = client.max_disclosures();
+    for i in 0..cap {
+        let viewer = Address::generate(&env);
+        client.add_disclosure(&admin, &viewer, &i);
+    }
+
+    // One more must return a typed error, not panic.
+    let extra = Address::generate(&env);
+    let result = client.try_add_disclosure(&admin, &extra, &0);
+    assert!(result.is_err());
+}
+
+#[test]
+fn cbdc_boundary_i128_max_amount_rejected() {
+    let (env, admin, client) = create_cbdc();
+    env.mock_all_auths();
+    client.set_tier_limit(&admin, &u64::MAX);
+
+    let user = Address::generate(&env);
+    // i128::MAX exceeds u64::MAX and must be rejected with a typed error.
+    let result = client.try_deposit_i128(&user, &i128::MAX);
+    assert!(result.is_err());
+}
+
+#[test]
+fn cbdc_boundary_i128_min_amount_rejected() {
+    let (env, admin, client) = create_cbdc();
+    env.mock_all_auths();
+
+    let user = Address::generate(&env);
+    let result = client.try_deposit_i128(&user, &i128::MIN);
+    assert!(result.is_err());
+}
+
+// ── Supply Chain Boundary & Adversarial Tests ─────────────────────────────────────
+
+/// Helper: register the supply chain contract and return a client.
+fn create_supply_chain() -> (Env, Address, SupplyChainClient<'static>) {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(SupplyChain, ());
+    let client = SupplyChainClient::new(&env, &contract_id);
+    env.mock_all_auths();
+    client.initialize(&admin);
+    (env, admin, client)
+}
+
+#[test]
+fn supply_chain_boundary_quantity_at_u64_max() {
+    let (env, admin, client) = create_supply_chain();
+    env.mock_all_auths();
+
+    let item = BytesN::from_array(&env, &[1u8; 32]);
+    client.register_item(&admin, &item, &u64::MAX);
+    assert_eq!(client.item_quantity(&item), u64::MAX);
+}
+
+#[test]
+fn supply_chain_overflow_quantity_beyond_u64_max() {
+    let (env, admin, client) = create_supply_chain();
+    env.mock_all_auths();
+
+    let item = BytesN::from_array(&env, &[2u8; 32]);
+    client.register_item(&admin, &item, &u64::MAX);
+
+    // Adding 1 more would overflow; must return a typed error.
+    let result = client.try_add_quantity(&admin, &item, &1);
+    assert!(result.is_err());
+}
+
+#[test]
+fn supply_chain_boundary_custody_chain_cap_enforced() {
+    let (env, admin, client) = create_supply_chain();
+    env.mock_all_auths();
+
+    let item = BytesN::from_array(&env, &[3u8; 32]);
+    client.register_item(&admin, &item, &1);
+
+    let cap = client.max_custody_events();
+    for _ in 0..cap {
+        let custodian = Address::generate(&env);
+        client.transfer_custody(&admin, &item, &custodian);
+    }
+
+    // One more transfer must return a typed error, not panic.
+    let extra = Address::generate(&env);
+    let result = client.try_transfer_custody(&admin, &item, &extra);
+    assert!(result.is_err());
+}
+
+#[test]
+fn supply_chain_boundary_i128_max_quantity_rejected() {
+    let (env, admin, client) = create_supply_chain();
+    env.mock_all_auths();
+
+    let item = BytesN::from_array(&env, &[4u8; 32]);
+    // i128::MAX exceeds u64::MAX and must be rejected with a typed error.
+    let result = client.try_register_item_i128(&admin, &item, &i128::MAX);
+    assert!(result.is_err());
+}
+
+#[test]
+fn supply_chain_boundary_i128_min_quantity_rejected() {
+    let (env, admin, client) = create_supply_chain();
+    env.mock_all_auths();
+
+    let item = BytesN::from_array(&env, &[5u8; 32]);
+    let result = client.try_register_item_i128(&admin, &item, &i128::MIN);
+    assert!(result.is_err());
+}
+
+#[test]
+fn supply_chain_boundary_zero_quantity() {
+    let (env, admin, client) = create_supply_chain();
+    env.mock_all_auths();
+
+    let item = BytesN::from_array(&env, &[6u8; 32]);
+    // Zero quantity should be rejected with a typed error.
+    let result = client.try_register_item(&admin, &item, &0);
+    assert!(result.is_err());
+}
+
+#[test]
+fn supply_chain_boundary_duplicate_item_rejected() {
+    let (env, admin, client) = create_supply_chain();
+    env.mock_all_auths();
+
+    let item = BytesN::from_array(&env, &[7u8; 32]);
+    client.register_item(&admin, &item, &10);
+
+    // Registering the same item again must return a typed error.
+    let result = client.try_register_item(&admin, &item, &10);
+    assert!(result.is_err());
+}
+
+// ── Property-Based Adversarial Tests ──────────────────────────────────────────────
+
+#[cfg(test)]
+mod proptest_boundaries {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn cbdc_deposit_never_panics(amount in any::<u64>()) {
+            let (env, admin, client) = create_cbdc();
+            env.mock_all_auths();
+            client.set_tier_limit(&admin, &u64::MAX);
+            let user = Address::generate(&env);
+            // Must never panic; either succeeds or returns a typed error.
+            let _ = client.try_deposit(&user, &amount);
+        }
+
+        #[test]
+        fn cbdc_withdraw_never_panics(amount in any::<u64>()) {
+            let (env, admin, client) = create_cbdc();
+            env.mock_all_auths();
+            client.set_tier_limit(&admin, &u64::MAX);
+            let user = Address::generate(&env);
+            client.deposit(&user, &u64::MAX);
+            let _ = client.try_withdraw(&user, &amount);
+        }
+
+        #[test]
+        fn cbdc_i128_deposit_never_panics(amount in any::<i128>()) {
+            let (env, admin, client) = create_cbdc();
+            env.mock_all_auths();
+            let user = Address::generate(&env);
+            let _ = client.try_deposit_i128(&user, &amount);
+        }
+
+        #[test]
+        fn supply_chain_register_never_panics(quantity in any::<u64>()) {
+            let (env, admin, client) = create_supply_chain();
+            env.mock_all_auths();
+            let item = BytesN::from_array(&env, &[9u8; 32]);
+            let _ = client.try_register_item(&admin, &item, &quantity);
+        }
+
+        #[test]
+        fn supply_chain_i128_register_never_panics(quantity in any::<i128>()) {
+            let (env, admin, client) = create_supply_chain();
+            env.mock_all_auths();
+            let item = BytesN::from_array(&env, &[10u8; 32]);
+            let _ = client.try_register_item_i128(&admin, &item, &quantity);
+        }
+    }
+}
+
 fn create_ledger() -> (Env, Address, AuditLedgerClient<'static>) {
     let env = Env::default();
     let owner = Address::generate(&env);

@@ -10,10 +10,14 @@ This directory contains formal specifications and verification tooling for the
 ```
 formal-verification/
 ├── audit_ledger.spec       Certora CVL property rules
+├── suptech_feeds.spec      Certora CVL rules for the SupTech feed dispatcher
+├── cbdc_offline.spec       Certora CVL rules for CBDC offline reconciliation
 ├── properties.md           Human-readable property catalog with status
 ├── README.md               This file
 └── k-spec/
-    └── audit_ledger-spec.k K-framework semantic specification
+    ├── audit_ledger-spec.k K-framework semantic specification
+    ├── suptech_feeds-spec.k K-framework spec for the SupTech feed dispatcher
+    └── cbdc_offline-spec.k K-framework spec for CBDC offline reconciliation
 ```
 
 ---
@@ -28,6 +32,20 @@ Two complementary tools are used:
 | **K-framework** | Models the operational semantics of state transitions as rewrite rules and verifies proof claims via symbolic execution and SMT solving (Z3). |
 
 The full property list with verification status is in [`properties.md`](properties.md).
+
+In addition to the `AuditLedger` contract, this directory hosts formal
+specifications for two off-chain state machines:
+
+| Module | Spec files | Claim / rule prefix |
+|--------|-----------|---------------------|
+| `src/suptech_feeds.rs` — SupTech real-time regulatory telemetry feed dispatcher | `suptech_feeds.spec`, `k-spec/suptech_feeds-spec.k` | `SUPTECH-*` |
+| `src/cbdc_offline.rs` — CBDC offline voucher double-spend reconciliation verifier | `cbdc_offline.spec`, `k-spec/cbdc_offline-spec.k` | `CBDC-*` |
+
+Both modules must preserve their state-machine invariants under duplicate
+submissions, out-of-order timestamps, mid-batch rollbacks, and concurrent
+multi-actor access, and must retain Merkle proof / hash-chain integrity after
+simulated recovery. The property-based and chaos tests that exercise these
+invariants live in `src/proptest.rs` and `src/concurrent_tests.rs`.
 
 ---
 
@@ -69,6 +87,44 @@ certoraRun AuditLedger.sol --verify AuditLedger:formal-verification/audit_ledger
 
 # Full suite (takes ~10 min)
 certoraRun AuditLedger.sol --verify AuditLedger:formal-verification/audit_ledger.spec
+```
+
+### Suptech feed dispatcher rules
+
+```bash
+# All SUPTECH-* rules
+certoraRun SuptechFeeds.sol \
+           --verify SuptechFeeds:formal-verification/suptech_feeds.spec \
+           --msg "Suptech feed dispatcher safety props"
+
+# Single rule, e.g. duplicate submissions must not advance the feed cursor
+certoraRun SuptechFeeds.sol \
+           --verify SuptechFeeds:formal-verification/suptech_feeds.spec \
+           --rule SUPTECH_NO_DUPLICATE_ADVANCE
+
+# Out-of-order timestamp and mid-batch rollback rules
+certoraRun SuptechFeeds.sol \
+           --verify SuptechFeeds:formal-verification/suptech_feeds.spec \
+           --rule SUPTECH_MONOTONIC_TIMESTAMPS SUPTECH_ROLLBACK_RESTORES_STATE
+```
+
+### CBDC offline reconciliation rules
+
+```bash
+# All CBDC-* rules
+certoraRun CbdcOffline.sol \
+           --verify CbdcOffline:formal-verification/cbdc_offline.spec \
+           --msg "CBDC offline reconciliation safety props"
+
+# Single rule, e.g. a voucher may never be redeemed twice
+certoraRun CbdcOffline.sol \
+           --verify CbdcOffline:formal-verification/cbdc_offline.spec \
+           --rule CBDC_NO_DOUBLE_SPEND
+
+# Merkle proof / hash-chain integrity after simulated recovery
+certoraRun CbdcOffline.sol \
+           --verify CbdcOffline:formal-verification/cbdc_offline.spec \
+           --rule CBDC_MERKLE_INTEGRITY_AFTER_RECOVERY
 ```
 
 ### Reading results
@@ -143,6 +199,63 @@ kprove audit_ledger-spec.k \
        --claim SPEC-3          # Cap enforcement
 ```
 
+### Compile and run the Suptech feed dispatcher spec
+
+```bash
+cd formal-verification/k-spec
+
+kompile suptech_feeds-spec.k \
+        --backend haskell \
+        --main-module SUPTECH-FEEDS-SPEC \
+        --syntax-module SUPTECH-FEEDS-SYNTAX \
+        -o .kompiled-suptech-feeds
+
+# All SUPTECH-* claims
+kprove suptech_feeds-spec.k \
+       --definition .kompiled-suptech-feeds \
+       --spec-module SUPTECH-FEEDS-SPEC
+
+# Single claim, e.g. duplicate submissions are idempotent
+kprove suptech_feeds-spec.k \
+       --definition .kompiled-suptech-feeds \
+       --spec-module SUPTECH-FEEDS-SPEC \
+       --claim SUPTECH-DUPLICATE-IDEMPOTENT
+```
+
+### Compile and run the CBDC offline reconciliation spec
+
+```bash
+cd formal-verification/k-spec
+
+kompile cbdc_offline-spec.k \
+        --backend haskell \
+        --main-module CBDC-OFFLINE-SPEC \
+        --syntax-module CBDC-OFFLINE-SYNTAX \
+        -o .kompiled-cbdc-offline
+
+# All CBDC-* claims
+kprove cbdc_offline-spec.k \
+       --definition .kompiled-cbdc-offline \
+       --spec-module CBDC-OFFLINE-SPEC
+
+# Single claim, e.g. hash-chain integrity survives mid-batch rollback
+kprove cbdc_offline-spec.k \
+       --definition .kompiled-cbdc-offline \
+       --spec-module CBDC-OFFLINE-SPEC \
+       --claim CBDC-HASHCHAIN-AFTER-ROLLBACK
+```
+
+Claim labels used by the two new specs:
+
+| Label | Module | Meaning |
+|-------|--------|---------|
+| `SUPTECH-DUPLICATE-IDEMPOTENT` | `src/suptech_feeds.rs` | Re-submitting an already-dispatched feed event leaves the cursor and Merkle root unchanged. |
+| `SUPTECH-MONOTONIC-TIMESTAMPS` | `src/suptech_feeds.rs` | Out-of-order timestamps are rejected or reordered without regressing the committed watermark. |
+| `SUPTECH-ROLLBACK-RESTORES-STATE` | `src/suptech_feeds.rs` | A mid-batch rollback restores the pre-batch cursor, root, and pending set. |
+| `CBDC-NO-DOUBLE-SPEND` | `src/cbdc_offline.rs` | A voucher can be reconciled at most once across all actors. |
+| `CBDC-HASHCHAIN-AFTER-ROLLBACK` | `src/cbdc_offline.rs` | The hash chain is intact after a mid-batch rollback. |
+| `CBDC-MERKLE-INTEGRITY-AFTER-RECOVERY` | `src/cbdc_offline.rs` | Merkle proofs verify against the recovered root after simulated recovery. |
+
 ### Interpreting counterexamples
 
 When a claim fails K prints the residual configuration — the part of the state
@@ -216,6 +329,46 @@ jobs:
           kprove audit_ledger-spec.k \
             --definition .kompiled \
             --spec-module AUDIT-LEDGER-SPEC
+
+  suptech-feeds-proofs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install K
+        run: bash <(curl -s https://kframework.org/install)
+      - name: Compile Suptech feed dispatcher spec
+        run: |
+          cd formal-verification/k-spec
+          kompile suptech_feeds-spec.k --backend haskell \
+            --main-module SUPTECH-FEEDS-SPEC \
+            --syntax-module SUPTECH-FEEDS-SYNTAX \
+            -o .kompiled-suptech-feeds
+      - name: Run SUPTECH-* proofs
+        run: |
+          cd formal-verification/k-spec
+          kprove suptech_feeds-spec.k \
+            --definition .kompiled-suptech-feeds \
+            --spec-module SUPTECH-FEEDS-SPEC
+
+  cbdc-offline-proofs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install K
+        run: bash <(curl -s https://kframework.org/install)
+      - name: Compile CBDC offline reconciliation spec
+        run: |
+          cd formal-verification/k-spec
+          kompile cbdc_offline-spec.k --backend haskell \
+            --main-module CBDC-OFFLINE-SPEC \
+            --syntax-module CBDC-OFFLINE-SYNTAX \
+            -o .kompiled-cbdc-offline
+      - name: Run CBDC-* proofs
+        run: |
+          cd formal-verification/k-spec
+          kprove cbdc_offline-spec.k \
+            --definition .kompiled-cbdc-offline \
+            --spec-module CBDC-OFFLINE-SPEC
 ```
 
 ---
@@ -224,10 +377,16 @@ jobs:
 
 1. Describe the property in [`properties.md`](properties.md) and assign it the
    next `P-XX` identifier.
-2. Add a CVL `rule` or `invariant` to `audit_ledger.spec`.
-3. Add a K `claim` to `k-spec/audit_ledger-spec.k` (in `AUDIT-LEDGER-SPEC`).
+2. Add a CVL `rule` or `invariant` to `audit_ledger.spec` (or, for the off-chain
+   state machines, `suptech_feeds.spec` / `cbdc_offline.spec`).
+3. Add a K `claim` to `k-spec/audit_ledger-spec.k` (in `AUDIT-LEDGER-SPEC`), or
+   to `k-spec/suptech_feeds-spec.k` (`SUPTECH-FEEDS-SPEC`) /
+   `k-spec/cbdc_offline-spec.k` (`CBDC-OFFLINE-SPEC`).
 4. Run both verification tools and update the **Status** column.
-5. Commit all three files together in the same PR.
+5. Commit all affected spec files together in the same PR.
+6. Mirror the property as a property-based test in `src/proptest.rs` and, where
+   concurrency is involved, in `src/concurrent_tests.rs`, so the CI coverage
+   gate in `scripts/ci_contract_event_tests.sh` exercises it.
 
 ### Tips
 
@@ -246,3 +405,8 @@ jobs:
 - [Soroban SDK Reference](https://docs.rs/soroban-sdk/)
 - [`properties.md`](properties.md) — full property catalog
 - [`docs/FORMAL_VERIFICATION.md`](../docs/FORMAL_VERIFICATION.md) — architecture overview
+- [`src/suptech_feeds.rs`](../src/suptech_feeds.rs) — SupTech feed dispatcher under verification
+- [`src/cbdc_offline.rs`](../src/cbdc_offline.rs) — CBDC offline reconciliation verifier under verification
+- [`src/proptest.rs`](../src/proptest.rs) — property-based invariant tests
+- [`src/concurrent_tests.rs`](../src/concurrent_tests.rs) — multi-actor concurrency tests
+- [`scripts/ci_contract_event_tests.sh`](../scripts/ci_contract_event_tests.sh) — coverage gate

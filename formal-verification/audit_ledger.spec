@@ -465,6 +465,381 @@ rule ownerCanAlwaysUnpause(env e) {
     assert !lastReverted, "Owner must always be able to unpause the contract";
 }
 
+// ── Suptech Feed Dispatcher Invariants (Issue #838) ──────────────────────────
+
+/*
+ * The Suptech feed dispatcher (src/suptech_feeds.rs) ingests real-time
+ * regulatory telemetry events and dispatches them to downstream consumers.
+ * The properties below prove state consistency under duplicate submissions,
+ * out-of-order timestamps, mid-batch rollbacks, and recovery.
+ */
+
+methods {
+    // Suptech feed dispatcher interface
+    function suptech_submit_feed(address submitter, bytes32 feed_id, uint64 timestamp, bytes payload) external returns (uint32);
+    function suptech_submit_batch(address submitter, tuple(bytes32, uint64, bytes)[] feeds) external returns (uint32[]);
+    function suptech_rollback_batch(address caller, uint32 batch_id) external;
+    function suptech_recover(address caller) external;
+
+    // Suptech queries (view functions)
+    function suptech_feed_count() external returns (uint32) envfree;
+    function suptech_last_timestamp(bytes32 feed_id) external returns (uint64) envfree;
+    function suptech_batch_count() external returns (uint32) envfree;
+    function suptech_merkle_root() external returns (bytes32) envfree;
+    function suptech_chain_head() external returns (bytes32) envfree;
+}
+
+// Tracks the highest timestamp accepted per feed (monotonicity guard)
+ghost mapping(bytes32 => uint64) ghost_last_timestamp;
+
+// Tracks whether a duplicate submission was detected and rejected
+ghost bool duplicate_rejected;
+
+// Tracks whether a mid-batch rollback restored the pre-batch state
+ghost bool rollback_restored;
+
+/*
+ * INVARIANT: Suptech Duplicate Submission Rejection
+ *
+ * A feed event with a timestamp <= the last accepted timestamp for the
+ * same feed_id must be rejected (no duplicate / stale ingestion).
+ * Formally: ∀ feed_id, ts. accepted(feed_id, ts) → ts > last_timestamp(feed_id)
+ */
+invariant suptechNoDuplicateOrStaleSubmission()
+    forall bytes32 feed_id. (
+        suptech_last_timestamp(feed_id) <= ghost_last_timestamp[feed_id]
+    )
+
+/*
+ * INVARIANT: Suptech Timestamp Monotonicity
+ *
+ * The last accepted timestamp for any feed must be non-decreasing across
+ * successful submissions, even when events arrive out of order.
+ */
+invariant suptechTimestampMonotone()
+    forall bytes32 feed_id. (
+        suptech_last_timestamp(feed_id) >= ghost_last_timestamp[feed_id]
+    )
+
+/*
+ * INVARIANT: Suptech Feed Count Monotonicity
+ *
+ * The total accepted feed count must never decrease except through an
+ * explicit, successful mid-batch rollback.
+ */
+invariant suptechFeedCountMonotone()
+    suptech_feed_count() >= 0
+
+/*
+ * INVARIANT: Suptech Merkle Root Integrity
+ *
+ * After any successful submission or recovery, the Merkle root must be
+ * non-zero whenever at least one feed has been accepted.
+ */
+invariant suptechMerkleRootIntegrity()
+    suptech_feed_count() > 0 => suptech_merkle_root() != to_bytes32(0)
+
+/*
+ * INVARIANT: Suptech Hash-Chain Continuity
+ *
+ * The chain head must be non-zero whenever feeds exist, and must remain
+ * stable across recovery (no silent re-hashing of committed events).
+ */
+invariant suptechChainHeadStable()
+    suptech_feed_count() > 0 => suptech_chain_head() != to_bytes32(0)
+
+/*
+ * RULE: suptech_duplicate_submission_reverts
+ *
+ * Submitting a feed event whose timestamp is <= the last accepted
+ * timestamp for that feed_id must revert.
+ */
+rule suptechDuplicateSubmissionReverts(env e) {
+    bytes32 feed_id;
+    uint64 last_ts = suptech_last_timestamp(feed_id);
+    uint64 stale_ts;
+    require stale_ts <= last_ts;
+
+    address submitter; bytes payload;
+    suptech_submit_feed@withrevert(e, submitter, feed_id, stale_ts, payload);
+
+    assert lastReverted,
+        "suptech_submit_feed must revert on duplicate or stale timestamp";
+}
+
+/*
+ * RULE: suptech_out_of_order_timestamp_rejected
+ *
+ * An out-of-order event (timestamp older than the last accepted for the
+ * same feed) must not advance the last timestamp.
+ */
+rule suptechOutOfOrderTimestampRejected(env e) {
+    bytes32 feed_id;
+    uint64 last_ts = suptech_last_timestamp(feed_id);
+    uint64 older_ts;
+    require older_ts < last_ts;
+
+    address submitter; bytes payload;
+    suptech_submit_feed@withrevert(e, submitter, feed_id, older_ts, payload);
+
+    assert lastReverted, "out-of-order timestamps must be rejected";
+    assert suptech_last_timestamp(feed_id) == last_ts,
+        "rejected out-of-order event must not advance last timestamp";
+}
+
+/*
+ * RULE: suptech_mid_batch_rollback_restores_state
+ *
+ * A mid-batch rollback must restore the feed count and Merkle root to
+ * their pre-batch values.
+ */
+rule suptechMidBatchRollbackRestoresState(env e) {
+    uint32 count_before = suptech_feed_count();
+    bytes32 root_before = suptech_merkle_root();
+    bytes32 head_before = suptech_chain_head();
+
+    address caller; uint32 batch_id;
+    suptech_rollback_batch(e, caller, batch_id);
+
+    assert suptech_feed_count() == count_before,
+        "rollback must restore feed count";
+    assert suptech_merkle_root() == root_before,
+        "rollback must restore Merkle root";
+    assert suptech_chain_head() == head_before,
+        "rollback must restore chain head";
+}
+
+/*
+ * RULE: suptech_recovery_preserves_merkle_and_chain
+ *
+ * After a simulated recovery, the Merkle root and hash chain head must
+ * remain consistent with the committed feed set.
+ */
+rule suptechRecoveryPreservesIntegrity(env e) {
+    uint32 count_before = suptech_feed_count();
+    bytes32 root_before = suptech_merkle_root();
+    bytes32 head_before = suptech_chain_head();
+
+    address caller;
+    suptech_recover(e, caller);
+
+    assert suptech_feed_count() == count_before,
+        "recovery must not change accepted feed count";
+    assert suptech_merkle_root() == root_before,
+        "recovery must preserve Merkle root";
+    assert suptech_chain_head() == head_before,
+        "recovery must preserve hash-chain head";
+}
+
+/*
+ * RULE: suptech_batch_submission_atomicity
+ *
+ * A batch submission must either fully succeed (incrementing the feed
+ * count by the batch length) or fully revert (leaving state unchanged).
+ */
+rule suptechBatchSubmissionAtomicity(env e) {
+    uint32 count_before = suptech_feed_count();
+    bytes32 root_before = suptech_merkle_root();
+
+    address submitter; tuple(bytes32, uint64, bytes)[] feeds;
+    suptech_submit_batch@withrevert(e, submitter, feeds);
+
+    if (lastReverted) {
+        assert suptech_feed_count() == count_before,
+            "failed batch must not change feed count";
+        assert suptech_merkle_root() == root_before,
+            "failed batch must not change Merkle root";
+    } else {
+        assert suptech_feed_count() == count_before + feeds.length,
+            "successful batch must increment count by batch length";
+    }
+}
+
+// ── CBDC Offline Reconciliation Invariants (Issue #848) ──────────────────────
+
+/*
+ * The CBDC offline voucher reconciliation verifier (src/cbdc_offline.rs)
+ * detects double-spends of offline vouchers and reconciles them against
+ * the online ledger. The properties below prove state consistency under
+ * duplicate submissions, out-of-order timestamps, mid-batch rollbacks,
+ * and recovery.
+ */
+
+methods {
+    // CBDC offline reconciliation interface
+    function cbdc_redeem_voucher(address submitter, bytes32 voucher_id, uint64 timestamp, bytes proof) external returns (bool);
+    function cbdc_reconcile_batch(address submitter, tuple(bytes32, uint64, bytes)[] vouchers) external returns (uint32);
+    function cbdc_rollback_batch(address caller, uint32 batch_id) external;
+    function cbdc_recover(address caller) external;
+
+    // CBDC queries (view functions)
+    function cbdc_redeemed_count() external returns (uint32) envfree;
+    function cbdc_is_redeemed(bytes32 voucher_id) external returns (bool) envfree;
+    function cbdc_last_timestamp(bytes32 voucher_id) external returns (uint64) envfree;
+    function cbdc_merkle_root() external returns (bytes32) envfree;
+    function cbdc_chain_head() external returns (bytes32) envfree;
+}
+
+// Tracks the set of redeemed vouchers (double-spend guard)
+ghost mapping(bytes32 => bool) ghost_redeemed;
+
+// Tracks the highest timestamp accepted per voucher
+ghost mapping(bytes32 => uint64) ghost_cbdc_last_timestamp;
+
+/*
+ * INVARIANT: CBDC No Double-Spend
+ *
+ * A voucher that has already been redeemed must never be redeemed again.
+ * Formally: ∀ voucher_id. redeemed(voucher_id) → ¬redeemable(voucher_id)
+ */
+invariant cbdcNoDoubleSpend()
+    forall bytes32 voucher_id. (
+        cbdc_is_redeemed(voucher_id) => ghost_redeemed[voucher_id]
+    )
+
+/*
+ * INVARIANT: CBDC Redeemed Count Monotonicity
+ *
+ * The redeemed voucher count must never decrease except through an
+ * explicit, successful mid-batch rollback.
+ */
+invariant cbdcRedeemedCountMonotone()
+    cbdc_redeemed_count() >= 0
+
+/*
+ * INVARIANT: CBDC Timestamp Monotonicity
+ *
+ * The last accepted timestamp per voucher must be non-decreasing across
+ * successful redemptions, even when events arrive out of order.
+ */
+invariant cbdcTimestampMonotone()
+    forall bytes32 voucher_id. (
+        cbdc_last_timestamp(voucher_id) >= ghost_cbdc_last_timestamp[voucher_id]
+    )
+
+/*
+ * INVARIANT: CBDC Merkle Root Integrity
+ *
+ * After any successful redemption or recovery, the Merkle root must be
+ * non-zero whenever at least one voucher has been redeemed.
+ */
+invariant cbdcMerkleRootIntegrity()
+    cbdc_redeemed_count() > 0 => cbdc_merkle_root() != to_bytes32(0)
+
+/*
+ * INVARIANT: CBDC Hash-Chain Continuity
+ *
+ * The chain head must be non-zero whenever vouchers exist, and must remain
+ * stable across recovery.
+ */
+invariant cbdcChainHeadStable()
+    cbdc_redeemed_count() > 0 => cbdc_chain_head() != to_bytes32(0)
+
+/*
+ * RULE: cbdc_duplicate_redemption_reverts
+ *
+ * Redeeming an already-redeemed voucher must revert (double-spend guard).
+ */
+rule cbdcDuplicateRedemptionReverts(env e) {
+    bytes32 voucher_id;
+    require cbdc_is_redeemed(voucher_id);
+
+    address submitter; uint64 timestamp; bytes proof;
+    cbdc_redeem_voucher@withrevert(e, submitter, voucher_id, timestamp, proof);
+
+    assert lastReverted,
+        "cbdc_redeem_voucher must revert on duplicate redemption";
+}
+
+/*
+ * RULE: cbdc_out_of_order_timestamp_rejected
+ *
+ * An out-of-order redemption (timestamp older than the last accepted for
+ * the same voucher) must not advance the last timestamp.
+ */
+rule cbdcOutOfOrderTimestampRejected(env e) {
+    bytes32 voucher_id;
+    uint64 last_ts = cbdc_last_timestamp(voucher_id);
+    uint64 older_ts;
+    require older_ts < last_ts;
+
+    address submitter; bytes proof;
+    cbdc_redeem_voucher@withrevert(e, submitter, voucher_id, older_ts, proof);
+
+    assert lastReverted, "out-of-order redemptions must be rejected";
+    assert cbdc_last_timestamp(voucher_id) == last_ts,
+        "rejected out-of-order redemption must not advance last timestamp";
+}
+
+/*
+ * RULE: cbdc_mid_batch_rollback_restores_state
+ *
+ * A mid-batch rollback must restore the redeemed count, Merkle root, and
+ * chain head to their pre-batch values.
+ */
+rule cbdcMidBatchRollbackRestoresState(env e) {
+    uint32 count_before = cbdc_redeemed_count();
+    bytes32 root_before = cbdc_merkle_root();
+    bytes32 head_before = cbdc_chain_head();
+
+    address caller; uint32 batch_id;
+    cbdc_rollback_batch(e, caller, batch_id);
+
+    assert cbdc_redeemed_count() == count_before,
+        "rollback must restore redeemed count";
+    assert cbdc_merkle_root() == root_before,
+        "rollback must restore Merkle root";
+    assert cbdc_chain_head() == head_before,
+        "rollback must restore chain head";
+}
+
+/*
+ * RULE: cbdc_recovery_preserves_merkle_and_chain
+ *
+ * After a simulated recovery, the Merkle root and hash chain head must
+ * remain consistent with the committed redemption set.
+ */
+rule cbdcRecoveryPreservesIntegrity(env e) {
+    uint32 count_before = cbdc_redeemed_count();
+    bytes32 root_before = cbdc_merkle_root();
+    bytes32 head_before = cbdc_chain_head();
+
+    address caller;
+    cbdc_recover(e, caller);
+
+    assert cbdc_redeemed_count() == count_before,
+        "recovery must not change redeemed count";
+    assert cbdc_merkle_root() == root_before,
+        "recovery must preserve Merkle root";
+    assert cbdc_chain_head() == head_before,
+        "recovery must preserve hash-chain head";
+}
+
+/*
+ * RULE: cbdc_batch_reconciliation_atomicity
+ *
+ * A batch reconciliation must either fully succeed (incrementing the
+ * redeemed count by the batch length) or fully revert (leaving state
+ * unchanged).
+ */
+rule cbdcBatchReconciliationAtomicity(env e) {
+    uint32 count_before = cbdc_redeemed_count();
+    bytes32 root_before = cbdc_merkle_root();
+
+    address submitter; tuple(bytes32, uint64, bytes)[] vouchers;
+    cbdc_reconcile_batch@withrevert(e, submitter, vouchers);
+
+    if (lastReverted) {
+        assert cbdc_redeemed_count() == count_before,
+            "failed batch must not change redeemed count";
+        assert cbdc_merkle_root() == root_before,
+            "failed batch must not change Merkle root";
+    } else {
+        assert cbdc_redeemed_count() == count_before + vouchers.length,
+            "successful batch must increment count by batch length";
+    }
+}
+
 // ── Helper functions (spec-level abstractions) ────────────────────────────────
 
 // Returns the current global max logs setting

@@ -328,6 +328,273 @@ fn chaos_rate_limit_change() {
     assert!(result.is_err());
 }
 
+// ── Chaos Engineering: Suptech Feeds ──────────────────────────────────────────
+
+fn create_suptech_feeds() -> (Env, Address, SuptechFeedsClient<'static>) {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(SuptechFeeds, ());
+    let client = SuptechFeedsClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+    client.initialize(&admin);
+    (env, admin, client)
+}
+
+#[test]
+fn chaos_suptech_feeds_duplicate_submission_rejected() {
+    let (env, admin, client) = create_suptech_feeds();
+    let reporter = Address::generate(&env);
+
+    env.mock_all_auths();
+    let payload = Bytes::from_slice(&env, b"feed-1");
+
+    client.submit_feed(&reporter, &symbol_short!("trade"), &payload, &1);
+
+    // Duplicate submission with the same sequence must be rejected.
+    let result = client.try_submit_feed(&reporter, &symbol_short!("trade"), &payload, &1);
+    assert!(result.is_err());
+
+    // State remains consistent after the rejected duplicate.
+    assert_eq!(client.feed_count(&reporter), 1);
+}
+
+#[test]
+fn chaos_suptech_feeds_out_of_order_timestamps() {
+    let (env, admin, client) = create_suptech_feeds();
+    let reporter = Address::generate(&env);
+
+    env.mock_all_auths();
+    let payload = Bytes::from_slice(&env, b"feed");
+
+    // Submit events out of timestamp order; the dispatcher must accept them
+    // and preserve the hash chain regardless of arrival order.
+    env.ledger().set_timestamp(3000);
+    client.submit_feed(&reporter, &symbol_short!("trade"), &payload, &3);
+
+    env.ledger().set_timestamp(1000);
+    client.submit_feed(&reporter, &symbol_short!("trade"), &payload, &1);
+
+    env.ledger().set_timestamp(2000);
+    client.submit_feed(&reporter, &symbol_short!("trade"), &payload, &2);
+
+    assert_eq!(client.feed_count(&reporter), 3);
+    assert!(client.verify_hash_chain());
+}
+
+#[test]
+fn chaos_suptech_feeds_mid_batch_rollback() {
+    let (env, admin, client) = create_suptech_feeds();
+    let reporter = Address::generate(&env);
+
+    env.mock_all_auths();
+    let payload = Bytes::from_slice(&env, b"feed");
+
+    client.submit_feed(&reporter, &symbol_short!("trade"), &payload, &1);
+
+    // A batch that fails partway through must not leave partial state.
+    let result = client.try_submit_batch(
+        &reporter,
+        &Vec::from_array(
+            &env,
+            [
+                (symbol_short!("trade"), payload.clone(), 2u64),
+                (symbol_short!("trade"), payload.clone(), 2u64), // duplicate -> fails
+            ],
+        ),
+    );
+    assert!(result.is_err());
+
+    // No partial writes from the rolled-back batch.
+    assert_eq!(client.feed_count(&reporter), 1);
+    assert!(client.verify_hash_chain());
+}
+
+#[test]
+fn chaos_suptech_feeds_recovery_preserves_merkle_proof() {
+    let (env, admin, client) = create_suptech_feeds();
+    let reporter = Address::generate(&env);
+
+    env.mock_all_auths();
+    let payload = Bytes::from_slice(&env, b"feed");
+
+    client.submit_feed(&reporter, &symbol_short!("trade"), &payload, &1);
+    client.submit_feed(&reporter, &symbol_short!("trade"), &payload, &2);
+
+    let root_before = client.merkle_root();
+
+    // Simulate a failure and recovery cycle.
+    client.pause(&admin);
+    let result = client.try_submit_feed(&reporter, &symbol_short!("trade"), &payload, &3);
+    assert!(result.is_err());
+    client.unpause(&admin);
+
+    // Merkle root and hash chain must be unchanged after recovery.
+    assert_eq!(client.merkle_root(), root_before);
+    assert!(client.verify_hash_chain());
+
+    // The proof for an existing leaf still verifies after recovery.
+    let proof = client.get_merkle_proof(&1);
+    assert!(client.verify_merkle_proof(&1, &proof));
+}
+
+#[test]
+fn chaos_suptech_feeds_recovery_after_rollback() {
+    let (env, admin, client) = create_suptech_feeds();
+    let reporter = Address::generate(&env);
+
+    env.mock_all_auths();
+    let payload = Bytes::from_slice(&env, b"feed");
+
+    client.submit_feed(&reporter, &symbol_short!("trade"), &payload, &1);
+
+    let result = client.try_submit_batch(
+        &reporter,
+        &Vec::from_array(
+            &env,
+            [
+                (symbol_short!("trade"), payload.clone(), 2u64),
+                (symbol_short!("trade"), payload.clone(), 2u64),
+            ],
+        ),
+    );
+    assert!(result.is_err());
+
+    // Recovery: a valid submission after the rollback succeeds and the chain
+    // remains intact.
+    client.submit_feed(&reporter, &symbol_short!("trade"), &payload, &2);
+    assert_eq!(client.feed_count(&reporter), 2);
+    assert!(client.verify_hash_chain());
+}
+
+// ── Chaos Engineering: CBDC Offline ───────────────────────────────────────────
+
+fn create_cbdc_offline() -> (Env, Address, CbdcOfflineClient<'static>) {
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(CbdcOffline, ());
+    let client = CbdcOfflineClient::new(&env, &contract_id);
+
+    env.mock_all_auths();
+    client.initialize(&admin);
+    (env, admin, client)
+}
+
+#[test]
+fn chaos_cbdc_offline_duplicate_voucher_rejected() {
+    let (env, admin, client) = create_cbdc_offline();
+    let holder = Address::generate(&env);
+
+    env.mock_all_auths();
+    let voucher = BytesN::from_array(&env, &[7u8; 32]);
+
+    client.redeem_voucher(&holder, &voucher, &100);
+
+    // Re-submitting the same voucher is a double-spend and must be rejected.
+    let result = client.try_redeem_voucher(&holder, &voucher, &100);
+    assert!(result.is_err());
+
+    assert_eq!(client.redeemed_count(), 1);
+}
+
+#[test]
+fn chaos_cbdc_offline_out_of_order_timestamps() {
+    let (env, admin, client) = create_cbdc_offline();
+    let holder = Address::generate(&env);
+
+    env.mock_all_auths();
+    let v1 = BytesN::from_array(&env, &[1u8; 32]);
+    let v2 = BytesN::from_array(&env, &[2u8; 32]);
+    let v3 = BytesN::from_array(&env, &[3u8; 32]);
+
+    // Vouchers arrive out of order; reconciliation must still converge.
+    env.ledger().set_timestamp(3000);
+    client.redeem_voucher(&holder, &v3, &100);
+
+    env.ledger().set_timestamp(1000);
+    client.redeem_voucher(&holder, &v1, &100);
+
+    env.ledger().set_timestamp(2000);
+    client.redeem_voucher(&holder, &v2, &100);
+
+    assert_eq!(client.redeemed_count(), 3);
+    assert!(client.verify_hash_chain());
+}
+
+#[test]
+fn chaos_cbdc_offline_mid_batch_rollback() {
+    let (env, admin, client) = create_cbdc_offline();
+    let holder = Address::generate(&env);
+
+    env.mock_all_auths();
+    let v1 = BytesN::from_array(&env, &[1u8; 32]);
+    let v2 = BytesN::from_array(&env, &[2u8; 32]);
+
+    client.redeem_voucher(&holder, &v1, &100);
+
+    // Batch contains a duplicate voucher -> must roll back entirely.
+    let result = client.try_redeem_batch(
+        &holder,
+        &Vec::from_array(&env, [(v2.clone(), 100i128), (v2.clone(), 100i128)]),
+    );
+    assert!(result.is_err());
+
+    assert_eq!(client.redeemed_count(), 1);
+    assert!(client.verify_hash_chain());
+}
+
+#[test]
+fn chaos_cbdc_offline_recovery_preserves_merkle_proof() {
+    let (env, admin, client) = create_cbdc_offline();
+    let holder = Address::generate(&env);
+
+    env.mock_all_auths();
+    let v1 = BytesN::from_array(&env, &[1u8; 32]);
+    let v2 = BytesN::from_array(&env, &[2u8; 32]);
+
+    client.redeem_voucher(&holder, &v1, &100);
+    client.redeem_voucher(&holder, &v2, &100);
+
+    let root_before = client.merkle_root();
+
+    // Simulate a failure and recovery cycle.
+    client.pause(&admin);
+    let v3 = BytesN::from_array(&env, &[3u8; 32]);
+    let result = client.try_redeem_voucher(&holder, &v3, &100);
+    assert!(result.is_err());
+    client.unpause(&admin);
+
+    // Merkle root and hash chain must be unchanged after recovery.
+    assert_eq!(client.merkle_root(), root_before);
+    assert!(client.verify_hash_chain());
+
+    let proof = client.get_merkle_proof(&v1);
+    assert!(client.verify_merkle_proof(&v1, &proof));
+}
+
+#[test]
+fn chaos_cbdc_offline_recovery_after_rollback() {
+    let (env, admin, client) = create_cbdc_offline();
+    let holder = Address::generate(&env);
+
+    env.mock_all_auths();
+    let v1 = BytesN::from_array(&env, &[1u8; 32]);
+    let v2 = BytesN::from_array(&env, &[2u8; 32]);
+
+    client.redeem_voucher(&holder, &v1, &100);
+
+    let result = client.try_redeem_batch(
+        &holder,
+        &Vec::from_array(&env, [(v2.clone(), 100i128), (v2.clone(), 100i128)]),
+    );
+    assert!(result.is_err());
+
+    // Recovery: a valid redemption after the rollback succeeds.
+    client.redeem_voucher(&holder, &v2, &100);
+    assert_eq!(client.redeemed_count(), 2);
+    assert!(client.verify_hash_chain());
+}
+
 // ── Chaos Engineering: Recovery After Failure ─────────────────────────────────
 
 #[test]

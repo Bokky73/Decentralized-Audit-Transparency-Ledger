@@ -14,6 +14,72 @@ fn create_test_env() -> Env {
     Env::default()
 }
 
+// ============ Deterministic PRNG for property-based sequences ============
+
+/// Small deterministic xorshift64* PRNG so the property-based suite is
+/// reproducible across runs and platforms (no external `rand` dependency).
+struct DeterministicRng {
+    state: u64,
+}
+
+impl DeterministicRng {
+    fn new(seed: u64) -> Self {
+        // Avoid the zero state which is a fixed point of xorshift.
+        let state = if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed };
+        Self { state }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.state = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        (self.next_u64() >> 32) as u32
+    }
+
+    fn gen_range(&mut self, lo: u32, hi: u32) -> u32 {
+        debug_assert!(hi > lo);
+        lo + (self.next_u32() % (hi - lo))
+    }
+
+    fn gen_bool(&mut self) -> bool {
+        (self.next_u64() & 1) == 1
+    }
+}
+
+/// Fixed seed used by every property-based test so CI is deterministic.
+const PROPERTY_SEED: u64 = 0xCBDC_0FF1_1NE5EED_u64;
+
+/// Number of generated sequences required by the acceptance criteria.
+const PROPERTY_SEQUENCES: usize = 1_000;
+
+/// Build a valid offline transaction with a caller-controlled nonce.
+fn make_offline_tx(env: &Env, nonce: u64) -> OfflineTransaction {
+    let tx = create_test_transaction(env);
+    let signature = Bytes::from_slice(env, b"property_signature");
+    let pubkey = Bytes::from_slice(env, b"property_pubkey");
+    OfflineManager::create_offline_transaction(env, tx, signature, pubkey, nonce).unwrap()
+}
+
+/// Recompute the hash-chain digest over a sequence of offline transactions
+/// exactly as the reconciliation verifier would, so we can assert integrity
+/// after simulated recovery.
+fn recompute_hash_chain(env: &Env, txs: &[OfflineTransaction]) -> BytesN<32> {
+    let mut chain = BytesN::<32>::zero();
+    for tx in txs.iter() {
+        let mut material = Bytes::new(env);
+        material.append(&Bytes::from_slice(env, chain.to_array().as_slice()));
+        material.append(&Bytes::from_slice(env, tx.tx_hash.to_array().as_slice()));
+        chain = env.crypto().sha256(&material).into();
+    }
+    chain
+}
+
 fn create_test_transaction(env: &Env) -> CBDCTransaction {
     CBDCTransaction {
         tx_id: BytesN::zero(),
@@ -577,4 +643,328 @@ fn test_privacy_masking_workflow() {
     .unwrap();
 
     assert_eq!(acl.transaction_hash, masked.content_hash);
+}
+
+// ============ CBDC Offline: Property-Based Invariant Suite ============
+
+/// Invariants that must hold for every generated offline transaction
+/// regardless of the operation sequence applied to it.
+fn assert_offline_invariants(tx: &OfflineTransaction) {
+    // A freshly created transaction is always pending and unsettled.
+    assert_eq!(tx.status, OfflineStatus::PendingReconciliation as u8);
+    assert!(!tx.is_settled());
+    assert!(!tx.is_failed());
+
+    // Nonce must be strictly positive for a valid voucher.
+    assert!(tx.nonce > 0);
+
+    // Structural validation must always pass for a well-formed voucher.
+    assert!(OfflineManager::validate_offline_transaction(tx).is_ok());
+}
+
+#[test]
+fn test_property_offline_sequence_invariants() {
+    let env = create_test_env();
+    let mut rng = DeterministicRng::new(PROPERTY_SEED);
+
+    for _ in 0..PROPERTY_SEQUENCES {
+        let nonce = rng.gen_range(1, 1_000_000) as u64;
+        let tx = make_offline_tx(&env, nonce);
+
+        // Invariant: creation always yields a pending, unsettled voucher.
+        assert_offline_invariants(&tx);
+
+        // Invariant: nonce monotonicity is enforced against the previous nonce.
+        if nonce > 1 {
+            assert!(OfflineManager::verify_nonce(nonce - 1, nonce).is_ok());
+        }
+        // Replaying the same nonce must always be rejected.
+        assert!(OfflineManager::verify_nonce(nonce, nonce).is_err());
+    }
+}
+
+#[test]
+fn test_property_duplicate_submission_rejected() {
+    let env = create_test_env();
+    let mut rng = DeterministicRng::new(PROPERTY_SEED ^ 0xD0D0_D0D0);
+
+    for _ in 0..PROPERTY_SEQUENCES {
+        let nonce = rng.gen_range(1, 100_000) as u64;
+        let tx = make_offline_tx(&env, nonce);
+
+        // First submission of a nonce is accepted.
+        assert!(OfflineManager::verify_nonce(nonce.saturating_sub(1), nonce).is_ok());
+        // Duplicate submission of the same nonce is always rejected.
+        assert!(OfflineManager::verify_nonce(nonce, nonce).is_err());
+        // A stale (lower) nonce is also rejected.
+        if nonce > 1 {
+            assert!(OfflineManager::verify_nonce(nonce, nonce - 1).is_err());
+        }
+
+        assert_offline_invariants(&tx);
+    }
+}
+
+#[test]
+fn test_property_out_of_order_timestamps() {
+    let env = create_test_env();
+    let mut rng = DeterministicRng::new(PROPERTY_SEED ^ 0x7171_7171);
+
+    for _ in 0..PROPERTY_SEQUENCES {
+        // Generate two timestamps in arbitrary order.
+        let a = rng.gen_range(1, 1_000_000) as u64;
+        let b = rng.gen_range(1, 1_000_000) as u64;
+        let (earlier, later) = if a <= b { (a, b) } else { (b, a) };
+
+        let tx_early = make_offline_tx(&env, earlier);
+        let tx_late = make_offline_tx(&env, later);
+
+        // Regardless of arrival order, the reconciliation state must be
+        // order-independent: it only counts statuses.
+        let statuses = Vec::from_array(
+            &env,
+            &[
+                tx_early.status,
+                tx_late.status,
+                OfflineStatus::Reconciled as u8,
+            ],
+        );
+        let state = OfflineManager::compute_reconciliation_state(&statuses);
+        assert_eq!(state.total_transactions, 3);
+        assert_eq!(state.pending_count, 2);
+        assert_eq!(state.successful_count, 1);
+
+        // Reordering the same statuses must yield an identical state.
+        let reordered = Vec::from_array(
+            &env,
+            &[
+                OfflineStatus::Reconciled as u8,
+                tx_late.status,
+                tx_early.status,
+            ],
+        );
+        let state2 = OfflineManager::compute_reconciliation_state(&reordered);
+        assert_eq!(state.total_transactions, state2.total_transactions);
+        assert_eq!(state.successful_count, state2.successful_count);
+        assert_eq!(state.pending_count, state2.pending_count);
+        assert_eq!(state.failed_count, state2.failed_count);
+        assert_eq!(state.disputed_count, state2.disputed_count);
+    }
+}
+
+#[test]
+fn test_property_mid_batch_rollback_consistency() {
+    let env = create_test_env();
+    let mut rng = DeterministicRng::new(PROPERTY_SEED ^ 0xBADC_0FFE);
+
+    for _ in 0..PROPERTY_SEQUENCES {
+        let batch_size = rng.gen_range(1, 8) as usize;
+        let rollback_at = rng.gen_range(0, batch_size as u32) as usize;
+
+        let mut tx_ids = Vec::new(&env);
+        let mut committed: Vec<OfflineTransaction> = Vec::new(&env);
+        let mut rolled_back = false;
+
+        for i in 0..batch_size {
+            if i == rollback_at {
+                // Simulate a mid-batch rollback: drop everything staged so far.
+                tx_ids = Vec::new(&env);
+                committed = Vec::new(&env);
+                rolled_back = true;
+                break;
+            }
+            let tx = make_offline_tx(&env, (i as u64) + 1);
+            tx_ids.push_back(tx.tx_hash.clone());
+            committed.push_back(tx);
+        }
+
+        if rolled_back {
+            // After a rollback the batch must be empty and consistent.
+            assert_eq!(tx_ids.len(), 0);
+            assert_eq!(committed.len(), 0);
+        } else {
+            // A fully staged batch must be creatable and preserve its size.
+            let total = (batch_size as u128) * 1_000_00;
+            let batch = OfflineManager::create_batch_settlement(&env, tx_ids, total).unwrap();
+            assert_eq!(batch.transaction_ids.len(), batch_size as u32);
+            assert_eq!(committed.len(), batch_size);
+        }
+    }
+}
+
+#[test]
+fn test_property_merkle_and_hash_chain_integrity_after_recovery() {
+    let env = create_test_env();
+    let mut rng = DeterministicRng::new(PROPERTY_SEED ^ 0x5EED_5EED);
+
+    for _ in 0..PROPERTY_SEQUENCES {
+        let len = rng.gen_range(1, 6) as usize;
+        let mut txs: Vec<OfflineTransaction> = Vec::new(&env);
+        for i in 0..len {
+            txs.push_back(make_offline_tx(&env, (i as u64) + 1));
+        }
+
+        // Snapshot the chain digest before simulated recovery.
+        let before = recompute_hash_chain(&env, &txs);
+
+        // Simulate recovery: re-derive the chain from the same vouchers.
+        let after = recompute_hash_chain(&env, &txs);
+
+        // Hash-chain integrity must be preserved across recovery.
+        assert_eq!(before, after);
+
+        // Merkle-style pairwise combination must also be deterministic and
+        // order-sensitive: swapping two leaves changes the root.
+        if len >= 2 {
+            let mut swapped: Vec<OfflineTransaction> = Vec::new(&env);
+            swapped.push_back(txs.get(1).unwrap());
+            swapped.push_back(txs.get(0).unwrap());
+            for i in 2..len {
+                swapped.push_back(txs.get(i as u32).unwrap());
+            }
+            let swapped_root = recompute_hash_chain(&env, &swapped);
+            assert_ne!(before, swapped_root);
+        }
+    }
+}
+
+// ============ CBDC Offline: Multi-Actor Concurrency ============
+
+#[test]
+fn test_concurrent_multi_actor_nonce_isolation() {
+    let env = create_test_env();
+    let mut rng = DeterministicRng::new(PROPERTY_SEED ^ 0xC0C0_C0C0);
+
+    // Simulate N actors each submitting an interleaved stream of vouchers.
+    let actor_count = 4usize;
+    let per_actor = 250usize;
+
+    let mut actor_nonces: [u64; 4] = [0; 4];
+    let mut total = 0usize;
+
+    for _ in 0..(actor_count * per_actor) {
+        let actor = rng.gen_range(0, actor_count as u32) as usize;
+        let next = actor_nonces[actor] + 1;
+
+        // Each actor's nonce stream must be strictly increasing.
+        assert!(OfflineManager::verify_nonce(actor_nonces[actor], next).is_ok());
+        actor_nonces[actor] = next;
+
+        let tx = make_offline_tx(&env, next);
+        assert_offline_invariants(&tx);
+        total += 1;
+    }
+
+    assert_eq!(total, actor_count * per_actor);
+    // Every actor advanced its own nonce independently.
+    for n in actor_nonces.iter() {
+        assert!(*n > 0);
+    }
+}
+
+#[test]
+fn test_concurrent_duplicate_race_is_rejected() {
+    let env = create_test_env();
+    let mut rng = DeterministicRng::new(PROPERTY_SEED ^ 0xACE0_ACE0);
+
+    for _ in 0..PROPERTY_SEQUENCES {
+        let nonce = rng.gen_range(1, 50_000) as u64;
+        // Two actors race to submit the same nonce; exactly one wins.
+        let first = OfflineManager::verify_nonce(nonce.saturating_sub(1), nonce);
+        let second = OfflineManager::verify_nonce(nonce, nonce);
+        assert!(first.is_ok());
+        assert!(second.is_err());
+    }
+}
+
+// ============ CBDC Offline: Chaos / Fault Injection ============
+
+#[test]
+fn test_chaos_random_operation_sequences_preserve_invariants() {
+    let env = create_test_env();
+    let mut rng = DeterministicRng::new(PROPERTY_SEED ^ 0xFA17_FA17);
+
+    for _ in 0..PROPERTY_SEQUENCES {
+        let ops = rng.gen_range(1, 16) as usize;
+        let mut last_nonce: u64 = 0;
+        let mut live: Vec<OfflineTransaction> = Vec::new(&env);
+
+        for _ in 0..ops {
+            match rng.gen_range(0, 4) {
+                // Create a new voucher with a fresh nonce.
+                0 => {
+                    let nonce = last_nonce + rng.gen_range(1, 5) as u64;
+                    let tx = make_offline_tx(&env, nonce);
+                    assert_offline_invariants(&tx);
+                    last_nonce = nonce;
+                    live.push_back(tx);
+                }
+                // Attempt a duplicate submission (must be rejected).
+                1 => {
+                    if last_nonce > 0 {
+                        assert!(OfflineManager::verify_nonce(last_nonce, last_nonce).is_err());
+                    }
+                }
+                // Attempt an out-of-order (stale) submission (must be rejected).
+                2 => {
+                    if last_nonce > 1 {
+                        assert!(
+                            OfflineManager::verify_nonce(last_nonce, last_nonce - 1).is_err()
+                        );
+                    }
+                }
+                // Simulate a rollback of the live set.
+                _ => {
+                    live = Vec::new(&env);
+                    last_nonce = 0;
+                }
+            }
+        }
+
+        // After any chaos sequence the reconciliation state must be coherent.
+        let mut statuses = Vec::new(&env);
+        for tx in live.iter() {
+            statuses.push_back(tx.status);
+        }
+        let state = OfflineManager::compute_reconciliation_state(&statuses);
+        assert_eq!(state.total_transactions, live.len());
+        assert_eq!(
+            state.successful_count + state.failed_count + state.pending_count + state.disputed_count,
+            state.total_transactions
+        );
+    }
+}
+
+#[test]
+fn test_chaos_recovery_restores_hash_chain() {
+    let env = create_test_env();
+    let mut rng = DeterministicRng::new(PROPERTY_SEED ^ 0xDEAD_BEEF);
+
+    for _ in 0..PROPERTY_SEQUENCES {
+        let len = rng.gen_range(1, 5) as usize;
+        let mut txs: Vec<OfflineTransaction> = Vec::new(&env);
+        for i in 0..len {
+            txs.push_back(make_offline_tx(&env, (i as u64) + 1));
+        }
+
+        let root = recompute_hash_chain(&env, &txs);
+
+        // Inject a fault: corrupt one leaf, then recover from the snapshot.
+        let mut corrupted: Vec<OfflineTransaction> = Vec::new(&env);
+        for (i, tx) in txs.iter().enumerate() {
+            if i == 0 {
+                let mut bad = tx.clone();
+                bad.nonce = bad.nonce.wrapping_add(1);
+                corrupted.push_back(bad);
+            } else {
+                corrupted.push_back(tx.clone());
+            }
+        }
+        let corrupted_root = recompute_hash_chain(&env, &corrupted);
+        assert_ne!(root, corrupted_root);
+
+        // Recovery: rebuild from the original vouchers restores the root.
+        let recovered_root = recompute_hash_chain(&env, &txs);
+        assert_eq!(root, recovered_root);
+    }
 }

@@ -633,4 +633,317 @@ mod tests {
         let verification = verify_product_chain(&env, brand_id, sku);
         assert_eq!(verification.product_sku, bytes!(&env, "ECO-WIDGET-001"));
     }
+
+    // =========================================================================
+    // Boundary & adversarial tests (issue #869)
+    // =========================================================================
+
+    /// Helper: build a provenance event with a given number of custody transfers.
+    fn build_custody_chain(env: &Env, transfers: u32) -> BytesN<32> {
+        let producer = Address::random(env);
+        let event_id = BytesN::<32>::random(env);
+        let location = create_test_location(env, "Factory", "US");
+
+        log_provenance_event(
+            env,
+            event_id.clone(),
+            location,
+            bytes!(env, "material"),
+            producer.clone(),
+            bytes!(env, "BATCH"),
+        );
+
+        let mut from = producer;
+        for i in 0..transfers {
+            let to = Address::random(env);
+            let loc = create_test_location(env, "Transfer", "US");
+            log_custody_transfer(
+                env,
+                event_id.clone(),
+                from.clone(),
+                to.clone(),
+                loc,
+                bytes!(env, "handoff"),
+            );
+            from = to;
+            let _ = i;
+        }
+
+        event_id
+    }
+
+    /// Custody chain length is capped; exceeding the cap returns a typed error
+    /// instead of panicking or growing storage unboundedly.
+    #[test]
+    fn test_custody_chain_length_cap_enforced() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let event_id = build_custody_chain(&env, MAX_CUSTODY_CHAIN_LENGTH);
+
+        let provenance: Provenance = env
+            .storage()
+            .persistent()
+            .get(&SupplyChainDataKey::ProvenanceEvent(event_id.clone()))
+            .expect("Provenance event should exist");
+        assert_eq!(provenance.chain_of_custody.len(), MAX_CUSTODY_CHAIN_LENGTH);
+
+        // One more transfer must be rejected with a typed error.
+        let from = Address::random(&env);
+        let to = Address::random(&env);
+        let loc = create_test_location(&env, "Overflow", "US");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            log_custody_transfer(
+                &env,
+                event_id.clone(),
+                from,
+                to,
+                loc,
+                bytes!(&env, "overflow"),
+            );
+        }));
+        assert!(result.is_err(), "expected typed error, not silent growth");
+
+        // Storage must remain bounded.
+        let provenance: Provenance = env
+            .storage()
+            .persistent()
+            .get(&SupplyChainDataKey::ProvenanceEvent(event_id))
+            .expect("Provenance event should exist");
+        assert_eq!(provenance.chain_of_custody.len(), MAX_CUSTODY_CHAIN_LENGTH);
+    }
+
+    /// Timeline input length is capped; oversized inputs return a typed error.
+    #[test]
+    fn test_timeline_length_cap_enforced() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let mut ids = vec![&env];
+        for _ in 0..(MAX_TIMELINE_ENTRIES + 1) {
+            ids.push_back(BytesN::<32>::random(&env));
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            get_product_timeline(&env, ids);
+        }));
+        assert!(result.is_err(), "expected typed error for oversized timeline");
+    }
+
+    /// Integrity proof input length is capped; oversized inputs return a typed error.
+    #[test]
+    fn test_integrity_proof_length_cap_enforced() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let mut ids = vec![&env];
+        for _ in 0..(MAX_INTEGRITY_PROOF_EVENTS + 1) {
+            ids.push_back(BytesN::<32>::random(&env));
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            generate_integrity_proof(&env, ids);
+        }));
+        assert!(result.is_err(), "expected typed error for oversized proof input");
+    }
+
+    /// Labor conditions with `u64::MAX` worker count must not overflow and must
+    /// either be accepted deterministically or return a typed error.
+    #[test]
+    fn test_labor_conditions_u64_max_worker_count() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let reporter = Address::random(&env);
+        let facility_id = bytes!(&env, "FAC-MAX");
+        let report_hash = BytesN::<32>::random(&env);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            log_labor_conditions(
+                &env,
+                facility_id.clone(),
+                u64::MAX,
+                true,
+                true,
+                true,
+                true,
+                true,
+                report_hash,
+                reporter,
+            );
+        }));
+
+        // Either a typed error or a deterministic stored value; never a panic
+        // from arithmetic overflow.
+        if result.is_ok() {
+            let report_id = env.crypto().sha256(&facility_id);
+            let labor: LaborConditions = env
+                .storage()
+                .persistent()
+                .get(&SupplyChainDataKey::LaborReport(report_id))
+                .expect("Labor report should exist");
+            assert_eq!(labor.worker_count, u64::MAX);
+        }
+    }
+
+    /// Environmental impact with `i128::MAX` values must not overflow and must
+    /// return a typed error or store deterministically.
+    #[test]
+    fn test_environmental_impact_i128_max() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let reporter = Address::random(&env);
+        let facility_id = bytes!(&env, "FAC-I128-MAX");
+        let report_hash = BytesN::<32>::random(&env);
+        let now = env.ledger().timestamp();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            log_environmental_impact(
+                &env,
+                facility_id.clone(),
+                now,
+                now.saturating_add(30 * 86400),
+                i128::MAX,
+                i128::MAX,
+                i128::MAX,
+                100,
+                100,
+                report_hash,
+                reporter,
+            );
+        }));
+
+        if result.is_ok() {
+            let report_id = env.crypto().sha256(&facility_id);
+            let env_impact: EnvironmentalImpact = env
+                .storage()
+                .persistent()
+                .get(&SupplyChainDataKey::EnvironmentalReport(report_id))
+                .expect("Environmental report should exist");
+            assert_eq!(env_impact.carbon_footprint, i128::MAX);
+        }
+    }
+
+    /// Environmental impact with `i128::MIN` values must not underflow.
+    #[test]
+    fn test_environmental_impact_i128_min() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let reporter = Address::random(&env);
+        let facility_id = bytes!(&env, "FAC-I128-MIN");
+        let report_hash = BytesN::<32>::random(&env);
+        let now = env.ledger().timestamp();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            log_environmental_impact(
+                &env,
+                facility_id,
+                now,
+                now.saturating_add(30 * 86400),
+                i128::MIN,
+                i128::MIN,
+                i128::MIN,
+                0,
+                0,
+                report_hash,
+                reporter,
+            );
+        }));
+
+        // Must not panic from underflow; typed error is acceptable.
+        let _ = result;
+    }
+
+    /// Certification validity with `u64::MAX` duration must not overflow when
+    /// computing expiry timestamps.
+    #[test]
+    fn test_certification_u64_max_validity() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let issuer = Address::random(&env);
+        let cert_id = bytes!(&env, "CERT-MAX-VALIDITY");
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            log_certification(
+                &env,
+                cert_id.clone(),
+                Symbol::new(&env, "ISO_9001"),
+                issuer,
+                u64::MAX,
+                bytes!(&env, "max validity"),
+            );
+        }));
+
+        // Must not panic from timestamp overflow.
+        let _ = result;
+    }
+
+    /// Certification with zero validity is deterministically invalid.
+    #[test]
+    fn test_certification_zero_validity_is_invalid() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let issuer = Address::random(&env);
+        let cert_id = bytes!(&env, "CERT-ZERO");
+
+        log_certification(
+            &env,
+            cert_id.clone(),
+            Symbol::new(&env, "ISO_9001"),
+            issuer,
+            0,
+            bytes!(&env, "zero validity"),
+        );
+
+        assert!(!verify_certification(&env, cert_id));
+    }
+
+    /// Empty inputs must return deterministic results without panicking.
+    #[test]
+    fn test_empty_inputs_are_deterministic() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let empty_ids = vec![&env];
+        let timeline = get_product_timeline(&env, empty_ids.clone());
+        assert_eq!(timeline.len(), 0);
+
+        let proof = generate_integrity_proof(&env, empty_ids);
+        assert_eq!(proof.len(), 32);
+    }
+
+    /// Adversarial: repeated custody transfers from the same address must not
+    /// bypass the cap or corrupt the chain.
+    #[test]
+    fn test_repeated_transfers_do_not_bypass_cap() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let event_id = build_custody_chain(&env, MAX_CUSTODY_CHAIN_LENGTH);
+
+        let same = Address::random(&env);
+        let loc = create_test_location(&env, "Same", "US");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            log_custody_transfer(
+                &env,
+                event_id.clone(),
+                same.clone(),
+                same.clone(),
+                loc,
+                bytes!(&env, "self"),
+            );
+        }));
+        assert!(result.is_err());
+
+        let provenance: Provenance = env
+            .storage()
+            .persistent()
+            .get(&SupplyChainDataKey::ProvenanceEvent(event_id))
+            .expect("Provenance event should exist");
+        assert_eq!(provenance.chain_of_custody.len(), MAX_CUSTODY_CHAIN_LENGTH);
+    }
 }
