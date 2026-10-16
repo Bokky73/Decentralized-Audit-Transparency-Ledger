@@ -51,6 +51,41 @@ export interface EventPage {
   limit: number;
 }
 
+/** Opaque cursor token for deterministic cursor-based pagination. */
+export type PageCursor = string;
+
+/** Maximum number of items returned per page (capped at 100). */
+export type PageLimit = number;
+
+/** Maximum allowed page size for any paginated query. */
+export const MAX_PAGE_LIMIT = 100;
+
+/** Status enum used to filter query results. */
+export enum QueryStatus {
+  Pending = 0,
+  Active = 1,
+  Archived = 2,
+  Revoked = 3,
+}
+
+/** Multi-predicate filter for paginated queries. */
+export interface QueryFilter {
+  /** Inclusive lower bound on ledger timestamp. */
+  timestamp_from?: number;
+  /** Inclusive upper bound on ledger timestamp. */
+  timestamp_to?: number;
+  /** Restrict results to a single status. */
+  status?: QueryStatus;
+  /** Restrict results to a single submitter address. */
+  submitter?: string;
+}
+
+/** Paginated query result carrying a cursor for the next page. */
+export interface PaginatedResult<T = Event> {
+  items: T[];
+  next_cursor: PageCursor | null;
+}
+
 export interface CacheStats {
   hits: number;
   misses: number;

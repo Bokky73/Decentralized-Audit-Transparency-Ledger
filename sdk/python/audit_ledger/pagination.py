@@ -2,10 +2,15 @@
 
 Issue #248: Add cursor-based pagination, page iteration, total count caching,
 and pagination state management.
+Issue #852: Support the composite ordering-key cursor token format returned by
+``src/cbdc_privacy.rs`` and expose ``next_cursor`` traversal on :class:`Page`.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import time
 from dataclasses import dataclass, field
 from typing import (
@@ -20,6 +25,13 @@ from typing import (
 from .models import Page
 
 T = TypeVar("T")
+
+#: Maximum number of items a single page may request (mirrors the on-chain cap
+#: enforced by ``src/cbdc_privacy.rs``).
+MAX_PAGE_LIMIT = 100
+
+#: Separator used by the on-chain composite cursor encoding.
+_CURSOR_SEPARATOR = ":"
 
 # ── Cursor encoding ───────────────────────────────────────────────────────────
 
@@ -37,6 +49,71 @@ def encode_cursor(offset: int) -> str:
         An opaque cursor string.
     """
     return str(offset)
+
+
+def encode_composite_cursor(
+    ledger_timestamp: int,
+    status: int,
+    submitter: str,
+    sequence: int,
+) -> str:
+    """Encode a composite ordering key into an opaque cursor token.
+
+    The on-chain ``src/cbdc_privacy.rs`` module orders records by
+    ``(ledger_timestamp, status, submitter, sequence)`` so that ordering stays
+    stable across ledger upgrades and archival restores.  This helper produces
+    the matching opaque token.
+
+    Args:
+        ledger_timestamp: Ledger close time of the last returned record.
+        status: Status enum discriminant of the last returned record.
+        submitter: Submitter address of the last returned record.
+        sequence: Monotonic sequence number of the last returned record.
+
+    Returns:
+        An opaque cursor string.
+    """
+    payload = {
+        "t": int(ledger_timestamp),
+        "s": int(status),
+        "a": str(submitter),
+        "n": int(sequence),
+    }
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def decode_composite_cursor(cursor: str) -> "CompositeCursor":
+    """Decode a composite cursor token produced by the on-chain module.
+
+    Args:
+        cursor: Opaque cursor token.
+
+    Returns:
+        The decoded :class:`CompositeCursor`.
+
+    Raises:
+        ValueError: If the cursor is malformed.
+    """
+    if not isinstance(cursor, str) or not cursor:
+        raise ValueError(f"Invalid cursor: {cursor!r}")
+    padded = cursor + "=" * (-len(cursor) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+        payload = json.loads(raw.decode("utf-8"))
+    except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
+        raise ValueError(f"Invalid cursor: {cursor!r}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"Invalid cursor: {cursor!r}")
+    try:
+        return CompositeCursor(
+            ledger_timestamp=int(payload["t"]),
+            status=int(payload["s"]),
+            submitter=str(payload["a"]),
+            sequence=int(payload["n"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid cursor: {cursor!r}") from exc
 
 
 def decode_cursor(cursor: str) -> int:
@@ -58,6 +135,50 @@ def decode_cursor(cursor: str) -> int:
     if value < 0:
         raise ValueError(f"Cursor offset must be non-negative, got {value}")
     return value
+
+
+@dataclass(frozen=True)
+class CompositeCursor:
+    """A decoded composite ordering key.
+
+    Attributes:
+        ledger_timestamp: Ledger close time of the record.
+        status: Status enum discriminant of the record.
+        submitter: Submitter address of the record.
+        sequence: Monotonic sequence number of the record.
+    """
+
+    ledger_timestamp: int
+    status: int
+    submitter: str
+    sequence: int
+
+    def encode(self) -> str:
+        """Re-encode this ordering key as an opaque cursor token."""
+        return encode_composite_cursor(
+            self.ledger_timestamp, self.status, self.submitter, self.sequence
+        )
+
+    def sort_key(self) -> tuple:
+        """Deterministic ordering key matching the on-chain sort order."""
+        return (self.ledger_timestamp, self.status, self.submitter, self.sequence)
+
+
+def clamp_page_limit(limit: int) -> int:
+    """Clamp *limit* to the on-chain maximum page size.
+
+    Args:
+        limit: Requested page size.
+
+    Returns:
+        ``limit`` clamped to ``[1, MAX_PAGE_LIMIT]``.
+
+    Raises:
+        ValueError: If *limit* is not a positive integer.
+    """
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        raise ValueError(f"Page limit must be a positive integer, got {limit!r}")
+    return min(limit, MAX_PAGE_LIMIT)
 
 
 # ── Pagination state ──────────────────────────────────────────────────────────
@@ -105,6 +226,22 @@ class PaginationState:
         self.fetched = 0
         self.page_number = 0
         self.total = None
+        self.next_cursor = None
+
+    #: Opaque cursor token for the next page, as returned by the last fetch.
+    next_cursor: Optional[str] = None
+
+    def advance_cursor(self, next_cursor: Optional[str]) -> None:
+        """Advance the state using a server-issued ``next_cursor`` token.
+
+        Args:
+            next_cursor: Token from the previous response, or ``None`` when the
+                traversal is complete.
+        """
+        self.next_cursor = next_cursor
+        self.page_number += 1
+        if next_cursor is None:
+            self.total = self.fetched
 
 
 # ── Total count cache ─────────────────────────────────────────────────────────
@@ -204,7 +341,14 @@ class PageIterator(Generic[T]):
         if not page.items:
             raise StopIteration
 
-        self._state.advance(len(page.items))
+        next_cursor = getattr(page, "next_cursor", None)
+        if next_cursor is not None:
+            # Cursor-based traversal: the server tells us where to resume.
+            self._state.offset += len(page.items)
+            self._state.fetched += len(page.items)
+            self._state.advance_cursor(next_cursor)
+        else:
+            self._state.advance(len(page.items))
         return page
 
     @property
@@ -267,4 +411,84 @@ def fetch_page_by_cursor(
         ValueError: If the cursor is malformed.
     """
     offset = decode_cursor(cursor) if cursor is not None else 0
-    return fetch_fn(offset, limit)
+    return fetch_fn(offset, clamp_page_limit(limit))
+
+
+def fetch_page_by_composite_cursor(
+    fetch_fn: Callable[[Optional[CompositeCursor], int], Page[T]],
+    cursor: Optional[str],
+    limit: int = 50,
+) -> Page[T]:
+    """Fetch a single page using a composite ordering-key cursor.
+
+    This is the binding for the cursor token format emitted by
+    ``src/cbdc_privacy.rs``.
+
+    Args:
+        fetch_fn: Callable with signature ``(cursor, limit) -> Page[T]`` where
+            *cursor* is a :class:`CompositeCursor` or ``None`` for the first
+            page.
+        cursor: Opaque composite cursor from a previous response, or ``None``
+            to start from the beginning.
+        limit: Maximum number of items to return (clamped to
+            :data:`MAX_PAGE_LIMIT`).
+
+    Returns:
+        A :class:`~audit_ledger.models.Page` of items.
+
+    Raises:
+        ValueError: If the cursor is malformed.
+    """
+    decoded = decode_composite_cursor(cursor) if cursor is not None else None
+    return fetch_fn(decoded, clamp_page_limit(limit))
+
+
+def iter_pages_by_composite_cursor(
+    fetch_fn: Callable[[Optional[CompositeCursor], int], Page[T]],
+    limit: int = 50,
+    start_cursor: Optional[str] = None,
+) -> Iterator[Page[T]]:
+    """Iterate over every page using composite cursor traversal.
+
+    Traversal stops when the server returns no ``next_cursor`` or an empty
+    page, so it terminates correctly for empty results and single-item pages.
+
+    Args:
+        fetch_fn: Callable with signature ``(cursor, limit) -> Page[T]``.
+        limit: Items per page (clamped to :data:`MAX_PAGE_LIMIT`).
+        start_cursor: Optional cursor to resume from.
+
+    Yields:
+        Each :class:`~audit_ledger.models.Page` in order.
+    """
+    limit = clamp_page_limit(limit)
+    cursor: Optional[str] = start_cursor
+    while True:
+        page = fetch_page_by_composite_cursor(fetch_fn, cursor, limit)
+        if not page.items:
+            return
+        yield page
+        cursor = getattr(page, "next_cursor", None)
+        if cursor is None:
+            return
+
+
+def iter_all_items_by_composite_cursor(
+    fetch_fn: Callable[[Optional[CompositeCursor], int], Page[T]],
+    limit: int = 50,
+    start_cursor: Optional[str] = None,
+) -> Iterator[T]:
+    """Yield every individual item across all composite-cursor pages.
+
+    Args:
+        fetch_fn: Callable with signature ``(cursor, limit) -> Page[T]``.
+        limit: Items per page (clamped to :data:`MAX_PAGE_LIMIT`).
+        start_cursor: Optional cursor to resume from.
+
+    Yields:
+        Individual items of type ``T``.
+    """
+    for page in iter_pages_by_composite_cursor(
+        fetch_fn, limit=limit, start_cursor=start_cursor
+    ):
+        yield from page.items

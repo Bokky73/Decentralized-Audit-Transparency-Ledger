@@ -6,6 +6,16 @@ from dataclasses import dataclass, field
 from typing import Dict, Generic, List, Optional, TypeVar
 
 # ---------------------------------------------------------------------------
+# Pagination constants (#852)
+# ---------------------------------------------------------------------------
+
+MAX_PAGE_LIMIT = 100
+"""Hard cap on the number of items returned by a single paginated query."""
+
+DEFAULT_PAGE_LIMIT = 20
+"""Default page size used when the caller does not supply a limit."""
+
+# ---------------------------------------------------------------------------
 # Type aliases (#243)
 # ---------------------------------------------------------------------------
 
@@ -41,12 +51,93 @@ class Page(Generic[T]):
         total: Total number of events available.
         offset: Zero-based index of the first item on this page.
         limit: Maximum number of items requested per page.
+        next_cursor: Opaque cursor token for fetching the next page, or
+            ``None`` when this is the last page.
     """
 
     items: List[T]
     total: int
     offset: int
     limit: int
+    next_cursor: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Cursor-based pagination and filtering surface (#852)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PageCursor:
+    """Opaque cursor token identifying a position in a deterministic ordering.
+
+    Attributes:
+        token: The raw cursor token returned by the contract as
+            ``next_cursor``.  ``None`` denotes the start of the result set.
+    """
+
+    token: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, object]:
+        """Serialise the cursor for inclusion in a contract query request."""
+        return {"cursor": self.token}
+
+
+@dataclass
+class PageLimit:
+    """A validated page-size request.
+
+    The value is clamped to ``[1, MAX_PAGE_LIMIT]`` so that a single
+    invocation can never exhaust the Soroban CPU/memory budget.
+
+    Attributes:
+        value: The effective, clamped page size.
+    """
+
+    value: int = DEFAULT_PAGE_LIMIT
+
+    def __post_init__(self) -> None:
+        if self.value < 1:
+            self.value = 1
+        elif self.value > MAX_PAGE_LIMIT:
+            self.value = MAX_PAGE_LIMIT
+
+    def to_dict(self) -> Dict[str, object]:
+        """Serialise the limit for inclusion in a contract query request."""
+        return {"limit": self.value}
+
+
+@dataclass
+class EventFilter:
+    """Multi-predicate filter for paginated event queries.
+
+    All predicates are optional; ``None`` means "no constraint".  When
+    several are supplied they are combined with logical AND.
+
+    Attributes:
+        start_timestamp: Inclusive lower bound on the ledger timestamp.
+        end_timestamp: Inclusive upper bound on the ledger timestamp.
+        status: Optional status enum value (e.g. ``"active"``).
+        submitter: Optional Stellar address of the event submitter.
+    """
+
+    start_timestamp: Optional[int] = None
+    end_timestamp: Optional[int] = None
+    status: Optional[str] = None
+    submitter: Optional[Address] = None
+
+    def to_dict(self) -> Dict[str, object]:
+        """Serialise only the predicates that were actually supplied."""
+        result: Dict[str, object] = {}
+        if self.start_timestamp is not None:
+            result["start_timestamp"] = self.start_timestamp
+        if self.end_timestamp is not None:
+            result["end_timestamp"] = self.end_timestamp
+        if self.status is not None:
+            result["status"] = self.status
+        if self.submitter is not None:
+            result["submitter"] = self.submitter
+        return result
 
 
 # ---------------------------------------------------------------------------

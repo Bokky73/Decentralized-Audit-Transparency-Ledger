@@ -732,6 +732,97 @@
       "fields": [],
       "tombstone": false,
       "comment": "Total number of LCA profiles registered."
+    },
+    {
+      "ordinal": 79,
+      "name": "MlFeatureVector",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "BytesN<32>" }
+      ],
+      "tombstone": false,
+      "comment": "ML feature vector record keyed by a 32-byte feature ID (issue #856). Persistent tier: retained for the full audit retention SLA."
+    },
+    {
+      "ordinal": 80,
+      "name": "MlFeatureLineage",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "BytesN<32>" }
+      ],
+      "tombstone": false,
+      "comment": "Feature lineage edge set keyed by a 32-byte feature ID (issue #856). Persistent tier: audit-critical provenance."
+    },
+    {
+      "ordinal": 81,
+      "name": "MlFeatureHashAnchor",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "BytesN<32>" }
+      ],
+      "tombstone": false,
+      "comment": "Hash anchor for a feature vector keyed by a 32-byte feature ID (issue #856). Persistent tier: tamper-evident anchoring."
+    },
+    {
+      "ordinal": 82,
+      "name": "MlFeatureIndex",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "u32" }
+      ],
+      "tombstone": false,
+      "comment": "Sequential index → feature ID for ordered retrieval (issue #856). Persistent tier."
+    },
+    {
+      "ordinal": 83,
+      "name": "MlFeatureCount",
+      "kind": "unit",
+      "fields": [],
+      "tombstone": false,
+      "comment": "Total number of ML feature vectors registered (issue #856). Instance tier: cheap to rebuild, no archival SLA."
+    },
+    {
+      "ordinal": 84,
+      "name": "MlFeatureTtlConfig",
+      "kind": "unit",
+      "fields": [],
+      "tombstone": false,
+      "comment": "TTL bump policy for ML feature store records (issue #856): threshold and extend-to ledger counts. Instance tier."
+    },
+    {
+      "ordinal": 85,
+      "name": "MlFeatureScratch",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "BytesN<32>" }
+      ],
+      "tombstone": false,
+      "comment": "Transient per-feature scratch buffer used during recomputation (issue #856). Temporary tier: safe to evict, never audit-critical."
     }
-  ]
+  ],
+  "byte_budgets": {
+    "MlFeatureVector": 128,
+    "MlFeatureLineage": 256,
+    "MlFeatureHashAnchor": 64,
+    "MlFeatureIndex": 8,
+    "MlFeatureCount": 8,
+    "MlFeatureTtlConfig": 16,
+    "MlFeatureScratch": 96
+  },
+  "storage_tiers": {
+    "MlFeatureVector": "persistent",
+    "MlFeatureLineage": "persistent",
+    "MlFeatureHashAnchor": "persistent",
+    "MlFeatureIndex": "persistent",
+    "MlFeatureCount": "instance",
+    "MlFeatureTtlConfig": "instance",
+    "MlFeatureScratch": "temporary"
+  },
+  "ttl_policies": {
+    "MlFeatureVector": { "threshold_ledgers": 100000, "extend_to_ledgers": 500000, "permissionless_extend": true },
+    "MlFeatureLineage": { "threshold_ledgers": 100000, "extend_to_ledgers": 500000, "permissionless_extend": true },
+    "MlFeatureHashAnchor": { "threshold_ledgers": 100000, "extend_to_ledgers": 500000, "permissionless_extend": true },
+    "MlFeatureIndex": { "threshold_ledgers": 100000, "extend_to_ledgers": 500000, "permissionless_extend": true },
+    "MlFeatureScratch": { "threshold_ledgers": 1000, "extend_to_ledgers": 5000, "permissionless_extend": false }
+  }
 }

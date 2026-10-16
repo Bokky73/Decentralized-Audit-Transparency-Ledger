@@ -1,9 +1,111 @@
 {
-  "version": 1,
+  "version": 2,
   "contract": "AuditLedger",
   "generated_at": "2026-09-27T05:00:00Z",
-  "git_commit": "initial-baseline",
+  "git_commit": "ml-feature-store-ttl-optimization",
   "rust_toolchain": "stable",
+  "storage_tiers": {
+    "instance": [
+      "Owner",
+      "Config",
+      "Paused",
+      "AllowlistMode",
+      "GlobalMetadataMaxSize",
+      "RuntimeState",
+      "EventEmissionConfig",
+      "EventEmissionVersion",
+      "LowCostMode",
+      "DefaultNonceWindowSize",
+      "DefaultNonceMaxValue",
+      "ArchivedTotalEvents",
+      "Owners",
+      "RequiredSignatures",
+      "ProposalCount",
+      "EventTtl",
+      "ContractVersion",
+      "CategoryMaxLen",
+      "LogEventReentrancyGuard",
+      "PausedSince",
+      "PauseConfig",
+      "PauseReason",
+      "PauseMetadata",
+      "PauseExpiration",
+      "SnapshotCount",
+      "TtlCleanupStats",
+      "ArchiveScanCursor",
+      "AllMaterialIds",
+      "CircularitySnapshotCount",
+      "CircularityTotals",
+      "LcaProfileCount"
+    ],
+    "persistent": [
+      "SubmitterBlocklist",
+      "SubmitterAllowlist",
+      "EventCapSet",
+      "EventMaxLogs",
+      "EventCapRemoved",
+      "EventCapConfig",
+      "EventTypeIndices",
+      "SubmitterEventIndices",
+      "SubmitterEventCount",
+      "EventData",
+      "EventOrder",
+      "EventMetadataMaxSize",
+      "MetadataSchema",
+      "EventSchema",
+      "SchemaVersions",
+      "EventSchemaMigration",
+      "EventSignature",
+      "EventTypeCount",
+      "EventHeaderKey",
+      "EventMeta",
+      "EventMetadata",
+      "EventVersions",
+      "SubmitterRateLimit",
+      "SubmitterRateState",
+      "SubmitterNonce",
+      "SubmitterNonceConfig",
+      "ArchivedEventData",
+      "ArchivedEventHeaderKey",
+      "ArchivedEventMetadata",
+      "ArchivedEventArchivedFlag",
+      "ArchivedEventOrder",
+      "EventArchivedFlag",
+      "Proposal",
+      "EventContentHash",
+      "WebhookRegistrations",
+      "SnapshotData",
+      "MaterialPassport",
+      "MaterialLoopEvents",
+      "CircularitySnapshot",
+      "LcaProfile",
+      "LcaPhaseImpact",
+      "LcaResult",
+      "LcaNormRef",
+      "LcaWeightingScheme",
+      "LcaUncertainty",
+      "LcaDbEntry"
+    ],
+    "temporary": [
+      "GlobalMaxLogs",
+      "TotalEvents"
+    ]
+  },
+  "ttl_policy": {
+    "persistent_min_ttl_ledgers": 518400,
+    "persistent_extend_to_ledgers": 1036800,
+    "temporary_min_ttl_ledgers": 17280,
+    "temporary_extend_to_ledgers": 34560,
+    "instance_extend_to_ledgers": 1036800,
+    "extend_ttl_helper": "extend_ttl",
+    "permissionless": true
+  },
+  "byte_budget": {
+    "max_variant_discriminant_bytes": 1,
+    "max_key_bytes": 64,
+    "max_record_bytes": 512,
+    "total_snapshot_bytes": 24576
+  },
   "variants": [
     {
       "ordinal": 0,
@@ -732,6 +834,79 @@
       "fields": [],
       "tombstone": false,
       "comment": "Total number of LCA profiles registered."
+    },
+    {
+      "ordinal": 79,
+      "name": "FeatureVector",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "BytesN<32>" }
+      ],
+      "tombstone": false,
+      "tier": "persistent",
+      "comment": "On-chain ML feature vector keyed by a 32-byte feature ID (issue #856). Packed fields; persistent with TTL extension."
+    },
+    {
+      "ordinal": 80,
+      "name": "FeatureVectorCount",
+      "kind": "unit",
+      "fields": [],
+      "tombstone": false,
+      "tier": "instance",
+      "comment": "Total number of ML feature vectors registered (issue #856)."
+    },
+    {
+      "ordinal": 81,
+      "name": "FeatureLineage",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "BytesN<32>" }
+      ],
+      "tombstone": false,
+      "tier": "persistent",
+      "comment": "Feature vector lineage (parent/child edges) keyed by 32-byte feature ID (issue #856)."
+    },
+    {
+      "ordinal": 82,
+      "name": "FeatureHashAnchor",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "BytesN<32>" }
+      ],
+      "tombstone": false,
+      "tier": "persistent",
+      "comment": "Hash anchoring record for a feature vector keyed by 32-byte content hash (issue #856)."
+    },
+    {
+      "ordinal": 83,
+      "name": "FeatureVectorIndex",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "u32" }
+      ],
+      "tombstone": false,
+      "tier": "persistent",
+      "comment": "Sequential index → feature ID for ordered retrieval (issue #856)."
+    },
+    {
+      "ordinal": 84,
+      "name": "FeatureVectorTtl",
+      "kind": "unit",
+      "fields": [],
+      "tombstone": false,
+      "tier": "instance",
+      "comment": "TTL configuration for ML feature vector records (issue #856). Absent = default persistent TTL policy."
+    },
+    {
+      "ordinal": 85,
+      "name": "FeatureVectorArchivedFlag",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "BytesN<32>" }
+      ],
+      "tombstone": false,
+      "tier": "persistent",
+      "comment": "Archival flag for a feature vector keyed by 32-byte feature ID (issue #856)."
     }
   ]
 }

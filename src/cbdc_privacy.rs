@@ -4,6 +4,210 @@ use crate::cbdc_types::{CBDCTransaction, PrivacyTier};
 use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env};
 use soroban_sdk::xdr::ToXdr;
 
+/// Hard cap on the number of items returned by any single paginated query.
+pub const MAX_PAGE_LIMIT: u32 = 100;
+
+/// Opaque cursor token for deterministic pagination.
+///
+/// Encodes a composite ordering key of `(ledger_sequence, primary_id)` so that
+/// traversal is stable and reproducible across ledger upgrades and archival
+/// restores. A cursor of `None` means "start from the beginning".
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PageCursor {
+    /// Ledger sequence of the last returned item.
+    pub ledger_sequence: u32,
+    /// Primary id (monotonic within the ledger) of the last returned item.
+    pub primary_id: u64,
+}
+
+impl PageCursor {
+    pub fn new(ledger_sequence: u32, primary_id: u64) -> Self {
+        PageCursor {
+            ledger_sequence,
+            primary_id,
+        }
+    }
+
+    /// Returns true if `(ledger_sequence, primary_id)` sorts strictly after this cursor.
+    pub fn is_after(&self, ledger_sequence: u32, primary_id: u64) -> bool {
+        (ledger_sequence, primary_id) > (self.ledger_sequence, self.primary_id)
+    }
+}
+
+/// Requested page size, clamped to [`MAX_PAGE_LIMIT`].
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PageLimit {
+    /// Number of items requested by the caller.
+    pub limit: u32,
+}
+
+impl PageLimit {
+    /// Construct a page limit, clamping to the hard cap of [`MAX_PAGE_LIMIT`].
+    pub fn new(limit: u32) -> Self {
+        PageLimit {
+            limit: if limit > MAX_PAGE_LIMIT {
+                MAX_PAGE_LIMIT
+            } else {
+                limit
+            },
+        }
+    }
+
+    /// Effective (clamped) page size.
+    pub fn effective(&self) -> u32 {
+        if self.limit > MAX_PAGE_LIMIT {
+            MAX_PAGE_LIMIT
+        } else {
+            self.limit
+        }
+    }
+}
+
+/// Status of a masked transaction record for filtering purposes.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum RecordStatus {
+    /// Record is active and readable.
+    Active = 0,
+    /// Record has been revoked.
+    Revoked = 1,
+    /// Record has expired.
+    Expired = 2,
+}
+
+/// Multi-predicate filter for paginated collection queries.
+///
+/// All predicates are optional; `None` means "no constraint". When multiple
+/// predicates are supplied they are combined with logical AND.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryFilter {
+    /// Inclusive lower bound on ledger timestamp.
+    pub start_timestamp: Option<u64>,
+    /// Inclusive upper bound on ledger timestamp.
+    pub end_timestamp: Option<u64>,
+    /// Required status, if any.
+    pub status: Option<RecordStatus>,
+    /// Required submitter address, if any.
+    pub submitter: Option<Address>,
+}
+
+impl QueryFilter {
+    /// An empty filter that matches every record.
+    pub fn none() -> Self {
+        QueryFilter {
+            start_timestamp: None,
+            end_timestamp: None,
+            status: None,
+            submitter: None,
+        }
+    }
+
+    /// Returns true if the supplied record attributes satisfy this filter.
+    pub fn matches(
+        &self,
+        timestamp: u64,
+        status: RecordStatus,
+        submitter: &Address,
+    ) -> bool {
+        if let Some(start) = self.start_timestamp {
+            if timestamp < start {
+                return false;
+            }
+        }
+        if let Some(end) = self.end_timestamp {
+            if timestamp > end {
+                return false;
+            }
+        }
+        if let Some(required) = self.status {
+            if status != required {
+                return false;
+            }
+        }
+        if let Some(required) = &self.submitter {
+            if submitter != required {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// A single page of results plus the cursor to fetch the next page.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Page<T> {
+    /// Items in this page, in deterministic composite-key order.
+    pub items: soroban_sdk::Vec<T>,
+    /// Cursor to pass to the next call, or `None` when the collection is exhausted.
+    pub next_cursor: Option<PageCursor>,
+}
+
+/// A record stored in the privacy collection, ordered by `(ledger_sequence, primary_id)`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrivacyRecord {
+    /// Ledger sequence in which the record was created.
+    pub ledger_sequence: u32,
+    /// Monotonic primary id within the ledger.
+    pub primary_id: u64,
+    /// Ledger timestamp of the record.
+    pub timestamp: u64,
+    /// Current status of the record.
+    pub status: RecordStatus,
+    /// Submitter of the record.
+    pub submitter: Address,
+    /// Masked transaction payload.
+    pub transaction: MaskedTransaction,
+}
+
+/// Deterministic pagination helper over an ordered slice of [`PrivacyRecord`]s.
+///
+/// Records are assumed to be sorted ascending by `(ledger_sequence, primary_id)`.
+/// The helper applies the filter, skips everything at or before `cursor`, and
+/// collects at most `limit.effective()` items, returning the cursor for the next
+/// page (or `None` when exhausted).
+pub fn paginate_records(
+    env: &Env,
+    records: &[PrivacyRecord],
+    filter: &QueryFilter,
+    cursor: Option<PageCursor>,
+    limit: PageLimit,
+) -> Page<PrivacyRecord> {
+    let page_size = limit.effective();
+    let mut items: soroban_sdk::Vec<PrivacyRecord> = soroban_sdk::Vec::new(env);
+    let mut next_cursor: Option<PageCursor> = None;
+    let mut collected: u32 = 0;
+
+    for record in records.iter() {
+        // Skip anything at or before the cursor position.
+        if let Some(c) = &cursor {
+            if !c.is_after(record.ledger_sequence, record.primary_id) {
+                continue;
+            }
+        }
+
+        if !filter.matches(record.timestamp, record.status, &record.submitter) {
+            continue;
+        }
+
+        if collected == page_size {
+            // We have a full page and there is at least one more matching item.
+            next_cursor = Some(PageCursor::new(record.ledger_sequence, record.primary_id));
+            break;
+        }
+
+        items.push_back(record.clone());
+        collected += 1;
+    }
+
+    Page { items, next_cursor }
+}
+
 /// Privacy-masked transaction for confidential operations.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -375,5 +579,182 @@ mod tests {
         assert!(!AccessLevel::None.can_audit());
         assert!(AccessLevel::AuditOnly.can_audit());
         assert!(AccessLevel::Read.can_audit());
+    }
+
+    fn make_record(
+        env: &Env,
+        ledger_sequence: u32,
+        primary_id: u64,
+        timestamp: u64,
+        status: RecordStatus,
+        submitter: &Address,
+    ) -> PrivacyRecord {
+        PrivacyRecord {
+            ledger_sequence,
+            primary_id,
+            timestamp,
+            status,
+            submitter: submitter.clone(),
+            transaction: MaskedTransaction {
+                content_hash: BytesN::zero(),
+                privacy_tier: PrivacyTier::Public as u32,
+                encrypted_data: None,
+                authorized_decrypters: soroban_sdk::Vec::new(env),
+                masked_at: timestamp,
+                encryption_metadata: Bytes::new(env),
+            },
+        }
+    }
+
+    #[test]
+    fn test_page_limit_clamps_to_max() {
+        assert_eq!(PageLimit::new(0).effective(), 0);
+        assert_eq!(PageLimit::new(5).effective(), 5);
+        assert_eq!(PageLimit::new(MAX_PAGE_LIMIT).effective(), MAX_PAGE_LIMIT);
+        assert_eq!(PageLimit::new(MAX_PAGE_LIMIT + 1).effective(), MAX_PAGE_LIMIT);
+        assert_eq!(PageLimit::new(u32::MAX).effective(), MAX_PAGE_LIMIT);
+    }
+
+    #[test]
+    fn test_pagination_empty_results() {
+        let env = Env::default();
+        let records: [PrivacyRecord; 0] = [];
+        let page = paginate_records(
+            &env,
+            &records,
+            &QueryFilter::none(),
+            None,
+            PageLimit::new(10),
+        );
+        assert_eq!(page.items.len(), 0);
+        assert!(page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn test_pagination_single_item_page() {
+        let env = Env::default();
+        let submitter = Address::generate(&env);
+        let records = [
+            make_record(&env, 1, 1, 100, RecordStatus::Active, &submitter),
+            make_record(&env, 1, 2, 200, RecordStatus::Active, &submitter),
+        ];
+
+        let page = paginate_records(
+            &env,
+            &records,
+            &QueryFilter::none(),
+            None,
+            PageLimit::new(1),
+        );
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items.get(0).unwrap().primary_id, 1);
+        let cursor = page.next_cursor.expect("expected next cursor");
+        assert_eq!(cursor.ledger_sequence, 1);
+        assert_eq!(cursor.primary_id, 2);
+
+        let page2 = paginate_records(
+            &env,
+            &records,
+            &QueryFilter::none(),
+            Some(cursor),
+            PageLimit::new(1),
+        );
+        assert_eq!(page2.items.len(), 1);
+        assert_eq!(page2.items.get(0).unwrap().primary_id, 2);
+        assert!(page2.next_cursor.is_none());
+    }
+
+    #[test]
+    fn test_pagination_cursor_past_end() {
+        let env = Env::default();
+        let submitter = Address::generate(&env);
+        let records = [
+            make_record(&env, 1, 1, 100, RecordStatus::Active, &submitter),
+            make_record(&env, 1, 2, 200, RecordStatus::Active, &submitter),
+        ];
+
+        let page = paginate_records(
+            &env,
+            &records,
+            &QueryFilter::none(),
+            Some(PageCursor::new(99, 99)),
+            PageLimit::new(10),
+        );
+        assert_eq!(page.items.len(), 0);
+        assert!(page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn test_pagination_full_traversal() {
+        let env = Env::default();
+        let submitter = Address::generate(&env);
+        let records = [
+            make_record(&env, 1, 1, 100, RecordStatus::Active, &submitter),
+            make_record(&env, 1, 2, 200, RecordStatus::Active, &submitter),
+            make_record(&env, 2, 1, 300, RecordStatus::Active, &submitter),
+            make_record(&env, 2, 2, 400, RecordStatus::Active, &submitter),
+            make_record(&env, 3, 1, 500, RecordStatus::Active, &submitter),
+        ];
+
+        let mut cursor: Option<PageCursor> = None;
+        let mut seen: u32 = 0;
+        loop {
+            let page = paginate_records(
+                &env,
+                &records,
+                &QueryFilter::none(),
+                cursor,
+                PageLimit::new(2),
+            );
+            seen += page.items.len();
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(seen, 5);
+    }
+
+    #[test]
+    fn test_pagination_filter_by_timestamp_range() {
+        let env = Env::default();
+        let submitter = Address::generate(&env);
+        let records = [
+            make_record(&env, 1, 1, 100, RecordStatus::Active, &submitter),
+            make_record(&env, 1, 2, 200, RecordStatus::Active, &submitter),
+            make_record(&env, 1, 3, 300, RecordStatus::Active, &submitter),
+        ];
+
+        let filter = QueryFilter {
+            start_timestamp: Some(150),
+            end_timestamp: Some(250),
+            status: None,
+            submitter: None,
+        };
+        let page = paginate_records(&env, &records, &filter, None, PageLimit::new(10));
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items.get(0).unwrap().primary_id, 2);
+    }
+
+    #[test]
+    fn test_pagination_filter_by_status_and_submitter() {
+        let env = Env::default();
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+        let records = [
+            make_record(&env, 1, 1, 100, RecordStatus::Active, &alice),
+            make_record(&env, 1, 2, 200, RecordStatus::Revoked, &alice),
+            make_record(&env, 1, 3, 300, RecordStatus::Active, &bob),
+        ];
+
+        let filter = QueryFilter {
+            start_timestamp: None,
+            end_timestamp: None,
+            status: Some(RecordStatus::Active),
+            submitter: Some(alice.clone()),
+        };
+        let page = paginate_records(&env, &records, &filter, None, PageLimit::new(10));
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items.get(0).unwrap().primary_id, 1);
     }
 }
