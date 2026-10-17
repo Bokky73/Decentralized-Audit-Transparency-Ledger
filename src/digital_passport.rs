@@ -33,6 +33,15 @@ pub enum DigitalPassportError {
     ImportValidationFailed = 2012,
 }
 
+/// Deterministic bounds to prevent unbounded storage growth and arithmetic overflow.
+const MAX_MATERIALS: usize = 64;
+const MAX_SUBSTANCES: usize = 64;
+const MAX_BYTES_LEN: usize = 1024;
+const PERCENTAGE_MAX: u32 = 100;
+const REPAIRABILITY_SCORE_MAX: u32 = 10;
+const END_OF_LIFE_SCORE_MAX: u32 = 100;
+const TEN_YEARS_SECONDS: u64 = 10 * 365 * 86400;
+
 /// ESPR Compliance Status
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -239,6 +248,80 @@ pub struct PassportExport {
     pub verification_url: Bytes,        // URL for verification
 }
 
+/// Validate a material's bounded fields; panics deterministically on malformed input.
+fn validate_material(env: &Env, material: &Material) {
+    if material.percentage_by_weight > PERCENTAGE_MAX {
+        panic!("material percentage exceeds 100%");
+    }
+    if material.material_name.len() > MAX_BYTES_LEN {
+        panic!("material name too long");
+    }
+    if material.hazard_classification.len() > MAX_BYTES_LEN {
+        panic!("hazard classification too long");
+    }
+}
+
+/// Validate durability bounded fields; panics deterministically on malformed input.
+fn validate_durability(env: &Env, durability: &Durability) {
+    if durability.expected_lifetime_years == 0 {
+        panic!("expected lifetime must be non-zero");
+    }
+    if durability.warranty_years > durability.expected_lifetime_years {
+        panic!("warranty exceeds expected lifetime");
+    }
+    if durability.repairability_score > REPAIRABILITY_SCORE_MAX {
+        panic!("repairability score exceeds 10");
+    }
+    if durability.spare_parts_years > durability.expected_lifetime_years {
+        panic!("spare parts years exceed expected lifetime");
+    }
+    if durability.repair_information.len() > MAX_BYTES_LEN {
+        panic!("repair information too long");
+    }
+}
+
+/// Validate circularity bounded fields; panics deterministically on malformed input.
+fn validate_circularity(env: &Env, circularity: &Circularity) {
+    if circularity.recycled_content_percent > PERCENTAGE_MAX {
+        panic!("recycled content percent exceeds 100%");
+    }
+    if circularity.end_of_life_score > END_OF_LIFE_SCORE_MAX {
+        panic!("end-of-life score exceeds 100");
+    }
+    if circularity.recyclable_materials.len() > MAX_MATERIALS {
+        panic!("too many recyclable materials");
+    }
+    if circularity.disassembly_instructions.len() > MAX_BYTES_LEN {
+        panic!("disassembly instructions too long");
+    }
+    if circularity.recycling_instructions.len() > MAX_BYTES_LEN {
+        panic!("recycling instructions too long");
+    }
+}
+
+/// Validate carbon footprint bounded fields; panics deterministically on malformed input.
+fn validate_carbon_footprint(env: &Env, carbon: &CarbonFootprint) {
+    if carbon.carbon_offset_program.len() > MAX_BYTES_LEN {
+        panic!("carbon offset program too long");
+    }
+}
+
+/// Validate product identity bounded fields; panics deterministically on malformed input.
+fn validate_identity(env: &Env, identity: &ProductIdentity) {
+    if identity.product_id.is_empty() {
+        panic!("product id must not be empty");
+    }
+    if identity.product_name.len() > MAX_BYTES_LEN {
+        panic!("product name too long");
+    }
+    if identity.model_number.len() > MAX_BYTES_LEN {
+        panic!("model number too long");
+    }
+    if identity.batch_number.len() > MAX_BYTES_LEN {
+        panic!("batch number too long");
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Storage Keys
 // ─────────────────────────────────────────────────────────────────────────────
@@ -293,7 +376,17 @@ pub fn create_passport(
     manufacturer.require_auth();
 
     let now = env.ledger().timestamp();
-    let passport_id = env.crypto().sha256(&product_id).to_bytes();
+
+    // Bound and validate inputs before any state mutation.
+    if materials.len() > MAX_MATERIALS {
+        panic!("materials exceed max count");
+    }
+    for material in materials.iter() {
+        validate_material(&env, &material);
+    }
+    validate_durability(&env, &durability);
+    validate_circularity(&env, &circularity);
+    validate_carbon_footprint(&env, &carbon_footprint);
 
     let identity = ProductIdentity {
         product_id: product_id.clone(),
@@ -305,6 +398,17 @@ pub fn create_passport(
         registration_date: now,
         market_entry_date: now,
     };
+    validate_identity(&env, &identity);
+
+    let passport_id = env.crypto().sha256(&product_id).to_bytes();
+
+    // Reject duplicate passports to keep counters and index consistent.
+    if env.storage()
+        .persistent()
+        .has(&PassportDataKey::Passport(passport_id.clone()))
+    {
+        panic!("passport already exists");
+    }
 
     let passport = DigitalPassport {
         passport_id: passport_id.clone(),
@@ -324,7 +428,7 @@ pub fn create_passport(
         lifecycle_stage: PassportLifecycleStage::Created,
         created_date: now,
         last_updated: now,
-        expiry_date: now + (10 * 365 * 86400), // 10 year expiry
+        expiry_date: now.saturating_add(TEN_YEARS_SECONDS),
         version: 1,
     };
 
@@ -344,7 +448,7 @@ pub fn create_passport(
         .persistent()
         .set(&PassportDataKey::ProductPassports(product_id), &product_passports);
 
-    // Increment counter
+    // Increment counter with saturating arithmetic to prevent overflow.
     let count: u32 = env
         .storage()
         .persistent()
@@ -352,7 +456,7 @@ pub fn create_passport(
         .unwrap_or(0);
     env.storage()
         .persistent()
-        .set(&PassportDataKey::PassportCount, &(count + 1));
+        .set(&PassportDataKey::PassportCount, &(count.saturating_add(1)));
 
     passport_id
 }
@@ -380,17 +484,25 @@ pub fn update_passport(
     }
 
     if let Some(m) = materials {
+        if m.len() > MAX_MATERIALS {
+            panic!("materials exceed max count");
+        }
+        for material in m.iter() {
+            validate_material(&env, &material);
+        }
         passport.materials = m;
     }
     if let Some(c) = carbon_footprint {
+        validate_carbon_footprint(&env, &c);
         passport.carbon_footprint = c;
     }
     if let Some(ci) = circularity {
+        validate_circularity(&env, &ci);
         passport.circularity = ci;
     }
 
     passport.last_updated = env.ledger().timestamp();
-    passport.version += 1;
+    passport.version = passport.version.saturating_add(1);
 
     env.storage()
         .persistent()
@@ -453,6 +565,18 @@ pub fn record_repair(
 ) {
     repair_facility.require_auth();
 
+    if parts_replaced.len() > MAX_SUBSTANCES {
+        panic!("too many replaced parts");
+    }
+    for part in parts_replaced.iter() {
+        if part.len() > MAX_BYTES_LEN {
+            panic!("part name too long");
+        }
+    }
+    if repair_notes.len() > MAX_BYTES_LEN {
+        panic!("repair notes too long");
+    }
+
     let repair = RepairEvent {
         repair_date: env.ledger().timestamp(),
         repair_facility: repair_facility.clone(),
@@ -472,7 +596,7 @@ pub fn record_repair(
         .persistent()
         .set(&PassportDataKey::RepairHistory(passport_id.clone()), &repairs);
 
-    // Increment repair count
+    // Increment repair count with saturating arithmetic.
     let count: u32 = env
         .storage()
         .persistent()
@@ -480,7 +604,7 @@ pub fn record_repair(
         .unwrap_or(0);
     env.storage()
         .persistent()
-        .set(&PassportDataKey::RepairCount(passport_id), &(count + 1));
+        .set(&PassportDataKey::RepairCount(passport_id), &(count.saturating_add(1)));
 }
 
 /// Record a recycling event
@@ -493,6 +617,19 @@ pub fn record_recycling(
     certification: Bytes,
 ) {
     recycling_facility.require_auth();
+
+    if recovery_rate > PERCENTAGE_MAX {
+        panic!("recovery rate exceeds 100%");
+    }
+    if materials_recovered.len() > MAX_MATERIALS {
+        panic!("too many recovered materials");
+    }
+    for material in materials_recovered.iter() {
+        validate_material(&env, &material);
+    }
+    if certification.len() > MAX_BYTES_LEN {
+        panic!("certification too long");
+    }
 
     let recycling = RecyclingEvent {
         recycling_date: env.ledger().timestamp(),
@@ -513,7 +650,7 @@ pub fn record_recycling(
         .persistent()
         .set(&PassportDataKey::RecyclingHistory(passport_id.clone()), &recyclings);
 
-    // Increment recycling count
+    // Increment recycling count with saturating arithmetic.
     let count: u32 = env
         .storage()
         .persistent()
@@ -521,7 +658,7 @@ pub fn record_recycling(
         .unwrap_or(0);
     env.storage()
         .persistent()
-        .set(&PassportDataKey::RecyclingCount(passport_id.clone()), &(count + 1));
+        .set(&PassportDataKey::RecyclingCount(passport_id.clone()), &(count.saturating_add(1)));
 
     // Transition to recycled if recovery rate > 80%
     if recovery_rate > 80 {
@@ -543,6 +680,10 @@ pub fn record_refurbishment(
     scope: Bytes,
 ) {
     refurbishment_facility.require_auth();
+
+    if scope.len() > MAX_BYTES_LEN {
+        panic!("refurbishment scope too long");
+    }
 
     let refurbishment = RefurbishmentEvent {
         refurbishment_date: env.ledger().timestamp(),
@@ -619,10 +760,10 @@ pub fn verify_espr_compliance(
     }
     checked_fields.push_back(Bytes::from_slice(&env, b"circularity"));
 
-    // Verify total material percentage (should sum to ~100)
+    // Verify total material percentage (should sum to ~100) with saturating arithmetic.
     let mut total_percent: u32 = 0;
     for material in passport.materials.iter() {
-        total_percent += material.percentage_by_weight;
+        total_percent = total_percent.saturating_add(material.percentage_by_weight);
     }
     if total_percent < 95 || total_percent > 105 {
         issues.push_back(Bytes::from_slice(&env, b"Material percentages don't sum to 100%"));
@@ -776,15 +917,12 @@ pub fn import_passport_data(
 ) -> BytesN<32> {
     importer.require_auth();
 
-    // Simplified import - in real system would parse import_data
-    let passport_id = env.crypto().sha256(&import_data).to_bytes();
-
-    // Verify import format is valid
-    if import_data.is_empty() {
+    if import_data.is_empty() || import_data.len() > MAX_BYTES_LEN {
         panic!("Invalid import data");
     }
 
-    passport_id
+    // Simplified import - in real system would parse import_data
+    env.crypto().sha256(&import_data).to_bytes()
 }
 
 /// Export to standardized format (e.g., EU XML schema)

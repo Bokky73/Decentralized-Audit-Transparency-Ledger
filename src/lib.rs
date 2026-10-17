@@ -59,6 +59,12 @@ pub mod multi_region;
 // Predictive capacity planning, ML forecasting, and auto-scaling.
 pub mod capacity_planning;
 
+#[cfg(test)]
+mod digital_passport_invariant_tests;
+
+#[cfg(test)]
+mod capacity_planning_tests;
+
 // Operational runbook automation, validation, and execution auditing.
 pub mod runbook_automation;
 
