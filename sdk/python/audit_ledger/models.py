@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Dict, Generic, List, Optional, TypeVar
 
 # ---------------------------------------------------------------------------
@@ -47,6 +48,144 @@ class Page(Generic[T]):
     total: int
     offset: int
     limit: int
+
+
+# ---------------------------------------------------------------------------
+# SupTech rule query models (#832)
+# ---------------------------------------------------------------------------
+
+#: Maximum number of items the contract will return in a single page.
+MAX_PAGE_LIMIT = 100
+
+
+class RuleStatus(str, Enum):
+    """Lifecycle status of a SupTech rule."""
+
+    ACTIVE = "Active"
+    INACTIVE = "Inactive"
+    DEPRECATED = "Deprecated"
+    SUSPENDED = "Suspended"
+
+    @classmethod
+    def from_value(cls, value: object) -> "RuleStatus":
+        """Coerce a raw contract value into a :class:`RuleStatus`.
+
+        Accepts either the enum member name (``"ACTIVE"``) or its value
+        (``"Active"``), case-insensitively.  Unknown values raise
+        :class:`ValueError`.
+        """
+        if isinstance(value, cls):
+            return value
+        text = str(value).strip()
+        for member in cls:
+            if text.lower() in (member.name.lower(), member.value.lower()):
+                return member
+        raise ValueError(f"Unknown RuleStatus: {value!r}")
+
+
+@dataclass
+class RuleQueryFilter:
+    """Multi-predicate filter for paginated SupTech rule queries.
+
+    All predicates are optional; omitted predicates do not constrain the
+    result set.  The filter is serialised to the contract's expected
+    argument shape via :meth:`to_dict`.
+
+    Attributes:
+        start_timestamp: Inclusive lower bound on ledger timestamp.
+        end_timestamp: Inclusive upper bound on ledger timestamp.
+        status: Optional rule status to match.
+        submitter: Optional submitter address to match.
+        limit: Requested page size; capped at :data:`MAX_PAGE_LIMIT`.
+        cursor: Opaque cursor token from a previous page, or ``None``
+            to start from the beginning of the result set.
+    """
+
+    start_timestamp: Optional[int] = None
+    end_timestamp: Optional[int] = None
+    status: Optional[RuleStatus] = None
+    submitter: Optional[Address] = None
+    limit: int = MAX_PAGE_LIMIT
+    cursor: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.limit < 1:
+            raise ValueError("limit must be >= 1")
+        if self.limit > MAX_PAGE_LIMIT:
+            self.limit = MAX_PAGE_LIMIT
+        if (
+            self.start_timestamp is not None
+            and self.end_timestamp is not None
+            and self.start_timestamp > self.end_timestamp
+        ):
+            raise ValueError("start_timestamp must be <= end_timestamp")
+
+    def to_dict(self) -> Dict[str, object]:
+        """Return the filter as a contract-RPC argument dictionary."""
+        return {
+            "start_timestamp": self.start_timestamp,
+            "end_timestamp": self.end_timestamp,
+            "status": self.status.value if self.status is not None else None,
+            "submitter": self.submitter,
+            "limit": self.limit,
+            "cursor": self.cursor,
+        }
+
+
+@dataclass
+class RulePage(Generic[T]):
+    """A single page of SupTech rule query results.
+
+    Attributes:
+        items: The rules on this page.
+        next_cursor: Opaque cursor for the following page, or ``None``
+            when this is the last page.
+        limit: Page size requested for this query.
+    """
+
+    items: List[T]
+    next_cursor: Optional[str] = None
+    limit: int = MAX_PAGE_LIMIT
+
+    @property
+    def has_more(self) -> bool:
+        """Whether another page is available."""
+        return self.next_cursor is not None
+
+    @classmethod
+    def from_dict(
+        cls,
+        d: Dict[str, object],
+        item_factory: Optional[object] = None,
+    ) -> "RulePage[T]":
+        """Construct a :class:`RulePage` from a raw contract response.
+
+        Args:
+            d: Raw dictionary from the contract RPC response.
+            item_factory: Optional callable applied to each raw item to
+                build a typed model.  When omitted, raw items are kept.
+
+        Returns:
+            A fully-populated :class:`RulePage` instance.
+        """
+        raw_items = d.get("items") or []
+        items: List[T] = []
+        for raw in raw_items:  # type: ignore[union-attr]
+            if item_factory is not None:
+                items.append(item_factory(raw))  # type: ignore[operator]
+            else:
+                items.append(raw)  # type: ignore[arg-type]
+
+        raw_cursor = d.get("next_cursor")
+        next_cursor = str(raw_cursor) if raw_cursor else None
+
+        raw_limit = d.get("limit", MAX_PAGE_LIMIT)
+        try:
+            limit = int(raw_limit)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            limit = MAX_PAGE_LIMIT
+
+        return cls(items=items, next_cursor=next_cursor, limit=limit)
 
 
 # ---------------------------------------------------------------------------

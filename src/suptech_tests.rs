@@ -316,6 +316,236 @@ fn test_ruleset_creation() {
     assert_eq!(ruleset.version, 1);
 }
 
+// ============ SupTech Rules Pagination Tests ============
+
+fn seed_rule(env: &Env, framework: RegulatoryFramework, severity: u32, timestamp: u64) -> Rule {
+    let rule = RulesEngine::create_rule(
+        env,
+        framework,
+        Bytes::from_slice(env, b"Rule"),
+        Bytes::from_slice(env, b"condition"),
+        Bytes::from_slice(env, b"action"),
+        severity,
+    )
+    .unwrap();
+    RulesEngine::set_rule_created_at(env, &rule, timestamp);
+    rule
+}
+
+#[test]
+fn test_pagination_empty_result_set() {
+    let env = create_test_env();
+    let query = RuleQuery {
+        cursor: None,
+        limit: 10,
+        min_timestamp: None,
+        max_timestamp: None,
+        status: None,
+        submitter: None,
+    };
+
+    let page = RulesEngine::query_rules(&env, &query).unwrap();
+    assert_eq!(page.items.len(), 0);
+    assert!(page.next_cursor.is_none());
+}
+
+#[test]
+fn test_pagination_single_item_page() {
+    let env = create_test_env();
+    seed_rule(&env, RegulatoryFramework::FSB, 5, 1000);
+
+    let query = RuleQuery {
+        cursor: None,
+        limit: 1,
+        min_timestamp: None,
+        max_timestamp: None,
+        status: None,
+        submitter: None,
+    };
+
+    let page = RulesEngine::query_rules(&env, &query).unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert!(page.next_cursor.is_none());
+}
+
+#[test]
+fn test_pagination_cursor_past_end() {
+    let env = create_test_env();
+    seed_rule(&env, RegulatoryFramework::FSB, 5, 1000);
+
+    let query = RuleQuery {
+        cursor: Some(PageCursor { offset: 100 }),
+        limit: 10,
+        min_timestamp: None,
+        max_timestamp: None,
+        status: None,
+        submitter: None,
+    };
+
+    let page = RulesEngine::query_rules(&env, &query).unwrap();
+    assert_eq!(page.items.len(), 0);
+    assert!(page.next_cursor.is_none());
+}
+
+#[test]
+fn test_pagination_full_multi_page_traversal() {
+    let env = create_test_env();
+    for i in 0..25u64 {
+        seed_rule(&env, RegulatoryFramework::FSB, 5, 1000 + i);
+    }
+
+    let mut cursor: Option<PageCursor> = None;
+    let mut seen: Vec<u64> = Vec::new();
+    let mut pages = 0;
+
+    loop {
+        let query = RuleQuery {
+            cursor: cursor.clone(),
+            limit: 10,
+            min_timestamp: None,
+            max_timestamp: None,
+            status: None,
+            submitter: None,
+        };
+        let page = RulesEngine::query_rules(&env, &query).unwrap();
+        pages += 1;
+
+        for item in page.items.iter() {
+            seen.push(item.created_at);
+        }
+
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+
+    assert_eq!(seen.len(), 25);
+    assert_eq!(pages, 3);
+
+    // Stable deterministic ordering assertion.
+    let mut sorted = seen.clone();
+    sorted.sort();
+    assert_eq!(seen, sorted);
+}
+
+#[test]
+fn test_pagination_enforces_page_size_cap() {
+    let env = create_test_env();
+    for i in 0..150u64 {
+        seed_rule(&env, RegulatoryFramework::FSB, 5, 1000 + i);
+    }
+
+    let query = RuleQuery {
+        cursor: None,
+        limit: 1000,
+        min_timestamp: None,
+        max_timestamp: None,
+        status: None,
+        submitter: None,
+    };
+
+    let page = RulesEngine::query_rules(&env, &query).unwrap();
+    assert_eq!(page.items.len(), 100);
+    assert!(page.next_cursor.is_some());
+}
+
+#[test]
+fn test_pagination_filter_timestamp_range() {
+    let env = create_test_env();
+    for i in 0..10u64 {
+        seed_rule(&env, RegulatoryFramework::FSB, 5, 1000 + i * 100);
+    }
+
+    let query = RuleQuery {
+        cursor: None,
+        limit: 100,
+        min_timestamp: Some(1200),
+        max_timestamp: Some(1500),
+        status: None,
+        submitter: None,
+    };
+
+    let page = RulesEngine::query_rules(&env, &query).unwrap();
+    assert_eq!(page.items.len(), 4);
+    for item in page.items.iter() {
+        assert!(item.created_at >= 1200 && item.created_at <= 1500);
+    }
+}
+
+#[test]
+fn test_pagination_filter_status_enum() {
+    let env = create_test_env();
+    let active = seed_rule(&env, RegulatoryFramework::FSB, 5, 1000);
+    let inactive = seed_rule(&env, RegulatoryFramework::FSB, 5, 1001);
+    RulesEngine::deactivate_rule(&env, &inactive);
+
+    let query = RuleQuery {
+        cursor: None,
+        limit: 100,
+        min_timestamp: None,
+        max_timestamp: None,
+        status: Some(RuleStatus::Active),
+        submitter: None,
+    };
+
+    let page = RulesEngine::query_rules(&env, &query).unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items.get(0).unwrap().rule_id, active.rule_id);
+}
+
+#[test]
+fn test_pagination_filter_submitter_address() {
+    let env = create_test_env();
+    let submitter_a = soroban_sdk::Address::generate(&env);
+    let submitter_b = soroban_sdk::Address::generate(&env);
+
+    let rule_a = seed_rule(&env, RegulatoryFramework::FSB, 5, 1000);
+    RulesEngine::set_rule_submitter(&env, &rule_a, submitter_a.clone());
+    let rule_b = seed_rule(&env, RegulatoryFramework::FSB, 5, 1001);
+    RulesEngine::set_rule_submitter(&env, &rule_b, submitter_b);
+
+    let query = RuleQuery {
+        cursor: None,
+        limit: 100,
+        min_timestamp: None,
+        max_timestamp: None,
+        status: None,
+        submitter: Some(submitter_a),
+    };
+
+    let page = RulesEngine::query_rules(&env, &query).unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items.get(0).unwrap().rule_id, rule_a.rule_id);
+}
+
+#[test]
+fn test_pagination_combined_filters() {
+    let env = create_test_env();
+    let submitter = soroban_sdk::Address::generate(&env);
+
+    let matching = seed_rule(&env, RegulatoryFramework::FSB, 5, 1500);
+    RulesEngine::set_rule_submitter(&env, &matching, submitter.clone());
+
+    let wrong_time = seed_rule(&env, RegulatoryFramework::FSB, 5, 5000);
+    RulesEngine::set_rule_submitter(&env, &wrong_time, submitter.clone());
+
+    let wrong_submitter = seed_rule(&env, RegulatoryFramework::FSB, 5, 1500);
+
+    let query = RuleQuery {
+        cursor: None,
+        limit: 100,
+        min_timestamp: Some(1000),
+        max_timestamp: Some(2000),
+        status: Some(RuleStatus::Active),
+        submitter: Some(submitter),
+    };
+
+    let page = RulesEngine::query_rules(&env, &query).unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items.get(0).unwrap().rule_id, matching.rule_id);
+}
+
 // ============ SupTech Integration Tests ============
 
 #[test]

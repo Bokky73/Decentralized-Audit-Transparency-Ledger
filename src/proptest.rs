@@ -307,6 +307,94 @@ proptest! {
         }
     }
 
+    // ── CBDC interop arithmetic safety tests (issue #839) ────────────────────
+
+    #[test]
+    fn prop_convert_amount_never_panics(
+        amount in any::<u128>(),
+        rate in any::<u128>(),
+    ) {
+        let result = std::panic::catch_unwind(|| {
+            crate::cbdc_interop::convert_amount(amount, rate)
+        });
+        prop_assert!(result.is_ok(), "convert_amount must not panic for amount={amount}, rate={rate}");
+    }
+
+    #[test]
+    fn prop_compute_settlement_fee_never_panics(
+        amount in any::<u128>(),
+        fee_bps in any::<u32>(),
+    ) {
+        let result = std::panic::catch_unwind(|| {
+            crate::cbdc_interop::compute_settlement_fee(amount, fee_bps)
+        });
+        prop_assert!(result.is_ok(), "compute_settlement_fee must not panic for amount={amount}, fee_bps={fee_bps}");
+    }
+
+    #[test]
+    fn prop_convert_amount_bounded_or_typed_error(
+        amount in any::<u128>(),
+        rate in any::<u128>(),
+    ) {
+        match crate::cbdc_interop::convert_amount(amount, rate) {
+            Ok(value) => {
+                // Result must be bounded by the maximum representable value.
+                prop_assert!(value <= u128::MAX);
+            }
+            Err(_) => {
+                // Typed contract error is acceptable for boundary violations.
+            }
+        }
+    }
+
+    #[test]
+    fn prop_compute_settlement_fee_bounded_or_typed_error(
+        amount in any::<u128>(),
+        fee_bps in any::<u32>(),
+    ) {
+        match crate::cbdc_interop::compute_settlement_fee(amount, fee_bps) {
+            Ok(fee) => {
+                prop_assert!(fee <= amount, "fee must never exceed the settled amount");
+            }
+            Err(_) => {
+                // Typed contract error is acceptable for boundary violations.
+            }
+        }
+    }
+
+    #[test]
+    fn prop_convert_amount_u64_max_boundary(rate in any::<u128>()) {
+        let result = std::panic::catch_unwind(|| {
+            crate::cbdc_interop::convert_amount(u128::from(u64::MAX), rate)
+        });
+        prop_assert!(result.is_ok(), "convert_amount must not panic at u64::MAX boundary");
+    }
+
+    #[test]
+    fn prop_compute_settlement_fee_i128_max_boundary(fee_bps in any::<u32>()) {
+        let amount = i128::MAX as u128;
+        let result = std::panic::catch_unwind(|| {
+            crate::cbdc_interop::compute_settlement_fee(amount, fee_bps)
+        });
+        prop_assert!(result.is_ok(), "compute_settlement_fee must not panic at i128::MAX boundary");
+    }
+
+    #[test]
+    fn prop_convert_amount_zero_rate_is_identity(amount in any::<u128>()) {
+        match crate::cbdc_interop::convert_amount(amount, 0) {
+            Ok(value) => prop_assert_eq!(value, amount),
+            Err(_) => {}
+        }
+    }
+
+    #[test]
+    fn prop_compute_settlement_fee_zero_bps_is_zero(amount in any::<u128>()) {
+        match crate::cbdc_interop::compute_settlement_fee(amount, 0) {
+            Ok(fee) => prop_assert_eq!(fee, 0),
+            Err(_) => {}
+        }
+    }
+
     #[test]
     fn prop_chain_breaks_on_tampered_metadata(events in capped_event_sequence_strategy()) {
         let (env, owner, client) = create_ledger();

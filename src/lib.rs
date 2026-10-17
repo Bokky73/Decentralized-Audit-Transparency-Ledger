@@ -7199,6 +7199,9 @@ mod finops_tests;
 mod supply_chain_tests;
 
 #[cfg(test)]
+mod rbac_gating_tests;
+
+#[cfg(test)]
 mod governance_dashboard_tests;
 
 #[cfg(test)]

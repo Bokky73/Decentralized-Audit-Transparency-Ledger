@@ -1,9 +1,48 @@
 {
-  "version": 1,
+  "version": 2,
   "contract": "AuditLedger",
   "generated_at": "2026-09-27T05:00:00Z",
-  "git_commit": "initial-baseline",
+  "git_commit": "cbdc-interop-ttl-optimization",
   "rust_toolchain": "stable",
+  "byte_budget": {
+    "description": "Pinned serialized XDR byte budgets for CBDC interop (src/cbdc_interop.rs) records. CI storage layout checks compare measured sizes against these thresholds.",
+    "cbdc_interop": {
+      "key_max_bytes": 96,
+      "value_max_bytes": 256,
+      "record_max_bytes": 352,
+      "ttl_tier": {
+        "persistent": {
+          "min_ttl_ledgers": 17280,
+          "extend_to_ledgers": 518400,
+          "keys": [
+            "CbdcSettlementRecord",
+            "CbdcMessageBridgeRecord",
+            "CbdcAuditRecord",
+            "CbdcParticipantRegistry"
+          ]
+        },
+        "temporary": {
+          "min_ttl_ledgers": 720,
+          "extend_to_ledgers": 17280,
+          "keys": [
+            "CbdcPendingTransfer",
+            "CbdcIso20022Envelope",
+            "CbdcNonceWindow"
+          ]
+        },
+        "instance": {
+          "min_ttl_ledgers": 17280,
+          "extend_to_ledgers": 518400,
+          "keys": [
+            "CbdcConfig",
+            "CbdcAdmin",
+            "CbdcPaused",
+            "CbdcTtlPolicy"
+          ]
+        }
+      }
+    }
+  },
   "variants": [
     {
       "ordinal": 0,
@@ -732,6 +771,119 @@
       "fields": [],
       "tombstone": false,
       "comment": "Total number of LCA profiles registered."
+    },
+    {
+      "ordinal": 79,
+      "name": "CbdcConfig",
+      "kind": "unit",
+      "fields": [],
+      "tombstone": false,
+      "tier": "instance",
+      "comment": "CBDC interop configuration (src/cbdc_interop.rs). Instance tier: read on nearly every entrypoint."
+    },
+    {
+      "ordinal": 80,
+      "name": "CbdcAdmin",
+      "kind": "unit",
+      "fields": [],
+      "tombstone": false,
+      "tier": "instance",
+      "comment": "CBDC interop admin address. Instance tier: RBAC checks on every privileged call."
+    },
+    {
+      "ordinal": 81,
+      "name": "CbdcPaused",
+      "kind": "unit",
+      "fields": [],
+      "tombstone": false,
+      "tier": "instance",
+      "comment": "CBDC interop pause flag. Instance tier: hot-path guard."
+    },
+    {
+      "ordinal": 82,
+      "name": "CbdcTtlPolicy",
+      "kind": "unit",
+      "fields": [],
+      "tombstone": false,
+      "tier": "instance",
+      "comment": "Packed TTL policy (persistent/temporary extend-to ledgers) for CBDC interop records."
+    },
+    {
+      "ordinal": 83,
+      "name": "CbdcSettlementRecord",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "BytesN<32>" }
+      ],
+      "tombstone": false,
+      "tier": "persistent",
+      "comment": "Cross-ledger settlement record keyed by settlement ID. Persistent tier: archival-critical audit record."
+    },
+    {
+      "ordinal": 84,
+      "name": "CbdcMessageBridgeRecord",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "BytesN<32>" }
+      ],
+      "tombstone": false,
+      "tier": "persistent",
+      "comment": "ISO-20022 message bridge record keyed by message ID. Persistent tier: archival-critical audit record."
+    },
+    {
+      "ordinal": 85,
+      "name": "CbdcAuditRecord",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "BytesN<32>" }
+      ],
+      "tombstone": false,
+      "tier": "persistent",
+      "comment": "CBDC interop audit record keyed by audit ID. Persistent tier: must not be archived while active."
+    },
+    {
+      "ordinal": 86,
+      "name": "CbdcParticipantRegistry",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "Address" }
+      ],
+      "tombstone": false,
+      "tier": "persistent",
+      "comment": "Participant registry entry keyed by participant address. Persistent tier: retention SLA bound."
+    },
+    {
+      "ordinal": 87,
+      "name": "CbdcPendingTransfer",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "BytesN<32>" }
+      ],
+      "tombstone": false,
+      "tier": "temporary",
+      "comment": "In-flight transfer keyed by transfer ID. Temporary tier: short-lived, safe to expire."
+    },
+    {
+      "ordinal": 88,
+      "name": "CbdcIso20022Envelope",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "BytesN<32>" }
+      ],
+      "tombstone": false,
+      "tier": "temporary",
+      "comment": "Raw ISO-20022 envelope keyed by message ID. Temporary tier: superseded by bridge record."
+    },
+    {
+      "ordinal": 89,
+      "name": "CbdcNonceWindow",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "Address" }
+      ],
+      "tombstone": false,
+      "tier": "temporary",
+      "comment": "Packed replay-protection nonce window keyed by participant address. Temporary tier."
     }
   ]
 }
