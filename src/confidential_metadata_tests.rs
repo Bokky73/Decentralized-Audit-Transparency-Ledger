@@ -4,24 +4,30 @@ mod tests {
         AccessControlPolicy, ConfidentialError, ConfidentialEventLedger,
         ConfidentialEventLedgerClient,
     };
+    use crate::rbac::{RbacManager, Role};
     use soroban_sdk::{
         testutils::Address as _, Address, Bytes, BytesN, Env, Symbol, Vec,
     };
 
+    fn bootstrap(env: &Env, admin: &Address, submitter: &Address) {
+        env.mock_all_auths();
+        RbacManager::initialize_admin(env, admin);
+        RbacManager::set_role(env, admin, submitter, Role::Submitter).unwrap();
+    }
+
     #[test]
     fn test_log_and_access_confidential_event() {
         let env = Env::default();
-        env.mock_all_auths();
-
         let contract_id = env.register(ConfidentialEventLedger, ());
         let client = ConfidentialEventLedgerClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
-        client.initialize(&admin);
-
         let submitter = Address::generate(&env);
         let recipient = Address::generate(&env);
         let stranger = Address::generate(&env);
+        bootstrap(&env, &admin, &submitter);
+
+        client.initialize(&admin);
 
         let event_type = Symbol::new(&env, "audit_priv");
         let encrypted_metadata = Bytes::from_slice(&env, b"encrypted_secret_data_payload_123");
@@ -32,14 +38,16 @@ mod tests {
         allowed.push_back(recipient.clone());
         let policy = AccessControlPolicy::CustomAllowlist(allowed);
 
-        let event_id = client.log_confidential_event(
-            &submitter,
-            &event_type,
-            &encrypted_metadata,
-            &policy,
-            &zk_proof,
-            &key_id,
-        );
+        let event_id = client
+            .log_confidential_event(
+                &submitter,
+                &event_type,
+                &encrypted_metadata,
+                &policy,
+                &zk_proof,
+                &key_id,
+            )
+            .unwrap();
 
         // Access check
         assert!(client.check_access(&event_id, &submitter));
@@ -49,61 +57,77 @@ mod tests {
         // Decrypt / retrieve payload
         let decrypted = client.decrypt_event_metadata(&event_id, &recipient);
         assert_eq!(decrypted, encrypted_metadata);
+
+        // Unauthorized role (viewer) cannot log an event.
+        let viewer = Address::generate(&env);
+        let err = client.log_confidential_event(
+            &viewer,
+            &event_type,
+            &encrypted_metadata,
+            &policy,
+            &zk_proof,
+            &key_id,
+        );
+        assert_eq!(err, Err(ConfidentialError::InsufficientRole));
     }
 
     #[test]
     fn test_key_registration_and_rotation() {
         let env = Env::default();
-        env.mock_all_auths();
-
         let contract_id = env.register(ConfidentialEventLedger, ());
         let client = ConfidentialEventLedgerClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        bootstrap(&env, &admin, &user);
+
         client.initialize(&admin);
 
-        let user = Address::generate(&env);
         let pub_key1 = Bytes::from_slice(&env, b"public_key_v1");
-        client.register_encryption_key(&user, &pub_key1);
+        client.register_encryption_key(&user, &pub_key1).unwrap();
 
         let pub_key2 = Bytes::from_slice(&env, b"public_key_v2");
-        client.rotate_encryption_key(&user, &pub_key2);
+        client.rotate_encryption_key(&user, &pub_key2).unwrap();
 
-        client.revoke_encryption_key(&user);
+        client.revoke_encryption_key(&user).unwrap();
     }
 
     #[test]
     fn test_confidential_analytics_aggregation() {
         let env = Env::default();
-        env.mock_all_auths();
-
         let contract_id = env.register(ConfidentialEventLedger, ());
         let client = ConfidentialEventLedgerClient::new(&env, &contract_id);
 
         let admin = Address::generate(&env);
+        let submitter = Address::generate(&env);
+        bootstrap(&env, &admin, &submitter);
+
         client.initialize(&admin);
 
-        let submitter = Address::generate(&env);
         let event_type = Symbol::new(&env, "audit");
         let zk_proof = Bytes::from_slice(&env, b"valid_zk_snark_proof_commitment_bytes_32");
         let key_id = BytesN::from_array(&env, &[1u8; 32]);
 
-        let id1 = client.log_confidential_event(
-            &submitter,
-            &event_type,
-            &Bytes::from_slice(&env, b"chunk_1"),
-            &AccessControlPolicy::Public,
-            &zk_proof,
-            &key_id,
-        );
-        let id2 = client.log_confidential_event(
-            &submitter,
-            &event_type,
-            &Bytes::from_slice(&env, b"chunk_2"),
-            &AccessControlPolicy::Public,
-            &zk_proof,
-            &key_id,
-        );
+        let id1 = client
+            .log_confidential_event(
+                &submitter,
+                &event_type,
+                &Bytes::from_slice(&env, b"chunk_1"),
+                &AccessControlPolicy::Public,
+                &zk_proof,
+                &key_id,
+            )
+            .unwrap();
+        let id2 = client
+            .log_confidential_event(
+                &submitter,
+                &event_type,
+                &Bytes::from_slice(&env, b"chunk_2"),
+                &AccessControlPolicy::Public,
+                &zk_proof,
+                &key_id,
+            )
+            .unwrap();
 
         let mut list = Vec::new(&env);
         list.push_back(id1);
