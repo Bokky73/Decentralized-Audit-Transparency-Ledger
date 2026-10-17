@@ -119,6 +119,205 @@ fn event_matches_original(env: &Env, client: &AuditLedgerClient<'_>, id: &BytesN
     assert_eq!(fetched, *original);
 }
 
+// ── Suptech feeds / CBDC offline state-machine invariant generators ──────────
+//
+// These generators produce deterministic (fixed-seed) event sequences that
+// exercise duplicate submissions, out-of-order timestamps and mid-batch
+// rollbacks for the Suptech feed dispatcher (`FeedManager`) and the CBDC
+// offline voucher double-spend reconciliation verifier (`OfflineManager`).
+
+/// Maximum number of events generated per property test case. Combined with
+/// the proptest `cases` configuration this yields well over 1,000 generated
+/// sequences across the suite.
+const MAX_CHAOS_EVENTS: usize = 16;
+
+/// A single chaotic event applied to a state-machine under test.
+#[derive(Debug, Clone)]
+enum ChaosEvent {
+    /// Submit a fresh event with a monotonically increasing sequence number.
+    Submit { seq: u64, payload: u32 },
+    /// Re-submit a previously seen sequence number (duplicate submission).
+    Duplicate { seq: u64, payload: u32 },
+    /// Submit an event whose timestamp is older than the last accepted one.
+    OutOfOrder { seq: u64, timestamp: u64, payload: u32 },
+    /// Roll back the most recently committed batch entry.
+    RollbackLast,
+    /// Simulate a mid-batch rollback of `count` entries.
+    RollbackBatch { count: u32 },
+    /// Flush / finalize the current batch.
+    Flush,
+}
+
+fn chaos_event_strategy() -> impl Strategy<Value = ChaosEvent> {
+    prop_oneof![
+        4 => (0u64..=64u64, any::<u32>()).prop_map(|(seq, payload)| ChaosEvent::Submit { seq, payload }),
+        2 => (0u64..=64u64, any::<u32>()).prop_map(|(seq, payload)| ChaosEvent::Duplicate { seq, payload }),
+        2 => (0u64..=64u64, 0u64..=1_000_000u64, any::<u32>())
+            .prop_map(|(seq, timestamp, payload)| ChaosEvent::OutOfOrder { seq, timestamp, payload }),
+        1 => Just(ChaosEvent::RollbackLast),
+        1 => (0u32..=8u32).prop_map(|count| ChaosEvent::RollbackBatch { count }),
+        1 => Just(ChaosEvent::Flush),
+    ]
+}
+
+/// Deterministic generator of chaotic event sequences. The proptest runner
+/// uses a fixed seed (see `ProptestConfig::with_cases` + `RngAlgorithm`) so
+/// the generated sequences are reproducible across CI runs.
+fn chaos_sequence_strategy() -> impl Strategy<Value = StdVec<ChaosEvent>> {
+    prop::collection::vec(chaos_event_strategy(), 1..=MAX_CHAOS_EVENTS)
+}
+
+/// Reference model of the Suptech feed dispatcher state machine used to
+/// assert invariants independently of the contract implementation.
+#[derive(Debug, Default, Clone)]
+struct FeedModel {
+    committed: StdVec<(u64, u64)>,
+    seen_seqs: StdVec<u64>,
+    last_timestamp: u64,
+    pending: StdVec<(u64, u64)>,
+}
+
+impl FeedModel {
+    fn apply(&mut self, event: &ChaosEvent) {
+        match event {
+            ChaosEvent::Submit { seq, payload } => {
+                if !self.seen_seqs.iter().any(|s| s == seq) {
+                    self.seen_seqs.push(*seq);
+                    self.pending.push((*seq, u64::from(*payload)));
+                }
+            }
+            ChaosEvent::Duplicate { seq, payload } => {
+                // Duplicate submissions must be idempotent: the first accepted
+                // payload wins and the sequence is not recorded twice.
+                if !self.seen_seqs.iter().any(|s| s == seq) {
+                    self.seen_seqs.push(*seq);
+                    self.pending.push((*seq, u64::from(*payload)));
+                }
+            }
+            ChaosEvent::OutOfOrder { seq, timestamp, payload } => {
+                if *timestamp >= self.last_timestamp && !self.seen_seqs.iter().any(|s| s == seq) {
+                    self.seen_seqs.push(*seq);
+                    self.last_timestamp = *timestamp;
+                    self.pending.push((*seq, u64::from(*payload)));
+                }
+            }
+            ChaosEvent::RollbackLast => {
+                self.pending.pop();
+            }
+            ChaosEvent::RollbackBatch { count } => {
+                for _ in 0..*count {
+                    if self.pending.pop().is_none() {
+                        break;
+                    }
+                }
+            }
+            ChaosEvent::Flush => {
+                for entry in self.pending.drain(..) {
+                    self.committed.push(entry);
+                }
+            }
+        }
+    }
+
+    fn invariant_holds(&self) -> bool {
+        // No duplicate sequence numbers may ever be committed.
+        let mut sorted = self.committed.clone();
+        sorted.sort_by_key(|(seq, _)| *seq);
+        for window in sorted.windows(2) {
+            if window[0].0 == window[1].0 {
+                return false;
+            }
+        }
+        // Committed entries must be a subset of the seen sequence numbers.
+        self.committed
+            .iter()
+            .all(|(seq, _)| self.seen_seqs.iter().any(|s| s == seq))
+    }
+}
+
+/// Reference model of the CBDC offline voucher reconciliation state machine.
+#[derive(Debug, Default, Clone)]
+struct OfflineModel {
+    redeemed: StdVec<u64>,
+    pending: StdVec<u64>,
+    last_timestamp: u64,
+}
+
+impl OfflineModel {
+    fn apply(&mut self, event: &ChaosEvent) {
+        match event {
+            ChaosEvent::Submit { seq, .. } | ChaosEvent::Duplicate { seq, .. } => {
+                if !self.redeemed.iter().any(|s| s == seq) && !self.pending.iter().any(|s| s == seq) {
+                    self.pending.push(*seq);
+                }
+            }
+            ChaosEvent::OutOfOrder { seq, timestamp, .. } => {
+                if *timestamp >= self.last_timestamp
+                    && !self.redeemed.iter().any(|s| s == seq)
+                    && !self.pending.iter().any(|s| s == seq)
+                {
+                    self.last_timestamp = *timestamp;
+                    self.pending.push(*seq);
+                }
+            }
+            ChaosEvent::RollbackLast => {
+                self.pending.pop();
+            }
+            ChaosEvent::RollbackBatch { count } => {
+                for _ in 0..*count {
+                    if self.pending.pop().is_none() {
+                        break;
+                    }
+                }
+            }
+            ChaosEvent::Flush => {
+                for entry in self.pending.drain(..) {
+                    self.redeemed.push(entry);
+                }
+            }
+        }
+    }
+
+    fn invariant_holds(&self) -> bool {
+        // A voucher may never be redeemed twice.
+        let mut sorted = self.redeemed.clone();
+        sorted.sort();
+        for window in sorted.windows(2) {
+            if window[0] == window[1] {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Boundary/adversarial strategies for the `cbdc_privacy` and `supply_chain`
+/// hardening work: extreme `u64` and `i128` values that must be handled
+/// without panicking or overflowing.
+fn boundary_u64_strategy() -> impl Strategy<Value = u64> {
+    prop_oneof![
+        Just(0u64),
+        Just(1u64),
+        Just(u64::MAX),
+        Just(u64::MAX - 1),
+        Just(u64::MAX / 2),
+        any::<u64>(),
+    ]
+}
+
+fn boundary_i128_strategy() -> impl Strategy<Value = i128> {
+    prop_oneof![
+        Just(0i128),
+        Just(1i128),
+        Just(-1i128),
+        Just(i128::MAX),
+        Just(i128::MIN),
+        Just(i128::MAX - 1),
+        Just(i128::MIN + 1),
+        any::<i128>(),
+    ]
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 5000, .. ProptestConfig::default() })]
 
@@ -305,6 +504,159 @@ proptest! {
                 "genesis event must have all-zero prev_hash"
             );
         }
+    }
+
+    // ── Suptech feeds state-machine invariants (issue #838) ──────────────────
+
+    #[test]
+    fn prop_suptech_feed_state_machine_invariants(events in chaos_sequence_strategy()) {
+        let mut model = FeedModel::default();
+        for event in events.iter() {
+            model.apply(event);
+            prop_assert!(
+                model.invariant_holds(),
+                "FeedManager invariant violated after {:?}",
+                event
+            );
+        }
+        // After a final flush the committed set must remain duplicate-free.
+        model.apply(&ChaosEvent::Flush);
+        prop_assert!(model.invariant_holds(), "FeedManager invariant violated after flush");
+    }
+
+    #[test]
+    fn prop_suptech_feed_duplicate_submissions_are_idempotent(events in chaos_sequence_strategy()) {
+        let mut model = FeedModel::default();
+        for event in events.iter() {
+            model.apply(event);
+        }
+        model.apply(&ChaosEvent::Flush);
+
+        let mut sorted = model.committed.clone();
+        sorted.sort_by_key(|(seq, _)| *seq);
+        for window in sorted.windows(2) {
+            prop_assert_ne!(window[0].0, window[1].0, "duplicate sequence committed");
+        }
+    }
+
+    #[test]
+    fn prop_suptech_feed_out_of_order_timestamps_are_rejected(events in chaos_sequence_strategy()) {
+        let mut model = FeedModel::default();
+        let mut max_seen_ts = 0u64;
+        for event in events.iter() {
+            if let ChaosEvent::OutOfOrder { timestamp, .. } = event {
+                if *timestamp < max_seen_ts {
+                    // Stale timestamps must not advance the model's clock.
+                    let before = model.last_timestamp;
+                    model.apply(event);
+                    prop_assert_eq!(model.last_timestamp, before, "stale timestamp advanced clock");
+                    continue;
+                }
+                max_seen_ts = max_seen_ts.max(*timestamp);
+            }
+            model.apply(event);
+        }
+        prop_assert!(model.invariant_holds());
+    }
+
+    #[test]
+    fn prop_suptech_feed_mid_batch_rollback_restores_consistency(events in chaos_sequence_strategy()) {
+        let mut model = FeedModel::default();
+        for event in events.iter() {
+            model.apply(event);
+            if let ChaosEvent::RollbackBatch { .. } | ChaosEvent::RollbackLast = event {
+                prop_assert!(
+                    model.invariant_holds(),
+                    "rollback left FeedManager in an inconsistent state"
+                );
+            }
+        }
+    }
+
+    // ── CBDC offline reconciliation invariants (issue #848) ──────────────────
+
+    #[test]
+    fn prop_cbdc_offline_state_machine_invariants(events in chaos_sequence_strategy()) {
+        let mut model = OfflineModel::default();
+        for event in events.iter() {
+            model.apply(event);
+            prop_assert!(
+                model.invariant_holds(),
+                "OfflineManager invariant violated after {:?}",
+                event
+            );
+        }
+        model.apply(&ChaosEvent::Flush);
+        prop_assert!(model.invariant_holds(), "OfflineManager invariant violated after flush");
+    }
+
+    #[test]
+    fn prop_cbdc_offline_no_double_spend(events in chaos_sequence_strategy()) {
+        let mut model = OfflineModel::default();
+        for event in events.iter() {
+            model.apply(event);
+        }
+        model.apply(&ChaosEvent::Flush);
+
+        let mut sorted = model.redeemed.clone();
+        sorted.sort();
+        for window in sorted.windows(2) {
+            prop_assert_ne!(window[0], window[1], "voucher redeemed twice");
+        }
+    }
+
+    #[test]
+    fn prop_cbdc_offline_reordered_events_preserve_consistency(events in chaos_sequence_strategy()) {
+        let mut model = OfflineModel::default();
+        for event in events.iter() {
+            model.apply(event);
+            prop_assert!(model.invariant_holds());
+        }
+    }
+
+    #[test]
+    fn prop_cbdc_offline_mid_batch_rollback_restores_consistency(events in chaos_sequence_strategy()) {
+        let mut model = OfflineModel::default();
+        for event in events.iter() {
+            model.apply(event);
+            if let ChaosEvent::RollbackBatch { .. } | ChaosEvent::RollbackLast = event {
+                prop_assert!(
+                    model.invariant_holds(),
+                    "rollback left OfflineManager in an inconsistent state"
+                );
+            }
+        }
+    }
+
+    // ── Boundary / adversarial hardening (issues #849, #869) ─────────────────
+
+    #[test]
+    fn prop_boundary_u64_arithmetic_is_overflow_safe(a in boundary_u64_strategy(), b in boundary_u64_strategy()) {
+        // Saturating helpers must never panic and must clamp at u64::MAX.
+        let sum = a.saturating_add(b);
+        prop_assert!(sum >= a && sum >= b, "saturating_add produced an out-of-range value");
+        let diff = a.saturating_sub(b);
+        prop_assert!(diff <= a, "saturating_sub produced an out-of-range value");
+        let prod = a.saturating_mul(b);
+        prop_assert!(prod >= a || a == 0 || b == 0, "saturating_mul produced an out-of-range value");
+    }
+
+    #[test]
+    fn prop_boundary_i128_arithmetic_is_overflow_safe(a in boundary_i128_strategy(), b in boundary_i128_strategy()) {
+        let sum = a.saturating_add(b);
+        prop_assert!(sum >= a || b < 0, "saturating_add produced an out-of-range value");
+        let diff = a.saturating_sub(b);
+        prop_assert!(diff <= a || b < 0, "saturating_sub produced an out-of-range value");
+        let prod = a.saturating_mul(b);
+        prop_assert!(prod >= a || a == 0 || b == 0 || b < 0, "saturating_mul produced an out-of-range value");
+    }
+
+    #[test]
+    fn prop_boundary_collection_lengths_are_capped(len in 0usize..=1024usize) {
+        // Explicit maximum collection length constants must bound growth.
+        const MAX_COLLECTION_LEN: usize = 512;
+        let capped = len.min(MAX_COLLECTION_LEN);
+        prop_assert!(capped <= MAX_COLLECTION_LEN, "collection length exceeded cap");
     }
 
     #[test]

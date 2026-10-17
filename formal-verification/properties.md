@@ -260,14 +260,122 @@ K-framework claim label, and the current verification status.
 
 ---
 
+### P-21 — SupTech Feed Dispatcher Consistency Under Partial Failures
+
+| Field | Value |
+|-------|-------|
+| **Category** | safety |
+| **Description** | For `src/suptech_feeds.rs`, every dispatched regulatory telemetry batch is applied atomically: after any partial failure or mid-batch rollback, the dispatcher state (per-feed sequence numbers, pending queue, and committed cursor) is either fully advanced to the pre-batch state or fully advanced to the post-batch state — never a mixture. No feed may observe a committed cursor ahead of its own sequence number. |
+| **CVL Rule** | `suptechFeedAtomicBatchApply`, `suptechFeedCursorNeverAheadOfSequence` |
+| **K Claim** | `SUPTECH-1`, `SUPTECH-2` |
+| **Status** | 🔲 Pending |
+
+---
+
+### P-22 — SupTech Feed Reordered / Duplicate Event Idempotence
+
+| Field | Value |
+|-------|-------|
+| **Category** | safety |
+| **Description** | For `src/suptech_feeds.rs`, duplicate submissions and out-of-order timestamps never corrupt feed state: a re-delivered event with an already-seen `(feed_id, sequence)` is rejected or ignored without mutating state, and events arriving out of timestamp order are either buffered or rejected but never cause the committed sequence to move backwards. |
+| **CVL Rule** | `suptechFeedDuplicateRejected`, `suptechFeedSequenceMonotone` |
+| **K Claim** | `SUPTECH-3`, `SUPTECH-4` |
+| **Status** | 🔲 Pending |
+
+---
+
+### P-23 — SupTech Feed Merkle Proof and Hash-Chain Integrity After Recovery
+
+| Field | Value |
+|-------|-------|
+| **Category** | safety |
+| **Description** | For `src/suptech_feeds.rs`, after any simulated recovery (crash, restart, or replayed batch), every committed feed entry's Merkle proof verifies against the stored root and the hash chain linking consecutive entries remains intact (`entry[n].prev_hash == entry[n-1].entry_hash`). Recovery never produces a root that fails verification for a committed entry. |
+| **CVL Rule** | `suptechFeedMerkleProofValid`, `suptechFeedHashChainIntactAfterRecovery` |
+| **K Claim** | `SUPTECH-5`, `SUPTECH-6` |
+| **Status** | 🔲 Pending |
+
+---
+
+### P-24 — SupTech Feed Concurrency Safety Under Multi-Actor Access
+
+| Field | Value |
+|-------|-------|
+| **Category** | safety |
+| **Description** | For `src/suptech_feeds.rs`, concurrent dispatches from multiple actors (RBAC-checked per `src/rbac.rs`) are serializable: the resulting committed state is equivalent to some sequential ordering of the accepted operations, and no interleaving loses an accepted event or double-applies a rejected one. |
+| **CVL Rule** | `suptechFeedSerializableUnderConcurrency` |
+| **K Claim** | `SUPTECH-7` |
+| **Status** | 🔲 Pending |
+
+---
+
+### P-25 — CBDC Offline Voucher Double-Spend Reconciliation Consistency
+
+| Field | Value |
+|-------|-------|
+| **Category** | safety |
+| **Description** | For `src/cbdc_offline.rs`, the offline voucher reconciliation verifier never accepts two distinct vouchers that redeem the same underlying value: after reconciliation, the set of settled voucher identifiers is duplicate-free, and any voucher presented twice is flagged as a double-spend rather than settled twice. |
+| **CVL Rule** | `cbdcOfflineNoDoubleSpend`, `cbdcOfflineSettledSetDuplicateFree` |
+| **K Claim** | `CBDC-1`, `CBDC-2` |
+| **Status** | 🔲 Pending |
+
+---
+
+### P-26 — CBDC Offline Voucher Reconciliation Atomicity Under Partial Failures
+
+| Field | Value |
+|-------|-------|
+| **Category** | safety |
+| **Description** | For `src/cbdc_offline.rs`, reconciliation of a batch of offline vouchers is atomic: a mid-batch rollback leaves the settled set, spent-value counters, and reconciliation cursor exactly as they were before the batch. Partial application of a batch is never observable. |
+| **CVL Rule** | `cbdcOfflineReconcileAtomic`, `cbdcOfflineNoPartialBatchState` |
+| **K Claim** | `CBDC-3`, `CBDC-4` |
+| **Status** | 🔲 Pending |
+
+---
+
+### P-27 — CBDC Offline Voucher Reordered / Duplicate Submission Idempotence
+
+| Field | Value |
+|-------|-------|
+| **Category** | safety |
+| **Description** | For `src/cbdc_offline.rs`, duplicate voucher submissions and out-of-order timestamps are idempotent: re-submitting a voucher already present in the settled set does not change the settled set or spent-value counters, and out-of-order arrivals never cause a voucher to be settled before its dependencies are satisfied. |
+| **CVL Rule** | `cbdcOfflineDuplicateIdempotent`, `cbdcOfflineOrderIndependentSettlement` |
+| **K Claim** | `CBDC-5`, `CBDC-6` |
+| **Status** | 🔲 Pending |
+
+---
+
+### P-28 — CBDC Offline Voucher Merkle Proof and Hash-Chain Integrity After Recovery
+
+| Field | Value |
+|-------|-------|
+| **Category** | safety |
+| **Description** | For `src/cbdc_offline.rs`, after any simulated recovery, every settled voucher's Merkle proof verifies against the stored reconciliation root and the hash chain over settled vouchers remains intact. Recovery never invalidates a previously verified proof for a settled voucher. |
+| **CVL Rule** | `cbdcOfflineMerkleProofValid`, `cbdcOfflineHashChainIntactAfterRecovery` |
+| **K Claim** | `CBDC-7`, `CBDC-8` |
+| **Status** | 🔲 Pending |
+
+---
+
+### P-29 — CBDC Offline Voucher Concurrency Safety Under Multi-Actor Access
+
+| Field | Value |
+|-------|-------|
+| **Category** | safety |
+| **Description** | For `src/cbdc_offline.rs`, concurrent voucher submissions from multiple actors (RBAC-checked per `src/rbac.rs`) are serializable with respect to the settled set and spent-value counters: the outcome is equivalent to some sequential ordering, and no interleaving permits a double-spend that a sequential execution would have rejected. |
+| **CVL Rule** | `cbdcOfflineSerializableUnderConcurrency` |
+| **K Claim** | `CBDC-9` |
+| **Status** | 🔲 Pending |
+
+---
+
 ## Verification Coverage Summary
 
 | Category | Total | Verified ✅ | Partial 🔶 | Pending 🔲 |
 |----------|-------|------------|-----------|-----------|
-| safety | 14 | 9 | 4 | 1 |
+| safety | 23 | 9 | 4 | 10 |
 | access-control | 5 | 5 | 0 | 0 |
 | liveness | 1 | 0 | 1 | 0 |
-| **Total** | **20** | **14** | **5** | **1** |
+| **Total** | **29** | **14** | **5** | **10** |
 
 ---
 

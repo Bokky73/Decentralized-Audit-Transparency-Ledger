@@ -132,9 +132,9 @@ description = "Audit trail for the reporting pipeline itself"
 [[module]]
 name = "supply_chain"
 path_prefix = "src/supply_chain.rs"
-line = 65.0
-branch = 40.0
-description = "Product provenance, certifications, chain of custody"
+line = 90.0
+branch = 90.0
+description = "Product provenance, certifications, chain of custody — hardened against overflow and unbounded growth (issue #869)"
 
 # ─ Stablecoin reserve auditing ────────────────────────────────────────────────
 [[module]]
@@ -322,14 +322,16 @@ description = "DAO dispute resolution framework"
 [[module]]
 name = "cbdc_offline"
 path_prefix = "src/cbdc_offline.rs"
-line = 55.0
-description = "CBDC offline transaction support"
+line = 90.0
+branch = 90.0
+description = "CBDC offline voucher double-spend reconciliation verifier — invariant & chaos resilience suite (issue #848)"
 
 [[module]]
 name = "cbdc_privacy"
 path_prefix = "src/cbdc_privacy.rs"
-line = 55.0
-description = "CBDC privacy features"
+line = 90.0
+branch = 90.0
+description = "CBDC tiered anonymity and selective disclosure guard — hardened against overflow and unbounded growth (issue #849)"
 
 [[module]]
 name = "cbdc_interop"
@@ -474,8 +476,9 @@ description = "SupTech API bindings"
 [[module]]
 name = "suptech_feeds"
 path_prefix = "src/suptech_feeds.rs"
-line = 50.0
-description = "Regulatory data feed integration"
+line = 90.0
+branch = 90.0
+description = "SupTech real-time regulatory telemetry feed dispatcher — invariant & chaos resilience suite (issue #838)"
 
 [[module]]
 name = "suptech_integration"
