@@ -12,6 +12,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, Address, Bytes, BytesN, Env, Symbol,
     Vec, panic_with_error, log,
 };
+use soroban_sdk::xdr::ToXdr;
 use sha2::{Digest, Sha256};
 
 use crate::rbac::{RbacError, RbacManager, RbacStorageKey, Role};
@@ -112,6 +113,123 @@ pub struct BridgeConfig {
 }
 
 // ============================================================================
+// Pagination types
+// ============================================================================
+
+/// Opaque cursor pointing at the last returned sequence.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttestationCursor {
+    /// Sequence number of the last item on the previous page.
+    pub seq: u64,
+}
+
+/// Opaque cursor for verification cache pages.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CacheCursor {
+    /// Sequence number of the last item on the previous page.
+    pub seq: u64,
+}
+
+/// Opaque cursor for relay pages (index into the relay list).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelayCursor {
+    /// Index of the last item on the previous page.
+    pub index: u32,
+}
+
+/// Multi-predicate filter for attestation read queries.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttestationFilter {
+    /// Optional relay address to match exactly.
+    pub relay: Option<Address>,
+    /// Optional user eth address to match exactly.
+    pub user_address: Option<Bytes>,
+    /// Optional token address to match exactly.
+    pub token_address: Option<Bytes>,
+    /// Optional accepted flag to match exactly.
+    pub accepted: Option<bool>,
+}
+
+/// Multi-predicate filter for verification cache read queries.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CacheFilter {
+    /// Optional user eth address to match exactly.
+    pub user: Option<Bytes>,
+    /// Optional token address to match exactly.
+    pub token_address: Option<Bytes>,
+    /// Optional token id to match exactly.
+    pub token_id: Option<u128>,
+}
+
+/// Paginated result of a filtered attestation query.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttestationPage {
+    /// Matching attestation ids for this page.
+    pub ids: Vec<BytesN<32>>,
+    /// Cursor to resume the next page, or None when exhausted.
+    pub next_cursor: Option<AttestationCursor>,
+    /// Number of storage rows examined to produce this page.
+    pub scanned: u32,
+    /// Total number of stored attestations.
+    pub total: u32,
+}
+
+/// Paginated result of a filtered verification cache query.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CachePage {
+    /// Matching cache ids for this page.
+    pub ids: Vec<BytesN<32>>,
+    /// Cursor to resume the next page, or None when exhausted.
+    pub next_cursor: Option<CacheCursor>,
+    /// Number of storage rows examined to produce this page.
+    pub scanned: u32,
+    /// Total number of stored cache entries.
+    pub total: u32,
+}
+
+/// Paginated result of a relay query.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelayPage {
+    /// Relay addresses for this page.
+    pub relays: Vec<Address>,
+    /// Cursor to resume the next page, or None when exhausted.
+    pub next_cursor: Option<RelayCursor>,
+    /// Total number of relays.
+    pub total: u32,
+}
+
+/// Default filter (match everything).
+impl Default for AttestationFilter {
+    fn default() -> Self {
+        AttestationFilter {
+            relay: None,
+            user_address: None,
+            token_address: None,
+            accepted: None,
+        }
+    }
+}
+
+/// Default filter (match everything).
+impl Default for CacheFilter {
+    fn default() -> Self {
+        CacheFilter {
+            user: None,
+            token_address: None,
+            token_id: None,
+        }
+    }
+}
+
+// ============================================================================
 // Storage Keys
 // ============================================================================
 
@@ -131,6 +249,14 @@ pub enum BridgeKey {
     VerificationCache(Bytes, Bytes, u128),
     /// Ethereum chain ID for this bridge (e.g., 1 for mainnet, 5 for Goerli)
     EthChainId,
+    /// Monotonic sequence counter for pending attestations.
+    AttestationNextSeq,
+    /// Ordered attestation id index: seq -> attestation id.
+    AttestationSeq(u64),
+    /// Monotonic sequence counter for verification cache entries.
+    CacheNextSeq,
+    /// Ordered verification cache id index: seq -> cache id.
+    CacheSeq(u64),
 }
 
 // ============================================================================
@@ -169,6 +295,9 @@ pub enum BridgeError {
     RbacSuspended = 13,
 }
 
+/// Maximum number of storage rows scanned per paginated read to bound CPU.
+const MAX_PAGE_SCAN: u64 = 200;
+
 // ============================================================================
 // Contract Implementation
 // ============================================================================
@@ -204,6 +333,12 @@ impl CrossChainBridge {
         env.storage()
             .instance()
             .set(&BridgeKey::AllRelays, &Vec::new(&env));
+        env.storage()
+            .instance()
+            .set(&BridgeKey::AttestationNextSeq, &1u64);
+        env.storage()
+            .instance()
+            .set(&BridgeKey::CacheNextSeq, &1u64);
 
         RbacManager::initialize_admin(&env, &owner);
 
@@ -379,6 +514,19 @@ impl CrossChainBridge {
 
         env.storage().instance().set(&key, &attestation);
 
+        // Maintain ordered sequence index for cursor-based pagination.
+        let mut seq: u64 = env
+            .storage()
+            .instance()
+            .get(&BridgeKey::AttestationNextSeq)
+            .unwrap_or(1);
+        env.storage()
+            .instance()
+            .set(&BridgeKey::AttestationNextSeq, &(seq + 1));
+        env.storage()
+            .instance()
+            .set(&BridgeKey::AttestationSeq(seq), &attestation);
+
         log!(
             &env,
             "CrossChainBridge: attestation submitted - relay={}, block={}",
@@ -439,6 +587,19 @@ impl CrossChainBridge {
 
         env.storage().instance().set(&cache_key, &record);
 
+        // Maintain ordered sequence index for cursor-based pagination.
+        let mut cseq: u64 = env
+            .storage()
+            .instance()
+            .get(&BridgeKey::CacheNextSeq)
+            .unwrap_or(1);
+        env.storage()
+            .instance()
+            .set(&BridgeKey::CacheNextSeq, &(cseq + 1));
+        env.storage()
+            .instance()
+            .set(&BridgeKey::CacheSeq(cseq), &record);
+
         log!(
             &env,
             "CrossChainBridge: attestation accepted - balance={}, ttl={}",
@@ -475,6 +636,74 @@ impl CrossChainBridge {
             record.balance
         } else {
             0 // No verified balance found
+        }
+    }
+
+    // ========================================================================
+    // Paginated read queries
+    // ========================================================================
+
+    /// List pending attestations with cursor-based pagination and multi-predicate
+    /// filtering. Scans the ordered `AttestationSeq` index starting after
+    /// `cursor.seq`, applies every non-`None` predicate (AND semantics), and
+    /// returns up to `limit` matching attestation ids. The scan is bounded by
+    /// [`MAX_PAGE_SCAN`] rows to protect the Soroban CPU/memory budget.
+    pub fn list_attestations(
+        env: Env,
+        cursor: Option<AttestationCursor>,
+        limit: u32,
+        filter: AttestationFilter,
+    ) -> AttestationPage {
+        Self::scan_attestations(&env, cursor, limit, filter)
+    }
+
+    /// List verification cache entries with cursor-based pagination and
+    /// multi-predicate filtering.
+    pub fn list_verification_cache(
+        env: Env,
+        cursor: Option<CacheCursor>,
+        limit: u32,
+        filter: CacheFilter,
+    ) -> CachePage {
+        Self::scan_cache(&env, cursor, limit, filter)
+    }
+
+    /// List bridge relays with cursor-based pagination over the relay list.
+    pub fn list_relays(
+        env: Env,
+        cursor: Option<RelayCursor>,
+        limit: u32,
+    ) -> RelayPage {
+        let relays: Vec<Address> = env
+            .storage()
+            .instance()
+            .get::<_, Vec<Address>>(&BridgeKey::AllRelays)
+            .unwrap_or_else(|| Vec::new(&env));
+        let total = relays.len() as u32;
+
+        let mut ids = Vec::new(&env);
+        let mut start: u32 = cursor.map(|c| c.index).unwrap_or(0) + 1;
+        if start > total {
+            start = total;
+        }
+        let mut i = start;
+        while i <= total && (ids.len() as u64) < (limit as u64) {
+            if let Some(addr) = relays.get((i - 1) as usize) {
+                ids.push_back(addr);
+            }
+            i += 1;
+        }
+
+        let next_cursor = if i - 1 < total as u32 {
+            Some(RelayCursor { index: i - 1 })
+        } else {
+            None
+        };
+
+        RelayPage {
+            relays: ids,
+            next_cursor,
+            total,
         }
     }
 
@@ -575,6 +804,153 @@ impl CrossChainBridge {
         );
 
         true
+    }
+
+    /// Deterministic attestation id: SHA-256 over relay || user_address || token_address.
+    fn attestation_id(env: &Env, relay: &Address, user: &Bytes, token: &Bytes) -> BytesN<32> {
+        let mut input = Bytes::new(env);
+        input.append(&relay.to_xdr(env));
+        input.append(user);
+        input.append(token);
+        env.crypto().sha256(&input).to_bytes()
+    }
+
+    /// Bounded cursor scan over pending attestations with AND-filter predicates.
+    fn scan_attestations(
+        env: &Env,
+        cursor: Option<AttestationCursor>,
+        limit: u32,
+        filter: AttestationFilter,
+    ) -> AttestationPage {
+        let mut ids = Vec::new(env);
+        let mut scanned: u32 = 0;
+        let mut last_seq: u64 = cursor.map(|c| c.seq).unwrap_or(0);
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&BridgeKey::AttestationNextSeq)
+            .unwrap_or(1)
+            .saturating_sub(1);
+
+        let mut seq = last_seq + 1;
+        let mut remaining = limit as u64;
+        let mut stop = false;
+
+        while remaining > 0 && scanned < MAX_PAGE_SCAN && !stop {
+            let att: Option<BalanceAttestation> =
+                env.storage()
+                    .instance()
+                    .get(&BridgeKey::AttestationSeq(seq));
+            scanned += 1;
+            last_seq = seq;
+
+            if let Some(a) = att {
+                let matches = filter.relay.map_or(true, |r| r == a.relay)
+                    && filter
+                        .user_address
+                        .map_or(true, |u| u == a.user_address)
+                    && filter
+                        .token_address
+                        .map_or(true, |t| t == a.token_address)
+                    && filter.accepted.map_or(true, |acc| acc == a.accepted);
+
+                if matches {
+                    let id = Self::attestation_id(env, &a.relay, &a.user_address, &a.token_address);
+                    ids.push_back(id);
+                    remaining -= 1;
+                }
+            }
+
+            if seq >= total {
+                stop = true;
+            } else {
+                seq += 1;
+            }
+        }
+
+        let next_cursor = if last_seq < total {
+            Some(AttestationCursor { seq: last_seq })
+        } else {
+            None
+        };
+
+        AttestationPage {
+            ids,
+            next_cursor,
+            scanned,
+            total: total as u32,
+        }
+    }
+
+    /// Bounded cursor scan over verification cache entries with AND-filter predicates.
+    fn scan_cache(
+        env: &Env,
+        cursor: Option<CacheCursor>,
+        limit: u32,
+        filter: CacheFilter,
+    ) -> CachePage {
+        let mut ids = Vec::new(env);
+        let mut scanned: u32 = 0;
+        let mut last_seq: u64 = cursor.map(|c| c.seq).unwrap_or(0);
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&BridgeKey::CacheNextSeq)
+            .unwrap_or(1)
+            .saturating_sub(1);
+
+        let mut seq = last_seq + 1;
+        let mut remaining = limit as u64;
+        let mut stop = false;
+
+        while remaining > 0 && scanned < MAX_PAGE_SCAN && !stop {
+            let rec: Option<BridgeVerificationRecord> =
+                env.storage().instance().get(&BridgeKey::CacheSeq(seq));
+            scanned += 1;
+            last_seq = seq;
+
+            if let Some(r) = rec {
+                let matches = filter.user.map_or(true, |u| u == r.user)
+                    && filter
+                        .token_address
+                        .map_or(true, |t| t == r.token_address)
+                    && filter.token_id.map_or(true, |t| t == r.token_id);
+
+                if matches {
+                    let id = Self::cache_id(env, &r.user, &r.token_address, r.token_id);
+                    ids.push_back(id);
+                    remaining -= 1;
+                }
+            }
+
+            if seq >= total {
+                stop = true;
+            } else {
+                seq += 1;
+            }
+        }
+
+        let next_cursor = if last_seq < total {
+            Some(CacheCursor { seq: last_seq })
+        } else {
+            None
+        };
+
+        CachePage {
+            ids,
+            next_cursor,
+            scanned,
+            total: total as u32,
+        }
+    }
+
+    /// Deterministic cache id: SHA-256 over user || token_address || token_id.
+    fn cache_id(env: &Env, user: &Bytes, token: &Bytes, token_id: u128) -> BytesN<32> {
+        let mut input = Bytes::new(env);
+        input.append(user);
+        input.append(token);
+        input.append(&Bytes::from_slice(env, &token_id.to_le_bytes()));
+        env.crypto().sha256(&input).to_bytes()
     }
 }
 
@@ -714,23 +1090,255 @@ fn config_state_bytes(env: &Env, threshold: u32, ttl: u32) -> Bytes {
 mod tests {
     use super::*;
 
+    fn owner(env: &Env) -> Address {
+        Address::generate(env)
+    }
+
+    fn relay(env: &Env) -> Address {
+        Address::generate(env)
+    }
+
+    fn pubkey_65(env: &Env) -> Bytes {
+        Bytes::from_slice(env, &[0x04u8; 65])
+    }
+
+    fn eth_addr(env: &Env) -> Bytes {
+        // 0x + 40 hex chars = 42 bytes
+        Bytes::from_slice(env, b"0x1234567890123456789012345678901234567890")
+    }
+
+    fn sample_attestation(env: &Env, relay: &Address) -> BalanceAttestation {
+        BalanceAttestation {
+            relay: relay.clone(),
+            user_address: eth_addr(env),
+            token_address: eth_addr(env),
+            token_id: 0,
+            balance: 1_000_000,
+            block_height: 100,
+            timestamp: 1_700_000_000,
+            signature: Bytes::from_slice(env, &[1u8; 65]),
+            accepted: false,
+        }
+    }
+
     #[test]
     fn test_bridge_initialization() {
-        // Tests for bridge setup
+        let env = Env::default();
+        env.mock_all_auths();
+        let o = owner(&env);
+
+        CrossChainBridge::initialize_bridge(
+            env.clone(),
+            o.clone(),
+            2,
+            100,
+            1,
+        );
+
+        let config = CrossChainBridge::get_bridge_config_info(env.clone());
+        assert_eq!(config.signature_threshold, 2);
+        assert_eq!(config.cache_ttl_ledgers, 100);
+        assert_eq!(config.max_block_age, 256);
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidThreshold")]
+    fn test_bridge_initialization_zero_threshold_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let o = owner(&env);
+
+        CrossChainBridge::initialize_bridge(env.clone(), o.clone(), 0, 100, 1);
     }
 
     #[test]
     fn test_relay_registration() {
-        // Tests for relay management
+        let env = Env::default();
+        env.mock_all_auths();
+        let o = owner(&env);
+        let r = relay(&env);
+
+        CrossChainBridge::initialize_bridge(env.clone(), o.clone(), 2, 100, 1);
+        CrossChainBridge::register_relay(env.clone(), r.clone(), pubkey_65(&env));
+
+        let stored: Option<BridgeRelay> = env
+            .storage()
+            .instance()
+            .get(&BridgeKey::BridgeRelay(r.clone()));
+        assert!(stored.is_some());
+        assert!(stored.unwrap().active);
+        assert_eq!(stored.unwrap().reputation, 100);
     }
 
     #[test]
-    fn test_attestation_submission() {
-        // Tests for attestation acceptance and signature verification
+    #[should_panic(expected = "InvalidSignatureFormat")]
+    fn test_relay_registration_bad_pubkey_len_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let o = owner(&env);
+        let r = relay(&env);
+
+        CrossChainBridge::initialize_bridge(env.clone(), o.clone(), 2, 100, 1);
+        CrossChainBridge::register_relay(env.clone(), r.clone(), Bytes::from_slice(&env, &[1u8; 33]));
     }
 
     #[test]
-    fn test_balance_verification_cache() {
-        // Tests for cache management and expiry
+    #[should_panic(expected = "RelayAlreadyExists")]
+    fn test_relay_registration_duplicate_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let o = owner(&env);
+        let r = relay(&env);
+
+        CrossChainBridge::initialize_bridge(env.clone(), o.clone(), 2, 100, 1);
+        CrossChainBridge::register_relay(env.clone(), r.clone(), pubkey_65(&env));
+        CrossChainBridge::register_relay(env.clone(), r.clone(), pubkey_65(&env));
+    }
+
+    #[test]
+    fn test_attestation_submission_and_acceptance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let o = owner(&env);
+        let r = relay(&env);
+
+        CrossChainBridge::initialize_bridge(env.clone(), o.clone(), 2, 100, 1);
+        CrossChainBridge::register_relay(env.clone(), r.clone(), pubkey_65(&env));
+
+        let att = sample_attestation(&env, &r);
+        CrossChainBridge::submit_attestation(env.clone(), att.clone());
+
+        let key = BridgeKey::PendingAttestation(
+            r.clone(),
+            att.user_address.clone(),
+            att.token_address.clone(),
+        );
+        let stored: Option<BalanceAttestation> = env.storage().instance().get(&key);
+        assert!(stored.is_some());
+
+        CrossChainBridge::accept_attestation(
+            env.clone(),
+            r.clone(),
+            att.user_address,
+            att.token_address,
+            att.token_id,
+        );
+
+        let cache_key = BridgeKey::VerificationCache(
+            att.user_address,
+            att.token_address,
+            att.token_id,
+        );
+        let record: Option<BridgeVerificationRecord> =
+            env.storage().instance().get(&cache_key);
+        assert!(record.is_some());
+        assert_eq!(record.unwrap().balance, att.balance);
+    }
+
+    #[test]
+    #[should_panic(expected = "AttestationTooOld")]
+    fn test_attestation_too_old_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let o = owner(&env);
+        let r = relay(&env);
+
+        CrossChainBridge::initialize_bridge(env.clone(), o.clone(), 2, 100, 1);
+        CrossChainBridge::register_relay(env.clone(), r.clone(), pubkey_65(&env));
+
+        let mut att = sample_attestation(&env, &r);
+        // Set block_height so block_height + max_block_age overflows u64
+        att.block_height = u64::MAX;
+        CrossChainBridge::submit_attestation(env.clone(), att);
+    }
+
+    #[test]
+    fn test_balance_verification_cache_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let o = owner(&env);
+        let r = relay(&env);
+
+        CrossChainBridge::initialize_bridge(env.clone(), o.clone(), 1, 1, 1);
+        CrossChainBridge::register_relay(env.clone(), r.clone(), pubkey_65(&env));
+
+        let att = sample_attestation(&env, &r);
+        CrossChainBridge::submit_attestation(env.clone(), att.clone());
+        CrossChainBridge::accept_attestation(
+            env.clone(),
+            r.clone(),
+            att.user_address,
+            att.token_address,
+            att.token_id,
+        );
+
+        // Fresh cache returns balance
+        let bal = CrossChainBridge::get_verified_balance(
+            env.clone(),
+            att.user_address,
+            att.token_address,
+            att.token_id,
+        );
+        assert_eq!(bal, att.balance);
+    }
+
+    #[test]
+    fn test_update_bridge_config() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let o = owner(&env);
+
+        CrossChainBridge::initialize_bridge(env.clone(), o.clone(), 2, 100, 1);
+        CrossChainBridge::update_bridge_config(env.clone(), 5, 200);
+
+        let config = CrossChainBridge::get_bridge_config_info(env.clone());
+        assert_eq!(config.signature_threshold, 5);
+        assert_eq!(config.cache_ttl_ledgers, 200);
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidThreshold")]
+    fn test_update_bridge_config_zero_threshold_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let o = owner(&env);
+
+        CrossChainBridge::initialize_bridge(env.clone(), o.clone(), 2, 100, 1);
+        CrossChainBridge::update_bridge_config(env.clone(), 0, 100);
+    }
+
+    #[test]
+    fn test_get_verified_balance_missing_returns_zero() {
+        let env = Env::default();
+        let bal = CrossChainBridge::get_verified_balance(
+            env.clone(),
+            eth_addr(&env),
+            eth_addr(&env),
+            0,
+        );
+        assert_eq!(bal, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidEthAddress")]
+    fn test_validate_eth_address_wrong_len() {
+        let env = Env::default();
+        validate_eth_address(&Bytes::from_slice(&env, b"0xshort"));
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidSignatureFormat")]
+    fn test_verify_signature_bad_len() {
+        let env = Env::default();
+        let r = relay(&env);
+        let relay_rec = BridgeRelay {
+            relay_address: r.clone(),
+            pubkey: pubkey_65(&env),
+            active: true,
+            reputation: 100,
+        };
+        let mut att = sample_attestation(&env, &r);
+        att.signature = Bytes::from_slice(&env, &[1u8; 33]);
+        assert!(!verify_signature(&env, &relay_rec, &att));
     }
 }

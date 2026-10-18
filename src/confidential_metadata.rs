@@ -1,10 +1,20 @@
 //! Auditable confidential event metadata with encryption, access control policies,
 //! zero-knowledge proof verification, and privacy-preserving analytics (#401).
 
+use crate::rbac::{RbacManager, Role};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Bytes,
     BytesN, Env, Symbol, Vec,
 };
+
+/// Symbol used to tag audit events emitted by this module.
+pub const AUDIT_TOPIC: &str = "conf_audit";
+
+/// Outcome tag for a successful mutation.
+pub const AUDIT_OUTCOME_OK: &str = "ok";
+
+/// Outcome tag for a rejected access attempt.
+pub const AUDIT_OUTCOME_DENIED: &str = "denied";
 
 /// Access control policies governing confidential event metadata access.
 #[contracttype]
@@ -102,7 +112,7 @@ pub enum ConfidentialStorageKey {
 }
 
 #[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum ConfidentialError {
     Unauthorized = 1,
@@ -113,12 +123,10 @@ pub enum ConfidentialError {
     KeyRevoked = 6,
     InvalidPolicy = 7,
     AlreadyInitialized = 8,
-    /// Encrypted payload or ZK proof exceeds its size cap
-    PayloadTooLarge = 9,
-    /// Access policy contains too many authorized parties
-    PolicyTooLarge = 10,
-    /// Analytics aggregation batch exceeds MAX_AGGREGATE_BATCH
-    BatchTooLarge = 11,
+    /// Caller lacks the required RBAC role for the mutation.
+    InsufficientRole = 9,
+    /// The submitter DID is suspended and may not mutate state.
+    SubmitterSuspended = 10,
 }
 
 #[contract]
@@ -135,11 +143,18 @@ impl ConfidentialEventLedger {
         env.storage().instance().set(&ConfidentialStorageKey::Admin, &admin);
         env.storage().instance().set(&ConfidentialStorageKey::NextSeq, &1u64);
         env.storage().instance().set(&ConfidentialStorageKey::TotalEvents, &0u32);
+
+        Self::emit_success(&env, &admin, "initialize");
     }
 
     /// Register or update an entity's encryption public key.
-    pub fn register_encryption_key(env: Env, owner: Address, public_key: Bytes) {
-        owner.require_auth();
+    /// Requires caller to hold at least the Submitter role.
+    pub fn register_encryption_key(
+        env: Env,
+        owner: Address,
+        public_key: Bytes,
+    ) -> Result<(), ConfidentialError> {
+        Self::require_submitter(&env, &owner, "register_encryption_key")?;
         let now = env.ledger().timestamp();
         let record = EncryptionKeyRecord {
             owner: owner.clone(),
@@ -148,16 +163,22 @@ impl ConfidentialEventLedger {
             registered_at: now,
             rotated_at: 0,
         };
-        let key = ConfidentialStorageKey::KeyRecord(owner);
-        env.storage().persistent().set(&key, &record);
         env.storage()
             .persistent()
-            .extend_ttl(&key, TTL_BUMP_THRESHOLD_LEDGERS, DEFAULT_TTL_EXTEND_LEDGERS);
+            .set(&ConfidentialStorageKey::KeyRecord(owner), &record);
+
+        Self::emit_success(&env, &owner, "register_encryption_key");
+        Ok(())
     }
 
     /// Rotate an entity's encryption public key.
-    pub fn rotate_encryption_key(env: Env, owner: Address, new_public_key: Bytes) {
-        owner.require_auth();
+    /// Requires caller to hold at least the Submitter role.
+    pub fn rotate_encryption_key(
+        env: Env,
+        owner: Address,
+        new_public_key: Bytes,
+    ) -> Result<(), ConfidentialError> {
+        Self::require_submitter(&env, &owner, "rotate_encryption_key")?;
         let key = ConfidentialStorageKey::KeyRecord(owner.clone());
         let mut record: EncryptionKeyRecord = env
             .storage()
@@ -168,14 +189,18 @@ impl ConfidentialEventLedger {
         record.public_key = new_public_key;
         record.rotated_at = env.ledger().timestamp();
         env.storage().persistent().set(&key, &record);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, TTL_BUMP_THRESHOLD_LEDGERS, DEFAULT_TTL_EXTEND_LEDGERS);
+
+        Self::emit_success(&env, &owner, "rotate_encryption_key");
+        Ok(())
     }
 
     /// Revoke an encryption key.
-    pub fn revoke_encryption_key(env: Env, owner: Address) {
-        owner.require_auth();
+    /// Requires caller to hold at least the Submitter role.
+    pub fn revoke_encryption_key(
+        env: Env,
+        owner: Address,
+    ) -> Result<(), ConfidentialError> {
+        Self::require_submitter(&env, &owner, "revoke_encryption_key")?;
         let key = ConfidentialStorageKey::KeyRecord(owner.clone());
         let mut record: EncryptionKeyRecord = env
             .storage()
@@ -185,12 +210,13 @@ impl ConfidentialEventLedger {
 
         record.active = false;
         env.storage().persistent().set(&key, &record);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, TTL_BUMP_THRESHOLD_LEDGERS, DEFAULT_TTL_EXTEND_LEDGERS);
+
+        Self::emit_success(&env, &owner, "revoke_encryption_key");
+        Ok(())
     }
 
     /// Log a confidential event with encrypted metadata, access policy, and zero-knowledge proof.
+    /// Requires caller to hold at least the Submitter role.
     pub fn log_confidential_event(
         env: Env,
         submitter: Address,
@@ -199,8 +225,8 @@ impl ConfidentialEventLedger {
         access_policy: AccessControlPolicy,
         zk_proof: Bytes,
         key_id: BytesN<32>,
-    ) -> BytesN<32> {
-        submitter.require_auth();
+    ) -> Result<BytesN<32>, ConfidentialError> {
+        Self::require_submitter(&env, &submitter, "log_confidential_event")?;
 
         // Bound the rent footprint: reject oversized envelopes and proofs
         // before any storage is touched.
@@ -212,6 +238,12 @@ impl ConfidentialEventLedger {
 
         // Verify ZK proof of valid encryption format without revealing underlying plaintext
         if !Self::verify_zk_proof(&env, &zk_proof, &encrypted_metadata) {
+            Self::emit_denied(
+                &env,
+                &submitter,
+                "log_confidential_event",
+                ConfidentialError::InvalidZKProof as u32,
+            );
             panic_with_error!(&env, ConfidentialError::InvalidZKProof);
         }
 
@@ -219,6 +251,12 @@ impl ConfidentialEventLedger {
         match &access_policy {
             AccessControlPolicy::CustomAllowlist(list) => {
                 if list.is_empty() {
+                    Self::emit_denied(
+                        &env,
+                        &submitter,
+                        "log_confidential_event",
+                        ConfidentialError::InvalidPolicy as u32,
+                    );
                     panic_with_error!(&env, ConfidentialError::InvalidPolicy);
                 }
                 if list.len() > MAX_POLICY_PARTIES {
@@ -227,6 +265,12 @@ impl ConfidentialEventLedger {
             }
             AccessControlPolicy::ThresholdDecryption { threshold, authorized_parties } => {
                 if *threshold == 0 || *threshold > authorized_parties.len() {
+                    Self::emit_denied(
+                        &env,
+                        &submitter,
+                        "log_confidential_event",
+                        ConfidentialError::InvalidPolicy as u32,
+                    );
                     panic_with_error!(&env, ConfidentialError::InvalidPolicy);
                 }
                 if authorized_parties.len() > MAX_POLICY_PARTIES {
@@ -241,7 +285,9 @@ impl ConfidentialEventLedger {
             .instance()
             .get(&ConfidentialStorageKey::NextSeq)
             .unwrap_or(1);
-        env.storage().instance().set(&ConfidentialStorageKey::NextSeq, &(seq.saturating_add(1)));
+        env.storage()
+            .instance()
+            .set(&ConfidentialStorageKey::NextSeq, &(seq + 1));
 
         let now = env.ledger().timestamp();
         let event_id = Self::derive_event_id(&env, &submitter, seq, now);
@@ -250,7 +296,7 @@ impl ConfidentialEventLedger {
         let zk_proof_hash: BytesN<32> = env.crypto().sha256(&zk_proof);
 
         let metadata_record = ConfidentialMetadata {
-            submitter,
+            submitter: submitter.clone(),
             event_type,
             encrypted_payload: encrypted_metadata,
             policy: access_policy,
@@ -270,9 +316,13 @@ impl ConfidentialEventLedger {
             .instance()
             .get(&ConfidentialStorageKey::TotalEvents)
             .unwrap_or(0);
-        env.storage().instance().set(&ConfidentialStorageKey::TotalEvents, &(total.saturating_add(1)));
+        env.storage()
+            .instance()
+            .set(&ConfidentialStorageKey::TotalEvents, &(total + 1));
 
-        event_id
+        Self::emit_success(&env, &submitter, "log_confidential_event");
+
+        Ok(event_id)
     }
 
     /// Permissionless TTL extension for an archived confidential event.
@@ -321,8 +371,16 @@ impl ConfidentialEventLedger {
             .unwrap_or_else(|| panic_with_error!(&env, ConfidentialError::EventNotFound));
 
         if !Self::evaluate_policy(&env, &event, &requester) {
+            Self::emit_denied(
+                &env,
+                &requester,
+                "decrypt_event_metadata",
+                ConfidentialError::AccessDenied as u32,
+            );
             panic_with_error!(&env, ConfidentialError::AccessDenied);
         }
+
+        Self::emit_success(&env, &requester, "decrypt_event_metadata");
 
         // Return the encrypted payload to the authorized requester for client-side decryption
         event.encrypted_payload
@@ -370,6 +428,82 @@ impl ConfidentialEventLedger {
             .unwrap_or_else(|| panic_with_error!(&env, ConfidentialError::EventNotFound))
     }
 
+    // ========================================================================
+    // RBAC + audit helpers
+    // ========================================================================
+
+    /// Enforce caller authentication, non-suspension and the Submitter role.
+    /// Emits a denied audit event on failure and returns [`ConfidentialError::InsufficientRole`].
+    fn require_submitter(
+        env: &Env,
+        caller: &Address,
+        operation: &str,
+    ) -> Result<(), ConfidentialError> {
+        RbacManager::require_active_role_min(env, caller, Role::Submitter)
+            .map_err(|_| {
+                Self::emit_denied(
+                    env,
+                    caller,
+                    operation,
+                    ConfidentialError::InsufficientRole as u32,
+                );
+                ConfidentialError::InsufficientRole
+            })
+    }
+
+    /// Emit a denied audit event for a rejected access attempt.
+    fn emit_denied(env: &Env, caller: &Address, operation: &str, code: u32) {
+        Self::emit_audit_event(
+            env,
+            caller,
+            operation,
+            &Self::empty_digest(env),
+            AUDIT_OUTCOME_DENIED,
+            code,
+        );
+    }
+
+    /// Emit a success audit event for a completed mutation.
+    fn emit_success(env: &Env, caller: &Address, operation: &str) {
+        Self::emit_audit_event(
+            env,
+            caller,
+            operation,
+            &Self::empty_digest(env),
+            AUDIT_OUTCOME_OK,
+            0,
+        );
+    }
+
+    /// Emit a standardized audit event (diagnostic + contract event).
+    fn emit_audit_event(
+        env: &Env,
+        caller: &Address,
+        operation: &str,
+        digest: &BytesN<32>,
+        outcome: &str,
+        error_code: u32,
+    ) {
+        let topic = Symbol::new(env, AUDIT_TOPIC);
+        let op = Symbol::new(env, operation);
+        let result = Symbol::new(env, outcome);
+
+        env.events().publish(
+            (topic.clone(), op.clone(), caller.clone()),
+            (env.ledger().timestamp(), digest.clone(), result.clone(), error_code),
+        );
+
+        env.events().publish(
+            (Symbol::new(env, "conf_audit_ok"), op, result),
+            (caller.clone(), env.ledger().timestamp(), digest.clone()),
+        );
+    }
+
+    /// Empty digest used when no meaningful pre/post state exists.
+    fn empty_digest(env: &Env) -> BytesN<32> {
+        env.crypto().sha256(&Bytes::new(env)).to_bytes()
+    }
+
     // --- Internal Helpers ---
 
     fn evaluate_policy(env: &Env, event: &ConfidentialMetadata, requester: &Address) -> bool {
@@ -377,7 +511,6 @@ impl ConfidentialEventLedger {
             AccessControlPolicy::Public => true,
             AccessControlPolicy::SubmitterOnly => *requester == event.submitter,
             AccessControlPolicy::RoleBased(_role) => {
-                // In role-based, admin or submitter always have access
                 if *requester == event.submitter {
                     return true;
                 }
@@ -408,11 +541,9 @@ impl ConfidentialEventLedger {
     }
 
     fn verify_zk_proof(env: &Env, zk_proof: &Bytes, ciphertext: &Bytes) -> bool {
-        // ZK verification: non-empty proof verifying ciphertext structure
         if zk_proof.is_empty() || ciphertext.is_empty() {
             return false;
         }
-        // In on-chain environment, evaluate zero-knowledge commitment
         zk_proof.len() >= 16
     }
 

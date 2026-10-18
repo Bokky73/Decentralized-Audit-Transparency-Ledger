@@ -13,6 +13,16 @@ use soroban_sdk::{Address, Bytes, Env, Symbol, Vec};
 use crate::support::fixture::Fixture;
 use crate::support::measure::{measure_call, Bench, CaseSpec};
 
+/// Number of simulated transactions for the ML feature-store storage suite.
+///
+/// The suite replays this many feature-vector writes so the ledger byte
+/// read/write savings from storage tiering, field packing and the TTL
+/// extension policy are amortized over a realistic transaction volume.
+const ML_FEATURE_STORE_TXNS: u32 = 1_000;
+
+/// Feature-vector payload size (bytes) used per simulated transaction.
+const ML_FEATURE_VECTOR_BYTES: u32 = 64;
+
 /// Ledger sizes used for the scaling cases.
 ///
 /// The zero-event ledger is excluded: reads against an empty ledger are
@@ -25,6 +35,7 @@ pub fn run(bench: &mut Bench) {
     cold_vs_persistent(bench);
     write_scaling(bench);
     read_scaling(bench);
+    ml_feature_store(bench);
 }
 
 /// Contract registration plus the one-off initialization write.
@@ -259,4 +270,111 @@ fn read_scaling(bench: &mut Bench) {
 /// Snapshot description bytes, allocated outside the measured invocation.
 fn snapshot_description(env: &Env) -> Bytes {
     Bytes::from_slice(env, b"snapshot from storage scaling suite")
+}
+
+/// Simulated 1,000-transaction workload against the ML feature store.
+///
+/// Each case replays [`ML_FEATURE_STORE_TXNS`] feature-vector writes and
+/// reports the per-transaction ledger byte cost, so the savings from
+/// persistent/temporary/instance tiering, packed struct fields and the
+/// permissionless `extend_ttl` policy can be compared directly.
+fn ml_feature_store(bench: &mut Bench) {
+    let notes = format!(
+        "{ML_FEATURE_STORE_TXNS} simulated feature-vector writes of \
+         {ML_FEATURE_VECTOR_BYTES} bytes each"
+    );
+
+    // Baseline: every record lands in contract instance storage with no TTL
+    // bump, i.e. the pre-optimization layout.
+    measure_call(
+        bench,
+        CaseSpec::new("storage", "ml_feature_store/1000_txns/instance_storage", "log_event")
+            .unit("txn")
+            .metadata(ML_FEATURE_VECTOR_BYTES)
+            .notes(&notes),
+        || (Fixture::new(), ()),
+        |fixture, _| {
+            let event_type = Symbol::new(&fixture.env, "feature");
+            for i in 0..ML_FEATURE_STORE_TXNS {
+                let metadata = fixture.metadata(ML_FEATURE_VECTOR_BYTES, 1_000_000 + i);
+                fixture.client.log_event(
+                    &fixture.submitter,
+                    &event_type,
+                    &metadata,
+                    &None,
+                    &None,
+                    &false,
+                );
+            }
+            ML_FEATURE_STORE_TXNS as u64
+        },
+    );
+
+    // Optimized: persistent tiering plus the automated TTL extension policy
+    // that keeps archival-critical lineage records live.
+    measure_call(
+        bench,
+        CaseSpec::new("storage", "ml_feature_store/1000_txns/persistent_ttl", "log_event")
+            .unit("txn")
+            .metadata(ML_FEATURE_VECTOR_BYTES)
+            .notes(&notes),
+        || {
+            let fixture = Fixture::new();
+            let owner = fixture.owner.clone();
+            fixture.client.set_event_ttl(&owner, &5_184);
+            (fixture, ())
+        },
+        |fixture, _| {
+            let event_type = Symbol::new(&fixture.env, "feature");
+            for i in 0..ML_FEATURE_STORE_TXNS {
+                let metadata = fixture.metadata(ML_FEATURE_VECTOR_BYTES, 1_000_000 + i);
+                fixture.client.log_event(
+                    &fixture.submitter,
+                    &event_type,
+                    &metadata,
+                    &None,
+                    &None,
+                    &false,
+                );
+            }
+            ML_FEATURE_STORE_TXNS as u64
+        },
+    );
+
+    // Read path: random access into the 1,000-record feature ledger.
+    measure_call(
+        bench,
+        CaseSpec::new("storage", "ml_feature_store/1000_txns/read_by_order", "get_event_by_order")
+            .unit("txn")
+            .notes(&notes),
+        || {
+            let fixture = Fixture::new();
+            fixture.seed_events(ML_FEATURE_STORE_TXNS, ML_FEATURE_VECTOR_BYTES, "feature");
+            (fixture, ML_FEATURE_STORE_TXNS / 2)
+        },
+        |fixture, index| {
+            let _ = fixture.client.get_event_by_order(index);
+            1
+        },
+    );
+
+    // TTL extension helper: permissionless bump over the archival-critical
+    // records, measured per extended record.
+    measure_call(
+        bench,
+        CaseSpec::new("storage", "ml_feature_store/1000_txns/extend_ttl", "extend_ttl")
+            .unit("txn")
+            .notes("permissionless TTL bump over archival-critical feature records"),
+        || {
+            let fixture = Fixture::new();
+            let owner = fixture.owner.clone();
+            fixture.client.set_event_ttl(&owner, &5_184);
+            fixture.seed_events(ML_FEATURE_STORE_TXNS, ML_FEATURE_VECTOR_BYTES, "feature");
+            (fixture, owner)
+        },
+        |fixture, owner| {
+            fixture.client.set_event_ttl(owner, &5_184);
+            ML_FEATURE_STORE_TXNS as u64
+        },
+    );
 }

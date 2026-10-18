@@ -12,4 +12,5 @@ export * from './filter-composition';
 export * from './connection-pool';
 export * from './metrics';
 export * from './confidential';
+export * from './pagination';
 export * from './suptech-rules';

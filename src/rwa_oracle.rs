@@ -1062,6 +1062,254 @@ pub fn extend_latest_price_ttl(env: &Env, asset_id: &Symbol) {
         .extend_ttl(&key, TTL_BUMP_THRESHOLD_LEDGERS, RECORD_TTL_EXTEND_LEDGERS);
 }
 
+/// Hard cap on the number of price-history entries returned in a single page.
+pub const MAX_PRICE_PAGE_LIMIT: u32 = 100;
+
+/// Cursor token for deterministic cursor-based pagination over price history.
+///
+/// The cursor encodes the composite sort key `(consensus_at, history_index)`
+/// of the last item returned on the previous page. Ordering on this composite
+/// key is stable across ledger upgrades and archival restores, so traversal is
+/// reproducible.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PriceHistoryCursor {
+    /// Consensus timestamp of the last returned item.
+    pub consensus_at: u64,
+    /// Tie-breaking history index of the last returned item.
+    pub history_index: u32,
+}
+
+/// Requested page size, capped at [`MAX_PRICE_PAGE_LIMIT`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PriceHistoryLimit {
+    /// Requested number of items.
+    pub limit: u32,
+}
+
+impl PriceHistoryLimit {
+    /// Construct a page limit, rejecting zero and clamping to the hard cap.
+    pub fn new(limit: u32) -> Result<Self, &'static str> {
+        if limit == 0 {
+            return Err("Page limit must be greater than zero");
+        }
+        Ok(Self {
+            limit: if limit > MAX_PRICE_PAGE_LIMIT {
+                MAX_PRICE_PAGE_LIMIT
+            } else {
+                limit
+            },
+        })
+    }
+
+    /// Effective (capped) limit.
+    pub fn effective(&self) -> u32 {
+        if self.limit > MAX_PRICE_PAGE_LIMIT {
+            MAX_PRICE_PAGE_LIMIT
+        } else {
+            self.limit
+        }
+    }
+}
+
+/// Multi-predicate filter for price history queries.
+///
+/// All predicates are optional; `None` means "no constraint". When several
+/// predicates are supplied they are combined with logical AND.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PriceHistoryFilter {
+    /// Inclusive lower bound on consensus timestamp.
+    pub min_consensus_at: Option<u64>,
+    /// Inclusive upper bound on consensus timestamp.
+    pub max_consensus_at: Option<u64>,
+    /// Inclusive lower bound on price (scaled by PRICE_PRECISION).
+    pub min_price: Option<u128>,
+    /// Inclusive upper bound on price (scaled by PRICE_PRECISION).
+    pub max_price: Option<u128>,
+    /// Minimum number of oracle feeds that contributed to the consensus price.
+    pub min_oracle_count: Option<u32>,
+}
+
+impl PriceHistoryFilter {
+    /// Empty filter matching every item.
+    pub fn none() -> Self {
+        Self {
+            min_consensus_at: None,
+            max_consensus_at: None,
+            min_price: None,
+            max_price: None,
+            min_oracle_count: None,
+        }
+    }
+
+    /// Validate the filter, returning a typed error for invalid ranges.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if let (Some(min), Some(max)) = (self.min_consensus_at, self.max_consensus_at) {
+            if min > max {
+                return Err("Invalid consensus timestamp range: min exceeds max");
+            }
+        }
+        if let (Some(min), Some(max)) = (self.min_price, self.max_price) {
+            if min > max {
+                return Err("Invalid price range: min exceeds max");
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns true when `cp` satisfies all predicates.
+    pub fn matches(&self, cp: &CanonicalPrice) -> bool {
+        if let Some(min) = self.min_consensus_at {
+            if cp.consensus_at < min {
+                return false;
+            }
+        }
+        if let Some(max) = self.max_consensus_at {
+            if cp.consensus_at > max {
+                return false;
+            }
+        }
+        if let Some(min) = self.min_price {
+            if cp.price < min {
+                return false;
+            }
+        }
+        if let Some(max) = self.max_price {
+            if cp.price > max {
+                return false;
+            }
+        }
+        if let Some(min) = self.min_oracle_count {
+            if cp.oracle_count < min {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// A page of canonical price results plus the cursor for the next page.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalPricePage {
+    /// Items in this page, deterministically ordered.
+    pub items: Vec<CanonicalPrice>,
+    /// Cursor to pass to the next call, or `None` when exhausted.
+    pub next_cursor: Option<PriceHistoryCursor>,
+}
+
+/// Compare two composite sort keys `(consensus_at, history_index)`.
+fn compare_price_keys(
+    a: &(u64, u32),
+    b: &(u64, u32),
+) -> core::cmp::Ordering {
+    match a.0.cmp(&b.0) {
+        core::cmp::Ordering::Equal => a.1.cmp(&b.1),
+        other => other,
+    }
+}
+
+/// Returns true when `key` sorts strictly after `cursor`.
+fn price_key_after_cursor(key: &(u64, u32), cursor: &PriceHistoryCursor) -> bool {
+    compare_price_keys(key, &(cursor.consensus_at, cursor.history_index))
+        == core::cmp::Ordering::Greater
+}
+
+/// Build the next cursor from the last item of a full page.
+fn price_next_cursor_for(key: &(u64, u32), page_len: u32, limit: u32) -> Option<PriceHistoryCursor> {
+    if page_len < limit {
+        None
+    } else {
+        Some(PriceHistoryCursor {
+            consensus_at: key.0,
+            history_index: key.1,
+        })
+    }
+}
+
+/// Deterministic in-place insertion sort over composite price keys.
+fn sort_price_keys(keys: &mut Vec<(u64, u32)>) {
+    let len = keys.len();
+    if len < 2 {
+        return;
+    }
+    let mut i = 1u32;
+    while i < len {
+        let mut j = i;
+        while j > 0 {
+            let prev = keys.get(j - 1).unwrap();
+            let cur = keys.get(j).unwrap();
+            if compare_price_keys(&prev, &cur) == core::cmp::Ordering::Greater {
+                keys.set(j - 1, cur);
+                keys.set(j, prev);
+                j -= 1;
+            } else {
+                break;
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Paginated, filtered query over an asset's price history.
+///
+/// Results are ordered by the composite key `(consensus_at, history_index)`
+/// which is stable across ledger upgrades and archival restores. Returns the
+/// page items and a `next_cursor` token, or `None` when exhausted.
+pub fn get_price_history_paginated(
+    env: &Env,
+    asset_id: &Symbol,
+    filter: &PriceHistoryFilter,
+    cursor: &Option<PriceHistoryCursor>,
+    limit: &PriceHistoryLimit,
+) -> Result<CanonicalPricePage, &'static str> {
+    filter.validate()?;
+    let effective = limit.effective();
+
+    let history: Vec<CanonicalPrice> = env.storage().instance().get(
+        &OracleDataKey::PriceHistory(asset_id.clone()),
+    ).unwrap_or(Vec::new(env));
+
+    // Collect matching keys and sort deterministically.
+    let mut keys: Vec<(u64, u32)> = Vec::new(env);
+    for (i, cp) in history.iter().enumerate() {
+        if !filter.matches(cp) {
+            continue;
+        }
+        keys.push_back((cp.consensus_at, i as u32));
+    }
+    sort_price_keys(&mut keys);
+
+    let mut items = Vec::new(env);
+    let mut last_key: Option<(u64, u32)> = None;
+    let mut page_len = 0u32;
+
+        for key in keys.iter() {
+            if let Some(c) = cursor {
+                if !price_key_after_cursor(&key, c) {
+                    continue;
+                }
+            }
+            if page_len >= effective {
+                break;
+            }
+            if let Some(cp) = history.get(key.1) {
+                items.push_back(cp.clone());
+                last_key = Some(key.clone());
+                page_len += 1;
+            }
+        }
+
+    let next_cursor = match last_key {
+        Some(k) => price_next_cursor_for(&k, page_len, effective),
+        None => None,
+    };
+
+    Ok(CanonicalPricePage { items, next_cursor })
+}
+
 /// Returns `true` when the latest price for the asset is stale.
 pub fn is_latest_price_stale(env: &Env, asset_id: &Symbol) -> bool {
     let window = get_staleness_window(env);

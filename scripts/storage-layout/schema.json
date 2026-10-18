@@ -10,6 +10,40 @@
     "generated_at": { "type": "string", "format": "date-time" },
     "git_commit": { "type": "string", "description": "Git commit SHA or 'unknown'" },
     "rust_toolchain": { "type": "string" },
+    "storage_tiers": {
+      "type": "object",
+      "description": "Tiered storage classification for ml_feature_store records (issue #856)",
+      "properties": {
+        "persistent": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Keys with long retention SLA; require permissionless extend_ttl"
+        },
+        "temporary": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Keys with short retention SLA; allowed to expire"
+        },
+        "instance": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Keys stored in the contract instance tier"
+        }
+      }
+    },
+    "byte_budget": {
+      "type": "object",
+      "description": "Serialized XDR byte budget thresholds for ml_feature_store records",
+      "properties": {
+        "max_record_bytes": { "type": "integer", "minimum": 0 },
+        "max_total_bytes": { "type": "integer", "minimum": 0 },
+        "per_key_bytes": {
+          "type": "object",
+          "additionalProperties": { "type": "integer", "minimum": 0 }
+        },
+        "ttl_extension_ledgers": { "type": "integer", "minimum": 0 }
+      }
+    },
     "variants": {
       "type": "array",
       "items": {

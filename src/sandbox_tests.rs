@@ -3,6 +3,7 @@
 
 use soroban_sdk::{Bytes, BytesN, Env};
 
+use crate::rbac::{RbacManager, Role};
 use crate::sandbox_types::*;
 use crate::sandbox_mgmt::*;
 use crate::sandbox_env::*;
@@ -290,19 +291,62 @@ fn test_mainnet_readiness() {
 
 // ============ Graduation Tests ============
 
+fn graduation_setup(env: &Env) -> (Address, Address, Address) {
+    let admin = Address::generate(env);
+    let auditor = Address::generate(env);
+    let submitter = Address::generate(env);
+
+    env.mock_all_auths();
+    RbacManager::initialize_admin(env, &admin);
+    RbacManager::set_role(env, &admin, &auditor, Role::Auditor).unwrap();
+    RbacManager::set_role(env, &admin, &submitter, Role::Submitter).unwrap();
+
+    (admin, auditor, submitter)
+}
+
 #[test]
 fn test_graduation_assessment() {
     let env = create_test_env();
-    let assessment = GraduationManager::create_assessment(&env, BytesN::zero());
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let submitter = Address::generate(&env);
+    RbacManager::initialize_admin(&env, &admin);
+    RbacManager::set_role(&env, &admin, &submitter, Role::Submitter).unwrap();
+
+    let id = GraduationManager::create_assessment(
+        &env,
+        &submitter,
+        BytesN::from_array(&env, &[1u8; 32]),
+    )
+    .unwrap();
+    let assessment = GraduationManager::get_assessment(&env, id).unwrap();
 
     assert_eq!(assessment.transactions_completed, 0);
     assert!(!assessment.is_eligible);
 }
 
+fn fresh_assessment(env: &Env) -> GraduationAssessment {
+    GraduationAssessment {
+        assessment_id: BytesN::zero(),
+        participant_id: BytesN::zero(),
+        assessed_at: env.ledger().timestamp(),
+        transactions_completed: 0,
+        days_in_sandbox: 0,
+        compliance_score: 0,
+        user_satisfaction: 0,
+        regulatory_approval: false,
+        financial_health_passed: false,
+        tech_readiness_score: 0,
+        is_eligible: false,
+        decision: GraduationDecision::Pending as u32,
+        notes: Bytes::new(env),
+    }
+}
+
 #[test]
 fn test_eligibility_evaluation() {
     let env = create_test_env();
-    let mut assessment = GraduationManager::create_assessment(&env, BytesN::zero());
+    let mut assessment = fresh_assessment(&env);
 
     assessment.transactions_completed = 1500;
     assessment.days_in_sandbox = 100;
@@ -321,22 +365,39 @@ fn test_eligibility_evaluation() {
 #[test]
 fn test_graduation_approval() {
     let env = create_test_env();
-    let mut assessment = GraduationManager::create_assessment(&env, BytesN::zero());
+    let (_admin, auditor, submitter) = graduation_setup(&env);
+
+    let id = GraduationManager::create_assessment(
+        &env,
+        &submitter,
+        BytesN::from_array(&env, &[2u8; 32]),
+    )
+    .unwrap();
+
+    let mut assessment = GraduationManager::get_assessment(&env, id.clone()).unwrap();
     assessment.is_eligible = true;
+    let key = crate::sandbox_graduation::GraduationStorageKey::Assessment(id.clone());
+    env.storage().persistent().set(&key, &assessment);
 
     let result = GraduationManager::approve_graduation(
-        &mut assessment,
+        &env,
+        &auditor,
+        id,
         Bytes::from_slice(&env, b"Ready"),
     );
 
     assert!(result.is_ok());
-    assert_eq!(assessment.decision, GraduationDecision::Approved as u8);
+    let approved = GraduationManager::get_assessment(&env, id).unwrap();
+    assert_eq!(
+        approved.decision,
+        GraduationDecision::Approved as u32
+    );
 }
 
 #[test]
 fn test_readiness_percentage() {
     let env = create_test_env();
-    let mut assessment = GraduationManager::create_assessment(&env, BytesN::zero());
+    let mut assessment = fresh_assessment(&env);
 
     assessment.compliance_score = 80;
     assessment.user_satisfaction = 75;
@@ -344,6 +405,125 @@ fn test_readiness_percentage() {
 
     let readiness = GraduationManager::compute_readiness_percentage(&assessment);
     assert_eq!(readiness, 81);
+}
+
+#[test]
+fn test_graduation_reject_and_defer() {
+    let env = create_test_env();
+    let (_admin, auditor, submitter) = graduation_setup(&env);
+
+    let id = GraduationManager::create_assessment(
+        &env,
+        &submitter,
+        BytesN::from_array(&env, &[3u8; 32]),
+    )
+    .unwrap();
+
+    GraduationManager::reject_graduation(
+        &env,
+        &auditor,
+        id.clone(),
+        Bytes::from_slice(&env, b"not ready"),
+    )
+    .unwrap();
+
+    let rejected = GraduationManager::get_assessment(&env, id).unwrap();
+    assert_eq!(
+        rejected.decision,
+        GraduationDecision::Rejected as u32
+    );
+
+    let err = GraduationManager::defer_graduation(
+        &env,
+        &auditor,
+        id,
+        Bytes::from_slice(&env, b"later"),
+    );
+    assert_eq!(err, Err(crate::sandbox_graduation::GraduationError::AlreadyGraduated));
+}
+
+#[test]
+fn test_graduation_rbac_gating() {
+    let env = create_test_env();
+    let (_admin, auditor, submitter) = graduation_setup(&env);
+
+    let viewer = Address::generate(&env);
+    RbacManager::set_role(&env, &_admin, &viewer, Role::Viewer).unwrap();
+
+    let id = GraduationManager::create_assessment(
+        &env,
+        &submitter,
+        BytesN::from_array(&env, &[4u8; 32]),
+    )
+    .unwrap();
+
+    // Viewer cannot create (below Submitter).
+    let err = GraduationManager::create_assessment(&env, &viewer, BytesN::zero());
+    assert_eq!(err, Err(crate::sandbox_graduation::GraduationError::Unauthorized));
+
+    // Viewer cannot approve (below Auditor).
+    let err = GraduationManager::approve_graduation(
+        &env,
+        &viewer,
+        id.clone(),
+        Bytes::from_slice(&env, b"x"),
+    );
+    assert_eq!(err, Err(crate::sandbox_graduation::GraduationError::Unauthorized));
+
+    // Auditor can approve once eligible.
+    let mut a = GraduationManager::get_assessment(&env, id.clone()).unwrap();
+    a.is_eligible = true;
+    let key = crate::sandbox_graduation::GraduationStorageKey::Assessment(id.clone());
+    env.storage().persistent().set(&key, &a);
+    assert!(GraduationManager::approve_graduation(&env, &auditor, id, Bytes::new(&env)).is_ok());
+
+    let approved =
+        GraduationManager::get_assessment(&env, BytesN::from_array(&env, &[4u8; 32])).unwrap();
+    assert_eq!(
+        approved.decision,
+        GraduationDecision::Approved as u32
+    );
+}
+
+#[test]
+fn test_graduation_cursor_pagination() {
+    let env = create_test_env();
+    let (_admin, _auditor, submitter) = graduation_setup(&env);
+
+    let mut ids = Vec::new(&env);
+    for i in 0..4 {
+        let pid = BytesN::from_array(&env, &[i as u8 + 1; 32]);
+        let id = GraduationManager::create_assessment(&env, &submitter, pid).unwrap();
+        ids.push_back(id);
+    }
+
+    let page1 = GraduationManager::list_assessments(
+        &env,
+        None,
+        2,
+        AssessmentFilter::default(),
+    );
+    assert_eq!(page1.ids.len(), 2);
+    assert!(page1.next_cursor.is_some());
+    assert_eq!(page1.total, 4);
+
+    let cursor = page1.next_cursor.unwrap();
+    let page2 = GraduationManager::list_assessments(&env, Some(cursor), 2, AssessmentFilter::default());
+    assert_eq!(page2.ids.len(), 2);
+    assert!(page2.next_cursor.is_none());
+
+    // Filter by eligibility (none eligible by default).
+    let filtered = GraduationManager::list_assessments(
+        &env,
+        None,
+        10,
+        AssessmentFilter {
+            participant_id: None,
+            decision: None,
+            is_eligible: Some(false),
+        },
+    );
+    assert_eq!(filtered.ids.len(), 4);
 }
 
 // ============ Integration Workflow Tests ============
