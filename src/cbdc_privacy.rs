@@ -334,9 +334,301 @@ impl PrivacyStats {
     }
 }
 
+
+// ── Storage TTL and archival rent policies (#851) ───────────────────────────
+//
+// All privacy state lives in `Persistent` Soroban storage so audit records
+// survive contract inactivity, but persistent entries accrue archival rent
+// and are silently archived once their TTL lapses. The helpers below give
+// callers a single deterministic policy for bumping TTLs and for estimating
+// rent, instead of ad-hoc per-key extensions.
+
+/// Number of ledgers of expected remaining life before a TTL bump becomes
+/// rent-efficient (matching the CBDC interop corridor policy).
+pub const TTL_BUMP_THRESHOLD_LEDGERS: u32 = 10_000;
+
+/// Default TTL extension applied to archival-critical record keys.
+pub const DEFAULT_TTL_EXTEND_LEDGERS: u32 = 100_000;
+
+/// Compact extension for cheap-to-restore metadata keys (counters, stats).
+pub const ARCHIVAL_METADATA_TTL_LEDGERS: u32 = 40_000;
+
+/// Deterministic cap on authorized decrypters stored per masked record, so a
+/// single write cannot balloon the rent footprint of one entry.
+pub const MAX_AUTHORIZED_DECRYPTERS: u32 = 256;
+
+/// Storage keys for persistent privacy state managed by [`PrivacyManager`].
+#[contracttype]
+pub enum PrivacyStorageKey {
+    /// Masked transaction keyed by content hash.
+    MaskedTx(BytesN<32>),
+    /// Privacy ACL keyed by ACL id.
+    PrivacyAcl(BytesN<32>),
+    /// Aggregate privacy statistics.
+    Stats,
+}
+
+impl PrivacyManager {
+    /// Permissionless TTL extension for a persistent privacy key.
+    ///
+    /// Bumping is safe to call by anyone: extending TTL only guarantees the
+    /// entry outlives the ledger long enough for auditors to read it, and it
+    /// cannot corrupt, overwrite, or resurrect archived values.
+    pub fn extend_ttl(env: &Env, key: &PrivacyStorageKey) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, TTL_BUMP_THRESHOLD_LEDGERS, DEFAULT_TTL_EXTEND_LEDGERS);
+    }
+
+    /// Cheap TTL restoration for compact metadata keys.
+    pub fn extend_metadata_ttl(env: &Env, key: &PrivacyStorageKey) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, TTL_BUMP_THRESHOLD_LEDGERS, ARCHIVAL_METADATA_TTL_LEDGERS);
+    }
+
+    /// Bumps every persistent key touched by one masked-transaction write in a
+    /// single policy pass, bundling the record and (optionally) its ACL so the
+    /// caller pays one deterministic rent decision per logical record instead
+    /// of ad-hoc per-key bumps.
+    pub fn extend_transaction_record_ttl(
+        env: &Env,
+        content_hash: &BytesN<32>,
+        acl_id: Option<BytesN<32>>,
+    ) {
+        Self::extend_ttl(env, &PrivacyStorageKey::MaskedTx(content_hash.clone()));
+        if let Some(acl) = acl_id {
+            Self::extend_ttl(env, &PrivacyStorageKey::PrivacyAcl(acl));
+        }
+    }
+
+    /// Stores a masked transaction under its content hash and extends the
+    /// record TTL in the same call, so fresh writes are never archived
+    /// prematurely.
+    pub fn store_masked_transaction(env: &Env, masked: &MaskedTransaction) {
+        env.storage()
+            .persistent()
+            .set(&PrivacyStorageKey::MaskedTx(masked.content_hash), masked);
+        Self::extend_ttl(env, &PrivacyStorageKey::MaskedTx(masked.content_hash));
+    }
+
+    /// Loads a masked transaction without touching its TTL (read-only).
+    pub fn load_masked_transaction(env: &Env, content_hash: &BytesN<32>) -> Option<MaskedTransaction> {
+        env.storage()
+            .persistent()
+            .get(&PrivacyStorageKey::MaskedTx(*content_hash))
+    }
+
+    /// Stores a privacy ACL under its id and extends the record TTL in the
+    /// same call.
+    pub fn store_privacy_acl(env: &Env, acl: &PrivacyACL) {
+        env.storage()
+            .persistent()
+            .set(&PrivacyStorageKey::PrivacyAcl(acl.acl_id), acl);
+        Self::extend_ttl(env, &PrivacyStorageKey::PrivacyAcl(acl.acl_id));
+    }
+
+    /// Loads a privacy ACL without touching its TTL (read-only).
+    pub fn load_privacy_acl(env: &Env, acl_id: &BytesN<32>) -> Option<PrivacyACL> {
+        env.storage()
+            .persistent()
+            .get(&PrivacyStorageKey::PrivacyAcl(*acl_id))
+    }
+
+    /// Removes an expired ACL from the ledger, reclaiming its rent footprint
+    /// entirely instead of letting it burn archival fees until TTL lapse.
+    pub fn prune_expired_acl(env: &Env, acl: &PrivacyACL, current_time: u64) -> bool {
+        if acl.is_expired(current_time) {
+            env.storage()
+                .persistent()
+                .remove(&PrivacyStorageKey::PrivacyAcl(acl.acl_id));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Deterministic TTL step for a key given its current life and the
+    /// protocol max TTL: bumps extend to the full default horizon, capped by
+    /// the contract's maximum, and no-op at or beyond the threshold.
+    pub fn select_ttl_extension(current_ttl: u32, max_ttl: u32) -> u32 {
+        if current_ttl > TTL_BUMP_THRESHOLD_LEDGERS {
+            return 0;
+        }
+        let extend = DEFAULT_TTL_EXTEND_LEDGERS.min(max_ttl);
+        extend.min(max_ttl.saturating_sub(current_ttl))
+    }
+
+    /// Approximate persistent rent footprint of a masked transaction, in
+    /// on-chain data bytes. Deterministic: hash fields are fixed 32 bytes,
+    /// encrypted payloads are width-capped by tier, and the authorized
+    /// decrypter list is capped by [`MAX_AUTHORIZED_DECRYPTERS`].
+    pub fn masked_transaction_rent_bytes(masked: &MaskedTransaction) -> u32 {
+        let mut size: u64 = 32 /* content_hash */ + 4 /* tier */ + 1 /* encrypted flag */
+            + /* authorized list */ 32 + (masked.authorized_decrypters.len() as u64).min(MAX_AUTHORIZED_DECRYPTERS as u64) * 32
+            + /* masked_at */ 8 + /* metadata */ (masked.encryption_metadata.len() as u64).min(32);
+        if let Some(data) = &masked.encrypted_data {
+            size += (data.len() as u64).min(1024);
+        }
+        size as u32
+    }
+
+    /// Approximate persistent rent footprint of a privacy ACL, in bytes.
+    pub fn privacy_acl_rent_bytes(acl: &PrivacyACL) -> u32 {
+        let len = |v: &soroban_sdk::Vec<Address>| {
+            (v.len() as u32).min(MAX_AUTHORIZED_DECRYPTERS)
+        };
+        32 * 2 /* acl + tx hash */ + 8 /* expires_at */ + 3 /* vec headers */
+            + (len(&acl.read_access) + len(&acl.audit_access) + len(&acl.regulatory_access)) * 32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soroban_sdk::testutils::storage::Persistent as _;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::Ledger as _;
+
+    /// Builds a masked transaction with a deterministic content hash.
+    fn sample_masked(env: &Env, tier: u32, encrypted: bool) -> MaskedTransaction {
+        let mut content_hash_bytes = [0u8; 32];
+        content_hash_bytes[0..4].copy_from_slice(&tier.to_le_bytes());
+        let mut decrypters: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
+        decrypters.push_back(Address::generate(&env));
+        let data = if encrypted {
+            Some(Bytes::from_slice(&env, &[7u8; 64]))
+        } else {
+            None
+        };
+        MaskedTransaction {
+            content_hash: BytesN::from_array(&env, &content_hash_bytes),
+            privacy_tier: tier,
+            encrypted_data: data,
+            authorized_decrypters: decrypters,
+            masked_at: env.ledger().timestamp(),
+            encryption_metadata: Bytes::from_slice(&env, b"TEST_V1"),
+        }
+    }
+
+    #[test]
+    fn test_ttl_application_bumps_record() {
+        let env = Env::default();
+        let masked = sample_masked(&env, PrivacyTier::Private as u32, true);
+        PrivacyManager::store_masked_transaction(&env, &masked);
+
+        let ttl = env
+            .storage()
+            .persistent()
+            .get_ttl(&PrivacyStorageKey::MaskedTx(masked.content_hash));
+        assert!(
+            ttl >= DEFAULT_TTL_EXTEND_LEDGERS,
+            "stored record must carry the archival TTL horizon"
+        );
+
+        // Rewriting at the threshold keeps extending deterministically.
+        PrivacyManager::extend_transaction_record_ttl(&env, &masked.content_hash, None);
+        let ttl2 = env
+            .storage()
+            .persistent()
+            .get_ttl(&PrivacyStorageKey::MaskedTx(masked.content_hash));
+        assert!(ttl2 >= ttl);
+    }
+
+    #[test]
+    fn test_select_ttl_extension_policy() {
+        // Fresh key: extend to the default horizon.
+        let max = 1_048_576u32;
+        assert_eq!(
+            PrivacyManager::select_ttl_extension(0, max),
+            DEFAULT_TTL_EXTEND_LEDGERS
+        );
+        // Past the threshold: bumping is a no-op.
+        assert_eq!(
+            PrivacyManager::select_ttl_extension(TTL_BUMP_THRESHOLD_LEDGERS + 1, max),
+            0
+        );
+        // Capped by the protocol max TTL.
+        assert_eq!(
+            PrivacyManager::select_ttl_extension(TTL_BUMP_THRESHOLD_LEDGERS, 20_000),
+            20_000 - TTL_BUMP_THRESHOLD_LEDGERS
+        );
+        // Already near max TTL: past the threshold, no extension.
+        assert_eq!(
+            PrivacyManager::select_ttl_extension(max.saturating_sub(1000), max),
+            0
+        );
+    }
+
+    #[test]
+    fn test_rent_footprint_is_deterministic() {
+        let env = Env::default();
+        let mut decrypters: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
+        decrypters.push_back(Address::generate(&env));
+        let masked_public = MaskedTransaction {
+            content_hash: BytesN::zero(),
+            privacy_tier: PrivacyTier::Public as u32,
+            encrypted_data: None,
+            authorized_decrypters: decrypters.clone(),
+            masked_at: 0,
+            encryption_metadata: Bytes::from_slice(&env, b"NONE"),
+        };
+        let masked_private = MaskedTransaction {
+            content_hash: BytesN::zero(),
+            privacy_tier: PrivacyTier::Private as u32,
+            encrypted_data: Some(Bytes::from_slice(&env, &[1u8; 64])),
+            authorized_decrypters: decrypters.clone(),
+            masked_at: 0,
+            encryption_metadata: Bytes::from_slice(&env, b"PRIVATE_V1"),
+        };
+        assert!(
+            PrivacyManager::masked_transaction_rent_bytes(&masked_public)
+                < PrivacyManager::masked_transaction_rent_bytes(&masked_private),
+            "encrypted payloads must enlarge the rent estimate"
+        );
+
+        let acl = PrivacyACL {
+            acl_id: BytesN::zero(),
+            transaction_hash: BytesN::zero(),
+            read_access: decrypters.clone(),
+            audit_access: soroban_sdk::Vec::new(&env),
+            regulatory_access: soroban_sdk::Vec::new(&env),
+            expires_at: 0,
+        };
+        assert!(
+            PrivacyManager::privacy_acl_rent_bytes(&acl) > 0,
+            "ACL footprint must reflect stored addresses"
+        );
+    }
+
+    #[test]
+    fn test_acl_store_and_prune_expired() {
+        let env = Env::default();
+        env.ledger().with_mut(|li| {
+            li.timestamp = 10_000;
+        });
+        let acl = PrivacyManager::create_privacy_acl(
+            &env,
+            BytesN::from_array(&env, &[9u8; 32]),
+            soroban_sdk::Vec::new(&env),
+            soroban_sdk::Vec::new(&env),
+            soroban_sdk::Vec::new(&env),
+            100,
+        )
+        .unwrap();
+        PrivacyManager::store_privacy_acl(&env, &acl);
+        assert!(
+            PrivacyManager::load_privacy_acl(&env, &acl.acl_id).is_some(),
+            "stored ACL must be readable"
+        );
+
+        // Expired ACLs are pruned to reclaim archival rent.
+        env.ledger().with_mut(|li| {
+            li.timestamp = 100_500;
+        });
+        assert!(PrivacyManager::prune_expired_acl(&env, &acl, env.ledger().timestamp()));
+        assert!(PrivacyManager::load_privacy_acl(&env, &acl.acl_id).is_none());
+    }
 
     #[test]
     fn test_privacy_acl_expiration() {
