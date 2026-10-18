@@ -530,6 +530,8 @@ mod regulatory_reporting_tests {
     #[test]
     fn test_full_happy_path_finra_oats() {
         let env = Env::default();
+        env.mock_all_auths();
+        let caller = Address::generate(&env);
         let mut report = valid_report_for(&env, RegulatoryAuthority::FINRA, ReportFormat::FinraOATS);
         let config = authority_config(&env, RegulatoryAuthority::FINRA);
         let now = 1_700_000_100u64;
@@ -537,18 +539,19 @@ mod regulatory_reporting_tests {
         // Step 1: validate
         let vr = validate_report(&env, &report, now);
         assert!(vr.passed);
-        mark_validated(&mut report, now).unwrap();
+        mark_validated(&env, &caller, &mut report, now).unwrap();
         assert_eq!(report.status, ReportStatus::Validated);
 
         // Step 2: submit
-        let sub = create_submission(&env, &report, 1, &config, now).unwrap();
-        mark_submitted(&mut report, now).unwrap();
+        let sub = create_submission(&env, &caller, &report, 1, &config, now).unwrap();
+        mark_submitted(&env, &caller, &mut report, now).unwrap();
         assert_eq!(sub.attempt, 1);
         assert_eq!(report.status, ReportStatus::Submitted);
 
         // Step 3: ingest acceptance
         let ack = ingest_acknowledgment(
             &env,
+            &caller,
             &sub,
             Bytes::from_slice(&env, b"{}"),
             Bytes::from_slice(&env, b"REF-001"),
@@ -556,11 +559,12 @@ mod regulatory_reporting_tests {
             Bytes::new(&env),
             Vec::new(&env),
             now + 100,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(ack.accepted);
 
         // Step 4: apply to report
-        let action = apply_acknowledgment(&mut report, &ack, now + 100).unwrap();
+        let action = apply_acknowledgment(&env, &caller, &mut report, &ack, now + 100).unwrap();
         assert_eq!(report.status, ReportStatus::Accepted);
         assert_eq!(action, ReportAction::Accepted);
     }
@@ -568,18 +572,21 @@ mod regulatory_reporting_tests {
     #[test]
     fn test_rejection_then_resubmit_mica_casp() {
         let env = Env::default();
+        env.mock_all_auths();
+        let caller = Address::generate(&env);
         let mut report = valid_report_for(&env, RegulatoryAuthority::MiCA, ReportFormat::MiCACASP);
         let config = authority_config(&env, RegulatoryAuthority::MiCA);
         let now = 1_700_000_100u64;
 
         // Validate and submit attempt 1
-        mark_validated(&mut report, now).unwrap();
-        let sub1 = create_submission(&env, &report, 1, &config, now).unwrap();
-        mark_submitted(&mut report, now).unwrap();
+        mark_validated(&env, &caller, &mut report, now).unwrap();
+        let sub1 = create_submission(&env, &caller, &report, 1, &config, now).unwrap();
+        mark_submitted(&env, &caller, &mut report, now).unwrap();
 
         // Rejection
         let ack_rej = ingest_acknowledgment(
             &env,
+            &caller,
             &sub1,
             Bytes::from_slice(&env, b"{}"),
             Bytes::from_slice(&env, b"REF-ERR"),
@@ -587,8 +594,9 @@ mod regulatory_reporting_tests {
             Bytes::from_slice(&env, b"Missing service_type"),
             Vec::new(&env),
             now + 100,
-        ).unwrap();
-        let action = apply_acknowledgment(&mut report, &ack_rej, now + 100).unwrap();
+        )
+        .unwrap();
+        let action = apply_acknowledgment(&env, &caller, &mut report, &ack_rej, now + 100).unwrap();
         assert_eq!(action, ReportAction::Rejected);
         assert_eq!(report.status, ReportStatus::Rejected);
 
@@ -598,8 +606,9 @@ mod regulatory_reporting_tests {
 
         // Fix content and submit attempt 2
         report.content.extend_from_slice(b"service_type=custody\n");
-        let sub2 = create_submission(&env, &report, attempt2, &config, now + 200).unwrap();
-        mark_submitted(&mut report, now + 200).unwrap();
+        let sub2 =
+            create_submission(&env, &caller, &report, attempt2, &config, now + 200).unwrap();
+        mark_submitted(&env, &caller, &mut report, now + 200).unwrap();
         assert_eq!(sub2.attempt, 2);
         assert_eq!(report.status, ReportStatus::Submitted);
     }
@@ -607,29 +616,35 @@ mod regulatory_reporting_tests {
     #[test]
     fn test_max_retries_exceeded() {
         let env = Env::default();
+        env.mock_all_auths();
+        let caller = Address::generate(&env);
         let report = valid_report_for(&env, RegulatoryAuthority::SEC, ReportFormat::SecFormADV);
         let config = authority_config(&env, RegulatoryAuthority::SEC); // max_retries=3
         // Attempt 4 exceeds max
-        let result = create_submission(&env, &report, 4, &config, 1_700_000_100);
+        let result = create_submission(&env, &caller, &report, 4, &config, 1_700_000_100);
         assert!(matches!(result, Err(ReportingError::MaxRetriesExceeded)));
     }
 
     #[test]
     fn test_submission_deadline_exceeded() {
         let env = Env::default();
+        env.mock_all_auths();
+        let caller = Address::generate(&env);
         let report = valid_report_for(&env, RegulatoryAuthority::CFTC, ReportFormat::CftcSwapData);
         let config = authority_config(&env, RegulatoryAuthority::CFTC);
-        let result = create_submission(&env, &report, 1, &config, 2_000_000_000); // past deadline
+        let result = create_submission(&env, &caller, &report, 1, &config, 2_000_000_000); // past deadline
         assert!(matches!(result, Err(ReportingError::DeadlineExceeded)));
     }
 
     #[test]
     fn test_disabled_authority_blocks_submission() {
         let env = Env::default();
+        env.mock_all_auths();
+        let caller = Address::generate(&env);
         let report = valid_report_for(&env, RegulatoryAuthority::BaFin, ReportFormat::BaFinWpHG);
         let mut config = authority_config(&env, RegulatoryAuthority::BaFin);
         config.enabled = false;
-        let result = create_submission(&env, &report, 1, &config, 1_700_000_100);
+        let result = create_submission(&env, &caller, &report, 1, &config, 1_700_000_100);
         assert!(matches!(result, Err(ReportingError::AuthorityDisabled)));
     }
 
@@ -697,18 +712,22 @@ mod regulatory_reporting_tests {
     #[test]
     fn test_mark_overdue_from_submitted() {
         let env = Env::default();
+        env.mock_all_auths();
+        let caller = Address::generate(&env);
         let mut report = valid_report_for(&env, RegulatoryAuthority::MAS, ReportFormat::MasTRR);
         report.status = ReportStatus::Submitted;
-        mark_overdue(&mut report, 1_800_000_000).unwrap();
+        mark_overdue(&env, &caller, &mut report, 1_800_000_000).unwrap();
         assert_eq!(report.status, ReportStatus::Overdue);
     }
 
     #[test]
     fn test_cancel_from_validated() {
         let env = Env::default();
+        env.mock_all_auths();
+        let caller = Address::generate(&env);
         let mut report = valid_report_for(&env, RegulatoryAuthority::BaFin, ReportFormat::BaFinAnaCredit);
-        mark_validated(&mut report, 1_700_000_100).unwrap();
-        cancel_report(&mut report, 1_700_000_200).unwrap();
+        mark_validated(&env, &caller, &mut report, 1_700_000_100).unwrap();
+        cancel_report(&env, &caller, &mut report, 1_700_000_200).unwrap();
         assert_eq!(report.status, ReportStatus::Cancelled);
     }
 
@@ -719,25 +738,29 @@ mod regulatory_reporting_tests {
     #[test]
     fn test_linear_retry_delay() {
         let env = Env::default();
+        env.mock_all_auths();
+        let caller = Address::generate(&env);
         let mut report = valid_report_for(&env, RegulatoryAuthority::FINRA, ReportFormat::FinraOATS);
         report.status = ReportStatus::Validated;
         let mut config = authority_config(&env, RegulatoryAuthority::FINRA);
         config.exponential_backoff = false;
         config.retry_delay_seconds = 60;
         let now = 1_700_000_100u64;
-        let sub = create_submission(&env, &report, 2, &config, now).unwrap();
+        let sub = create_submission(&env, &caller, &report, 2, &config, now).unwrap();
         assert_eq!(sub.retry_after, now + 60);
     }
 
     #[test]
     fn test_exponential_retry_delay_attempt_3() {
         let env = Env::default();
+        env.mock_all_auths();
+        let caller = Address::generate(&env);
         let mut report = valid_report_for(&env, RegulatoryAuthority::FINRA, ReportFormat::FinraOATS);
         report.status = ReportStatus::Validated;
         let config = authority_config(&env, RegulatoryAuthority::FINRA); // backoff=true, delay=30s
         let now = 1_700_000_100u64;
         // attempt 3: 2^(3-1) * 30 = 4 * 30 = 120
-        let sub = create_submission(&env, &report, 3, &config, now).unwrap();
+        let sub = create_submission(&env, &caller, &report, 3, &config, now).unwrap();
         assert_eq!(sub.retry_after, now + 120);
     }
 
@@ -763,6 +786,8 @@ mod regulatory_reporting_tests {
     #[test]
     fn test_ack_correlates_report_and_submission() {
         let env = Env::default();
+        env.mock_all_auths();
+        let caller = Address::generate(&env);
         let sub = RegulatorySubmission {
             id: BytesN::from_array(&env, &[10u8; 32]),
             report_id: BytesN::from_array(&env, &[1u8; 32]),
@@ -778,6 +803,7 @@ mod regulatory_reporting_tests {
         };
         let ack = ingest_acknowledgment(
             &env,
+            &caller,
             &sub,
             Bytes::from_slice(&env, b"ok"),
             Bytes::from_slice(&env, b"REF-999"),
@@ -785,7 +811,8 @@ mod regulatory_reporting_tests {
             Bytes::new(&env),
             Vec::new(&env),
             1_700_001_000,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(ack.submission_id, sub.id);
         assert_eq!(ack.report_id, sub.report_id);
         assert_eq!(ack.reference_number, Bytes::from_slice(&env, b"REF-999"));
@@ -794,6 +821,8 @@ mod regulatory_reporting_tests {
     #[test]
     fn test_empty_reference_number_fails_ack() {
         let env = Env::default();
+        env.mock_all_auths();
+        let caller = Address::generate(&env);
         let sub = RegulatorySubmission {
             id: BytesN::from_array(&env, &[10u8; 32]),
             report_id: BytesN::from_array(&env, &[1u8; 32]),
@@ -809,6 +838,7 @@ mod regulatory_reporting_tests {
         };
         let result = ingest_acknowledgment(
             &env,
+            &caller,
             &sub,
             Bytes::from_slice(&env, b"ok"),
             Bytes::new(&env), // empty reference
