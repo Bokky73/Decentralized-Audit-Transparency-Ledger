@@ -117,6 +117,32 @@ export interface Page<T> {
 /** Paginated query result carrying a cursor for the next page. Alias for {@link Page}. */
 export type PaginatedResult<T = Event> = Page<T>;
 
+/** Status of a SupTech rule. */
+export enum RuleStatus {
+  Active = 'Active',
+  Inactive = 'Inactive',
+  Pending = 'Pending',
+  Suspended = 'Suspended',
+}
+
+/** Multi-predicate filter for SupTech rule queries. */
+export interface RuleQueryFilter {
+  /** Inclusive lower bound on ledger timestamp. */
+  ledger_timestamp_min?: number;
+  /** Inclusive upper bound on ledger timestamp. */
+  ledger_timestamp_max?: number;
+  /** Restrict results to a single rule status. */
+  status?: RuleStatus;
+  /** Restrict results to a single submitter address. */
+  submitter?: string;
+}
+
+/** A single page of SupTech rule query results. */
+export interface RulePage {
+  items: Event[];
+  /** Cursor to pass to the next query, or null when the end has been reached. */
+  next_cursor: PageCursor | null;
+}
 export interface CacheStats {
   hits: number;
   misses: number;

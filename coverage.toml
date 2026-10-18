@@ -5,15 +5,18 @@
 # ── Global defaults ────────────────────────────────────────────────────────────
 [global]
 # Minimum line coverage percentage required across the entire crate (0–100).
-line_threshold = 60.0
+# Raised from 60.0 to 65.0 for issues #832 / #839 / #841 / #870, which add
+# pagination, CBDC hardening/storage and supply-chain RBAC code paths backed
+# by dedicated unit, proptest and integration suites.
+line_threshold = 65.0
 
 # Minimum branch coverage percentage required across the entire crate (0–100).
 # Set to 0 to disable branch enforcement globally.
-branch_threshold = 0.0
+branch_threshold = 40.0
 
 # Fail the coverage check if the overall line coverage drops below this value.
 # This acts as a hard floor regardless of per-module settings.
-hard_floor = 50.0
+hard_floor = 55.0
 
 # Number of historical trend data-points to keep in coverage-trend.json.
 trend_history_limit = 30
@@ -63,6 +66,9 @@ files = [
     "src/cbdc_tests.rs",
     "src/token_gating_tests.rs",
     "src/suptech_tests.rs",
+    "src/suptech_pagination_tests.rs",
+    "src/rbac_gating_tests.rs",
+    "src/cbdc_interop_boundary_tests.rs",
     "src/data_retention_tests.rs",
     "src/anti_corruption/tests.rs",
     "src/export_controls/tests.rs",
@@ -133,12 +139,15 @@ line = 60.0
 description = "Audit trail for the reporting pipeline itself"
 
 # ─ Supply chain transparency ──────────────────────────────────────────────────
+# Issue #870 adds RBAC role gating and audit-trail event emission to every
+# mutating entrypoint; the expanded positive/negative RBAC matrix tests in
+# src/rbac_gating_tests.rs raise the achievable line and branch coverage.
 [[module]]
 name = "supply_chain"
 path_prefix = "src/supply_chain.rs"
 line = 92.0
 branch = 91.0
-description = "Product provenance, certifications, chain of custody — hardened against overflow and unbounded growth (issue #869)"
+description = "Product provenance, certifications, chain of custody (RBAC-gated) — hardened against overflow and unbounded growth (issue #869)"
 
 # ─ Stablecoin reserve auditing ────────────────────────────────────────────────
 [[module]]
@@ -338,11 +347,15 @@ line = 90.0
 branch = 90.0
 description = "CBDC privacy features — tiered anonymity, selective disclosure, cursor-based pagination, filtered batch queries, hardened against overflow and unbounded growth (issues #849, #852)"
 
+# Issues #839 / #841 harden arithmetic, bound collection growth, add TTL
+# extension helpers and storage-footprint snapshot assertions, all covered by
+# boundary, adversarial proptest and storage-layout regression suites.
 [[module]]
 name = "cbdc_interop"
 path_prefix = "src/cbdc_interop.rs"
-line = 55.0
-description = "CBDC interoperability layer"
+line = 65.0
+branch = 45.0
+description = "CBDC interoperability layer (overflow-safe, TTL-managed)"
 
 [[module]]
 name = "cbdc_logging"
@@ -466,11 +479,15 @@ path_prefix = "src/suptech_reporting.rs"
 line = 55.0
 description = "SupTech automated report generation"
 
+# Issue #832 adds cursor-based pagination, multi-predicate filtering and
+# pagination edge-case tests (empty results, single-item pages, cursor past
+# end) plus SDK binding coverage for full multi-page traversal.
 [[module]]
 name = "suptech_rules"
 path_prefix = "src/suptech_rules.rs"
-line = 55.0
-description = "Supervisory rule engine"
+line = 65.0
+branch = 45.0
+description = "Supervisory rule engine (paginated, filtered queries)"
 
 [[module]]
 name = "suptech_api"

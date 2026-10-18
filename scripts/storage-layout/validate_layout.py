@@ -104,7 +104,7 @@ def check_storage_footprint(
     return violations
 
 
-def print_footprint_report(violations: list) -> None:
+def print_sc_footprint_report(violations: list) -> None:
     if not violations:
         print(_green(_bold("✓ Storage footprint within budget.")))
         print()
@@ -281,6 +281,70 @@ def print_ml_footprint_report(
         print(_yellow(_bold(f"  {len(warnings)} footprint warning(s). --strict mode: treating as failure.")))
     else:
         print(_yellow(_bold(f"  {len(warnings)} footprint warning(s) but no budget violations.")))
+
+
+# CBDC interop storage footprint budget
+# ---------------------------------------------------------------------------
+#
+# Pinned byte budgets for serialized XDR storage records owned by
+# `src/cbdc_interop.rs`. These thresholds are asserted against the candidate
+# snapshot so that any regression in packing / tiering is caught in CI.
+#
+# Keys are the record names as emitted by the snapshot generator; values are
+# the maximum allowed serialized XDR byte size.
+CBDC_INTEROP_BYTE_BUDGET = {
+    "CbdcInteropRecord": 256,
+    "CbdcSettlementRecord": 320,
+    "Iso20022MessageRecord": 512,
+    "CbdcAuditRecord": 192,
+}
+
+# Module prefix used to identify CBDC interop records in snapshots.
+CBDC_INTEROP_MODULE = "cbdc_interop"
+
+
+def check_cbdc_interop_footprint(new_snapshot: dict) -> list:
+    """Return a list of footprint violations for CBDC interop records.
+
+    Each violation is a dict with ``record``, ``actual`` and ``budget`` keys.
+    Records absent from the snapshot are ignored (they may be gated behind
+    feature flags); records present but exceeding their pinned budget are
+    reported.
+    """
+    violations = []
+    records = new_snapshot.get("records", {})
+    if not isinstance(records, dict):
+        return violations
+
+    for name, budget in CBDC_INTEROP_BYTE_BUDGET.items():
+        record = records.get(name)
+        if record is None:
+            continue
+        module = record.get("module", "")
+        if module and CBDC_INTEROP_MODULE not in module:
+            continue
+        actual = record.get("serialized_size")
+        if actual is None:
+            continue
+        if actual > budget:
+            violations.append(
+                {"record": name, "actual": actual, "budget": budget}
+            )
+    return violations
+
+
+def print_cbdc_footprint_report(footprint_violations: list) -> None:
+    print(_bold("CBDC INTEROP FOOTPRINT:"))
+    if not footprint_violations:
+        for name, budget in CBDC_INTEROP_BYTE_BUDGET.items():
+            print(f"  {_green('✓')} {name} <= {budget} bytes")
+    else:
+        for v in footprint_violations:
+            print(
+                f"  {_red('✗')} {v['record']} = {v['actual']} bytes "
+                f"(budget {v['budget']} bytes, over by "
+                f"{v['actual'] - v['budget']})"
+            )
     print()
 
 
@@ -471,17 +535,20 @@ def main() -> int:
         allow_tombstone_removal=args.allow_tombstone_removal,
     )
 
+    footprint_violations = check_cbdc_interop_footprint(new_snapshot)
+
     print_report(old_snapshot, new_snapshot, violations, warnings, strict=args.strict)
+    print_cbdc_footprint_report(footprint_violations)
 
     # Storage footprint assertions for supply chain
     sc_violations = check_storage_footprint(new_snapshot)
-    print_footprint_report(sc_violations)
+    print_sc_footprint_report(sc_violations)
 
     # Storage footprint regression assertions for src/ml_feature_store.rs
     ml_violations, ml_warnings = check_ml_feature_store_footprint(new_snapshot)
     print_ml_footprint_report(ml_violations, ml_warnings, strict=args.strict)
 
-    if violations or sc_violations or ml_violations:
+    if violations or footprint_violations or sc_violations or ml_violations:
         return 2
     if (warnings or ml_warnings) and args.strict:
         return 1

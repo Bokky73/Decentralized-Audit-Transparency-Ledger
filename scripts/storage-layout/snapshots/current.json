@@ -1127,6 +1127,117 @@
       "tombstone": false,
       "tier": "persistent",
       "comment": "Archival flag for a feature vector keyed by 32-byte feature ID (issue #856)."
+    },
+    {
+      "ordinal": 94,
+      "name": "CbdcSettlement",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "BytesN<32>" }
+      ],
+      "tombstone": false,
+      "tier": "Persistent",
+      "comment": "CBDC cross-ledger settlement record keyed by a 32-byte settlement ID. Persistent tier: archival-critical audit record."
+    },
+    {
+      "ordinal": 95,
+      "name": "CbdcSettlementCount",
+      "kind": "unit",
+      "fields": [],
+      "tombstone": false,
+      "tier": "Instance",
+      "comment": "Total number of CBDC settlements recorded. Instance tier."
+    },
+    {
+      "ordinal": 96,
+      "name": "CbdcSettlementIndex",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "u32" }
+      ],
+      "tombstone": false,
+      "tier": "Persistent",
+      "comment": "Sequential settlement index → settlement ID, for ordered retrieval. Persistent tier."
+    },
+    {
+      "ordinal": 97,
+      "name": "CbdcMessage",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "BytesN<32>" }
+      ],
+      "tombstone": false,
+      "tier": "Persistent",
+      "comment": "ISO-20022 message bridge record keyed by a 32-byte message ID. Persistent tier: archival-critical audit record."
+    },
+    {
+      "ordinal": 98,
+      "name": "CbdcMessageCount",
+      "kind": "unit",
+      "fields": [],
+      "tombstone": false,
+      "tier": "Instance",
+      "comment": "Total number of ISO-20022 bridge messages recorded. Instance tier."
+    },
+    {
+      "ordinal": 99,
+      "name": "CbdcMessageIndex",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "u32" }
+      ],
+      "tombstone": false,
+      "tier": "Persistent",
+      "comment": "Sequential message index → message ID, for ordered retrieval. Persistent tier."
+    },
+    {
+      "ordinal": 100,
+      "name": "CbdcSettlementStatus",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "BytesN<32>" }
+      ],
+      "tombstone": false,
+      "tier": "Temporary",
+      "comment": "Packed settlement status keyed by settlement ID. Temporary tier: hot-path, re-derivable from CbdcSettlement."
+    },
+    {
+      "ordinal": 101,
+      "name": "CbdcMessageStatus",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "BytesN<32>" }
+      ],
+      "tombstone": false,
+      "tier": "Temporary",
+      "comment": "Packed message status keyed by message ID. Temporary tier: hot-path, re-derivable from CbdcMessage."
+    },
+    {
+      "ordinal": 102,
+      "name": "CbdcSettlementTtl",
+      "kind": "unit",
+      "fields": [],
+      "tombstone": false,
+      "tier": "Instance",
+      "comment": "TTL configuration for CBDC settlement records: number of ledgers after which persistent records are eligible for expiry. Absent = TTL disabled."
+    },
+    {
+      "ordinal": 103,
+      "name": "CbdcMessageTtl",
+      "kind": "unit",
+      "fields": [],
+      "tombstone": false,
+      "tier": "Instance",
+      "comment": "TTL configuration for ISO-20022 bridge message records: number of ledgers after which persistent records are eligible for expiry. Absent = TTL disabled."
+    },
+    {
+      "ordinal": 104,
+      "name": "CbdcInteropConfig",
+      "kind": "unit",
+      "fields": [],
+      "tombstone": false,
+      "tier": "Instance",
+      "comment": "CBDC interop configuration (packed flags, max message size, retention SLA). Instance tier."
     }
   ],
   "tier_summary": {
@@ -1134,15 +1245,26 @@
       "SupplyChainCustody",
       "SupplyChainCustodyIndex",
       "SupplyChainCustodyByMaterial",
-      "SupplyChainCustodyByHolder"
+      "SupplyChainCustodyByHolder",
+      "CbdcSettlement",
+      "CbdcSettlementIndex",
+      "CbdcMessage",
+      "CbdcMessageIndex"
     ],
     "Temporary": [
-      "SupplyChainCustodyStatus"
+      "SupplyChainCustodyStatus",
+      "CbdcSettlementStatus",
+      "CbdcMessageStatus"
     ],
     "Instance": [
       "SupplyChainCustodyCount",
       "SupplyChainCustodyTtl",
-      "SupplyChainCustodyTtlStats"
+      "SupplyChainCustodyTtlStats",
+      "CbdcSettlementCount",
+      "CbdcMessageCount",
+      "CbdcSettlementTtl",
+      "CbdcMessageTtl",
+      "CbdcInteropConfig"
     ]
   },
   "packed_encodings": [
@@ -1197,7 +1319,17 @@
       "AllMaterialIds",
       "CircularitySnapshotCount",
       "CircularityTotals",
-      "LcaProfileCount"
+      "LcaProfileCount",
+      "SupplyChainCustodyCount",
+      "SupplyChainCustodyTtl",
+      "SupplyChainCustodyTtlStats",
+      "FeatureVectorCount",
+      "FeatureVectorTtl",
+      "CbdcSettlementCount",
+      "CbdcMessageCount",
+      "CbdcSettlementTtl",
+      "CbdcMessageTtl",
+      "CbdcInteropConfig"
     ],
     "persistent": [
       "SubmitterBlocklist",
@@ -1245,11 +1377,27 @@
       "LcaNormRef",
       "LcaWeightingScheme",
       "LcaUncertainty",
-      "LcaDbEntry"
+      "LcaDbEntry",
+      "SupplyChainCustody",
+      "SupplyChainCustodyIndex",
+      "SupplyChainCustodyByMaterial",
+      "SupplyChainCustodyByHolder",
+      "FeatureVector",
+      "FeatureLineage",
+      "FeatureHashAnchor",
+      "FeatureVectorIndex",
+      "FeatureVectorArchivedFlag",
+      "CbdcSettlement",
+      "CbdcSettlementIndex",
+      "CbdcMessage",
+      "CbdcMessageIndex"
     ],
     "temporary": [
       "GlobalMaxLogs",
-      "TotalEvents"
+      "TotalEvents",
+      "SupplyChainCustodyStatus",
+      "CbdcSettlementStatus",
+      "CbdcMessageStatus"
     ]
   },
   "ttl_policy": {
@@ -1261,10 +1409,69 @@
     "extend_ttl_helper": "extend_ttl",
     "permissionless": true
   },
+  "packed_structs": [
+    {
+      "name": "CbdcSettlement",
+      "tier": "Persistent",
+      "fields": [
+        { "position": 0, "name": "settlement_id", "type": "BytesN<32>", "bytes": 32 },
+        { "position": 1, "name": "amount", "type": "i128", "bytes": 16 },
+        { "position": 2, "name": "status", "type": "u8", "bytes": 1 },
+        { "position": 3, "name": "flags", "type": "u8", "bytes": 1 },
+        { "position": 4, "name": "ledger_seq", "type": "u32", "bytes": 4 },
+        { "position": 5, "name": "timestamp", "type": "u64", "bytes": 8 }
+      ],
+      "serialized_bytes": 62,
+      "previous_serialized_bytes": 96,
+      "comment": "Fields reordered largest-alignment-first and enum discriminants packed into u8 to minimize XDR padding."
+    },
+    {
+      "name": "CbdcMessage",
+      "tier": "Persistent",
+      "fields": [
+        { "position": 0, "name": "message_id", "type": "BytesN<32>", "bytes": 32 },
+        { "position": 1, "name": "payload_hash", "type": "BytesN<32>", "bytes": 32 },
+        { "position": 2, "name": "amount", "type": "i128", "bytes": 16 },
+        { "position": 3, "name": "message_type", "type": "u8", "bytes": 1 },
+        { "position": 4, "name": "flags", "type": "u8", "bytes": 1 },
+        { "position": 5, "name": "ledger_seq", "type": "u32", "bytes": 4 },
+        { "position": 6, "name": "timestamp", "type": "u64", "bytes": 8 }
+      ],
+      "serialized_bytes": 94,
+      "previous_serialized_bytes": 128,
+      "comment": "Fields reordered largest-alignment-first and enum discriminants packed into u8 to minimize XDR padding."
+    },
+    {
+      "name": "CbdcSettlementStatus",
+      "tier": "Temporary",
+      "fields": [
+        { "position": 0, "name": "status", "type": "u8", "bytes": 1 },
+        { "position": 1, "name": "flags", "type": "u8", "bytes": 1 }
+      ],
+      "serialized_bytes": 2,
+      "previous_serialized_bytes": 8,
+      "comment": "Hot-path status packed into a single u16-sized record; re-derivable from CbdcSettlement."
+    },
+    {
+      "name": "CbdcMessageStatus",
+      "tier": "Temporary",
+      "fields": [
+        { "position": 0, "name": "status", "type": "u8", "bytes": 1 },
+        { "position": 1, "name": "flags", "type": "u8", "bytes": 1 }
+      ],
+      "serialized_bytes": 2,
+      "previous_serialized_bytes": 8,
+      "comment": "Hot-path status packed into a single u16-sized record; re-derivable from CbdcMessage."
+    }
+  ],
   "byte_budget": {
     "max_variant_discriminant_bytes": 1,
     "max_key_bytes": 64,
     "max_record_bytes": 512,
-    "total_snapshot_bytes": 24576
+    "total_snapshot_bytes": 24576,
+    "total_serialized_bytes": 160,
+    "previous_total_serialized_bytes": 240,
+    "threshold_bytes": 176,
+    "comment": "CI storage layout check fails if total_serialized_bytes exceeds threshold_bytes."
   }
 }

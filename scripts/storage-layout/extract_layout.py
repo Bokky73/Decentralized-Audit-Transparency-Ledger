@@ -29,19 +29,43 @@ TIER_TEMPORARY = "Temporary"
 TIER_INSTANCE = "Instance"
 
 TIER_KEYWORDS = {
-    TIER_PERSISTENT: ("persistent", "permanent", "audit", "archive", "long-lived"),
-    TIER_TEMPORARY: ("temporary", "temp", "ephemeral", "transient", "short-lived"),
-    TIER_INSTANCE: ("instance", "singleton", "config", "admin", "global"),
+    TIER_PERSISTENT: (
+        "persistent",
+        "permanent",
+        "audit",
+        "archive",
+        "archival",
+        "long-lived",
+        "settlement",
+        "iso20022",
+        "iso-20022",
+    ),
+    TIER_TEMPORARY: (
+        "temporary",
+        "temp",
+        "ephemeral",
+        "transient",
+        "short-lived",
+        "nonce",
+        "cache",
+    ),
+    TIER_INSTANCE: (
+        "instance",
+        "singleton",
+        "config",
+        "admin",
+        "global",
+        "governance",
+        "rbac",
+    ),
 }
 
 # Heuristic name-based tier classification used when no explicit tier is
 # declared in the variant's doc comment.
-INSTANCE_NAME_HINTS = ("admin", "config", "owner", "initialized", "paused", "version")
+INSTANCE_NAME_HINTS = ("admin", "config", "owner", "initialized", "paused", "version", "governance", "rbac")
 TEMPORARY_NAME_HINTS = ("nonce", "cache", "temp", "pending", "session", "proof")
 
-# Approximate XDR-encoded byte sizes for common primitive field types. These
-# are used to estimate the serialized footprint of each variant so the snapshot
-# can pin byte budgets for the storage-footprint regression assertions.
+# Approximate XDR byte cost per primitive type.
 PRIMITIVE_XDR_SIZES = {
     "u8": 4,
     "i8": 4,
@@ -57,7 +81,15 @@ PRIMITIVE_XDR_SIZES = {
     "i256": 32,
     "bool": 4,
     "()": 0,
+    "Address": 32,
+    "Bytes": 4,
+    "BytesN": 32,
+    "Symbol": 4,
+    "String": 4,
+    "Vec": 4,
+    "Map": 4,
 }
+XDR_TYPE_SIZES = PRIMITIVE_XDR_SIZES
 
 # Fixed XDR overhead: enum discriminant (4 bytes) plus a small per-record
 # envelope allowance for length prefixes / padding.
@@ -65,19 +97,19 @@ XDR_ENUM_DISCRIMINANT_SIZE = 4
 XDR_RECORD_OVERHEAD = 4
 # Bytes charged for a variable-length field (String, Bytes, Vec, Address, ...).
 XDR_VARIABLE_FIELD_SIZE = 16
+ENUM_DISCRIMINANT_BYTES = 4
 
 
-def classify_tier(name: str, comment: str) -> str:
+def classify_tier(name_or_comment: str, comment_or_name: str = "") -> str:
     """Classify a variant into a storage tier based on comment then name."""
-    lowered_comment = comment.lower()
+    haystack = f"{name_or_comment} {comment_or_name}".lower()
     for tier, keywords in TIER_KEYWORDS.items():
-        if any(kw in lowered_comment for kw in keywords):
+        if any(kw in haystack for kw in keywords):
             return tier
 
-    lowered_name = name.lower()
-    if any(hint in lowered_name for hint in INSTANCE_NAME_HINTS):
+    if any(hint in haystack for hint in INSTANCE_NAME_HINTS):
         return TIER_INSTANCE
-    if any(hint in lowered_name for hint in TEMPORARY_NAME_HINTS):
+    if any(hint in haystack for hint in TEMPORARY_NAME_HINTS):
         return TIER_TEMPORARY
     return TIER_PERSISTENT
 
@@ -85,14 +117,12 @@ def classify_tier(name: str, comment: str) -> str:
 def estimate_field_size(field_type: str) -> int:
     """Estimate the XDR-encoded byte size of a single field type."""
     t = field_type.strip()
-    # Strip references and lifetimes.
     t = re.sub(r"^&\s*(?:'[a-zA-Z_][a-zA-Z0-9_]*\s*)?", "", t)
     t = t.strip()
 
     if t in PRIMITIVE_XDR_SIZES:
         return PRIMITIVE_XDR_SIZES[t]
 
-    # Option<T> / Vec<T> / tuples / generics: charge a variable-size allowance.
     if t.startswith("Option<") or t.startswith("Vec<") or t.startswith("("):
         return XDR_VARIABLE_FIELD_SIZE
     if t.startswith("String") or t.startswith("Bytes") or t.startswith("Symbol"):
@@ -100,7 +130,6 @@ def estimate_field_size(field_type: str) -> int:
     if t.startswith("Address") or t.startswith("BytesN"):
         return XDR_VARIABLE_FIELD_SIZE
 
-    # Unknown / user-defined type: assume a conservative fixed allowance.
     return XDR_VARIABLE_FIELD_SIZE
 
 
@@ -110,6 +139,17 @@ def estimate_variant_size(variant: dict) -> int:
     for field in variant.get("fields", []):
         size += estimate_field_size(field.get("type") or "")
     return size
+
+
+def estimate_xdr_size(fields: list) -> int:
+    """Estimate the packed XDR serialized byte size of a variant's payload."""
+    total = ENUM_DISCRIMINANT_BYTES
+    for field in fields:
+        ftype = (field.get("type") or "").strip()
+        base = re.split(r"[<(\[]", ftype, maxsplit=1)[0].strip()
+        base = base.lstrip("&").strip()
+        total += XDR_TYPE_SIZES.get(base, 4)
+    return total
 
 
 def get_git_commit() -> str:
@@ -320,9 +360,8 @@ def parse_variants(block: str) -> list:
                 "tombstone": tombstone,
                 "comment": comment,
                 "tier": tier,
-                "serialized_bytes": estimate_variant_size({
-                    "fields": fields,
-                }),
+                "serialized_bytes": estimate_variant_size({"fields": fields}),
+                "xdr_size_bytes": estimate_xdr_size(fields),
             })
             ordinal += 1
             i = j
@@ -343,9 +382,8 @@ def parse_variants(block: str) -> list:
                 "tombstone": tombstone,
                 "comment": comment,
                 "tier": tier,
-                "serialized_bytes": estimate_variant_size({
-                    "fields": fields,
-                }),
+                "serialized_bytes": estimate_variant_size({"fields": fields}),
+                "xdr_size_bytes": estimate_xdr_size(fields),
             })
             ordinal += 1
             i = j
@@ -365,6 +403,7 @@ def parse_variants(block: str) -> list:
                 "comment": comment,
                 "tier": tier,
                 "serialized_bytes": estimate_variant_size({"fields": []}),
+                "xdr_size_bytes": estimate_xdr_size([]),
             })
             ordinal += 1
             i = j
@@ -424,18 +463,27 @@ def main() -> int:
         TIER_PERSISTENT: 0,
         TIER_TEMPORARY: 0,
         TIER_INSTANCE: 0,
+        "persistent": 0,
+        "temporary": 0,
+        "instance": 0,
     }
+    total_xdr_bytes = 0
     for v in variants:
-        tier_counts[v["tier"]] = tier_counts.get(v["tier"], 0) + 1
+        tier = v.get("tier", TIER_PERSISTENT)
+        tier_counts[tier] = tier_counts.get(tier, 0) + 1
+        tier_lower = tier.lower()
+        if tier_lower in tier_counts:
+            tier_counts[tier_lower] = tier_counts.get(tier_lower, 0) + 1
+        total_xdr_bytes += v.get("xdr_size_bytes", v.get("serialized_bytes", 0))
 
-    total_serialized_bytes = sum(v["serialized_bytes"] for v in variants)
+    total_serialized_bytes = sum(v.get("serialized_bytes", 0) for v in variants)
     max_serialized_bytes = max(
-        (v["serialized_bytes"] for v in variants), default=0
+        (v.get("serialized_bytes", 0) for v in variants), default=0
     )
 
     # Build snapshot
     snapshot = {
-        "version": 1,
+        "version": 2,
         "contract": args.contract,
         "generated_at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "git_commit": get_git_commit(),
@@ -443,6 +491,7 @@ def main() -> int:
         "tier_counts": tier_counts,
         "total_serialized_bytes": total_serialized_bytes,
         "max_serialized_bytes": max_serialized_bytes,
+        "total_xdr_size_bytes": total_xdr_bytes,
         "variants": variants,
     }
 
@@ -460,13 +509,13 @@ def main() -> int:
     )
     print(
         "Tier counts: "
-        f"Persistent={tier_counts[TIER_PERSISTENT]} "
-        f"Temporary={tier_counts[TIER_TEMPORARY]} "
-        f"Instance={tier_counts[TIER_INSTANCE]}"
+        f"Persistent={tier_counts.get(TIER_PERSISTENT, 0)} "
+        f"Temporary={tier_counts.get(TIER_TEMPORARY, 0)} "
+        f"Instance={tier_counts.get(TIER_INSTANCE, 0)}"
     )
     print(
         f"Serialized byte budget: total={total_serialized_bytes} "
-        f"max={max_serialized_bytes}"
+        f"max={max_serialized_bytes} (total XDR: {total_xdr_bytes} bytes)"
     )
     return 0
 

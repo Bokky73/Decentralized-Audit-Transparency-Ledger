@@ -13,6 +13,7 @@ import binascii
 import json
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import (
     Callable,
     Generic,
@@ -781,4 +782,179 @@ def iter_all_items_by_composite_cursor(
     for page in iter_pages_by_composite_cursor(
         fetch_fn, limit=limit, start_cursor=start_cursor
     ):
+        yield from page.items
+
+
+# ── SupTech rule query pagination ─────────────────────────────────────────────
+
+
+class RuleStatus(str, Enum):
+    """Lifecycle status of a SupTech rule evaluation."""
+
+    PENDING = "pending"
+    PASSED = "passed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+@dataclass
+class RuleQueryFilter:
+    """Multi-predicate filter for SupTech rule queries.
+
+    Attributes:
+        ledger_timestamp_min: Inclusive lower bound on the ledger timestamp.
+        ledger_timestamp_max: Inclusive upper bound on the ledger timestamp.
+        status: Restrict results to a single :class:`RuleStatus`.
+        submitter: Restrict results to a single submitter address.
+    """
+
+    ledger_timestamp_min: Optional[int] = None
+    ledger_timestamp_max: Optional[int] = None
+    status: Optional[RuleStatus] = None
+    submitter: Optional[str] = None
+
+    def to_query_params(self) -> dict:
+        """Render the filter as a flat mapping of query parameters.
+
+        ``None`` fields are omitted so the resulting mapping can be passed
+        directly to the SDK's RPC layer.
+        """
+        params: dict = {}
+        if self.ledger_timestamp_min is not None:
+            params["ledger_timestamp_min"] = self.ledger_timestamp_min
+        if self.ledger_timestamp_max is not None:
+            params["ledger_timestamp_max"] = self.ledger_timestamp_max
+        if self.status is not None:
+            params["status"] = self.status.value
+        if self.submitter is not None:
+            params["submitter"] = self.submitter
+        return params
+
+
+def encode_rule_cursor(offset: int) -> str:
+    """Encode an offset into an opaque SupTech rule query cursor.
+
+    Args:
+        offset: Zero-based item index.
+
+    Returns:
+        An opaque cursor string.
+
+    Raises:
+        ValueError: If *offset* is negative.
+    """
+    if offset < 0:
+        raise ValueError(f"Cursor offset must be non-negative, got {offset}")
+    return f"rule:{offset}"
+
+
+def decode_rule_cursor(cursor: str) -> int:
+    """Decode a cursor produced by :func:`encode_rule_cursor`.
+
+    Args:
+        cursor: Cursor string previously returned by
+            :func:`encode_rule_cursor`.
+
+    Returns:
+        The decoded offset integer.
+
+    Raises:
+        ValueError: If the cursor is malformed.
+    """
+    if not isinstance(cursor, str) or not cursor.startswith("rule:"):
+        raise ValueError(f"Invalid rule cursor: {cursor!r}")
+    try:
+        value = int(cursor[len("rule:") :])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid rule cursor: {cursor!r}") from exc
+    if value < 0:
+        raise ValueError(f"Cursor offset must be non-negative, got {value}")
+    return value
+
+
+def _clamp_limit(limit: int) -> int:
+    """Clamp *limit* to the ``[1, MAX_PAGE_LIMIT]`` range."""
+    if limit < 1:
+        raise ValueError(f"Page limit must be at least 1, got {limit}")
+    return min(limit, MAX_PAGE_LIMIT)
+
+
+def fetch_rule_page_by_cursor(
+    fetch_fn: Callable[..., Page[T]],
+    cursor: Optional[str] = None,
+    limit: int = 50,
+    filters: Optional[RuleQueryFilter] = None,
+) -> Page[T]:
+    """Fetch a single page of SupTech rule results using an opaque cursor.
+
+    Args:
+        fetch_fn: Callable invoked as
+            ``fetch_fn(offset, limit, **filter_params) -> Page[T]``.
+        cursor: Opaque cursor from a previous response, or ``None`` to start
+            from the beginning.
+        limit: Maximum number of items to return (capped at
+            :data:`MAX_PAGE_LIMIT`).
+        filters: Optional :class:`RuleQueryFilter` predicates.
+
+    Returns:
+        A :class:`~audit_ledger.models.Page` of items.
+
+    Raises:
+        ValueError: If the cursor is malformed or *limit* is invalid.
+    """
+    offset = decode_rule_cursor(cursor) if cursor is not None else 0
+    params = filters.to_query_params() if filters is not None else {}
+    return fetch_fn(offset, _clamp_limit(limit), **params)
+
+
+def iter_rule_pages(
+    fetch_fn: Callable[..., Page[T]],
+    limit: int = 50,
+    filters: Optional[RuleQueryFilter] = None,
+) -> Iterator[Page[T]]:
+    """Yield every page of SupTech rule results via cursor traversal.
+
+    Traversal stops when a page reports no ``next_cursor`` or returns no
+    items, guaranteeing termination even if the backend misbehaves.
+
+    Args:
+        fetch_fn: Callable invoked as
+            ``fetch_fn(offset, limit, **filter_params) -> Page[T]``.
+        limit: Items per page (capped at :data:`MAX_PAGE_LIMIT`).
+        filters: Optional :class:`RuleQueryFilter` predicates.
+
+    Yields:
+        Successive :class:`~audit_ledger.models.Page` objects.
+    """
+    cursor: Optional[str] = None
+    while True:
+        page = fetch_rule_page_by_cursor(
+            fetch_fn, cursor=cursor, limit=limit, filters=filters
+        )
+        if not page.items:
+            return
+        yield page
+        next_cursor = getattr(page, "next_cursor", None)
+        if not next_cursor:
+            return
+        cursor = next_cursor
+
+
+def iter_all_rule_items(
+    fetch_fn: Callable[..., Page[T]],
+    limit: int = 50,
+    filters: Optional[RuleQueryFilter] = None,
+) -> Iterator[T]:
+    """Yield every individual SupTech rule item across all pages.
+
+    Args:
+        fetch_fn: Callable invoked as
+            ``fetch_fn(offset, limit, **filter_params) -> Page[T]``.
+        limit: Items per page (capped at :data:`MAX_PAGE_LIMIT`).
+        filters: Optional :class:`RuleQueryFilter` predicates.
+
+    Yields:
+        Individual rule items of type ``T``.
+    """
+    for page in iter_rule_pages(fetch_fn, limit=limit, filters=filters):
         yield from page.items

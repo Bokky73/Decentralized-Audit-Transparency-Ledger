@@ -42,6 +42,14 @@ Social impact
 - :func:`community_investment_summary` — community investment aggregation.
 - :func:`labour_compliance_rate`      — labour-standards compliance summary.
 - :func:`aggregate_impact_report`     — build full ImpactReport from metrics list.
+
+SupTech rules (#832)
+~~~~~~~~~~~~~~~~~~~~
+- :class:`PageCursor`                 — opaque cursor token for paginated queries.
+- :class:`PageLimit`                  — page size cap (max 100 items).
+- :class:`RuleQueryFilter`            — multi-predicate filter for rule queries.
+- :class:`RuleQueryPage`              — paginated rule query result.
+- :func:`query_rules`                 — paginated, filtered rule query helper.
 """
 
 from .batch import (
@@ -109,6 +117,11 @@ from .pagination import (
     query_paginated,
     iter_pages,
 )
+from .suptech_rules import (
+    RuleQueryFilter,
+    RuleQueryPage,
+    query_rules,
+)
 
 
 
@@ -173,4 +186,8 @@ __all__ = [
     "training_effectiveness",
     "remediation_progress",
     "build_compliance_report",
+    # SupTech rules pagination & filtering (#832)
+    "RuleQueryFilter",
+    "RuleQueryPage",
+    "query_rules",
 ]

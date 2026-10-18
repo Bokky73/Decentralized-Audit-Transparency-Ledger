@@ -10,6 +10,191 @@ use crate::cbdc_interop::*;
 use crate::cbdc_offline::*;
 use crate::cbdc_privacy::*;
 
+// ============ Boundary & Adversarial Tests (hardened interop) ============
+
+#[test]
+fn test_convert_amount_u128_max_saturates() {
+    // u128::MAX amount with a rate > 1 must not panic; must saturate.
+    let result = InteropManager::convert_amount(u128::MAX, 2_000_000_000_000_000_000u128);
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), u128::MAX);
+}
+
+#[test]
+fn test_convert_amount_zero_rate_is_typed_error() {
+    let result = InteropManager::convert_amount(1_000_000u128, 0u128);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_compute_settlement_fee_u128_max_bounded() {
+    // Fee on u128::MAX must saturate and never exceed the amount.
+    let fee = InteropManager::compute_settlement_fee(u128::MAX, 10_000u32).unwrap();
+    assert!(fee <= u128::MAX);
+}
+
+#[test]
+fn test_compute_settlement_fee_invalid_bps_is_typed_error() {
+    // bps > 10_000 (100%) is a boundary violation and must be a typed error.
+    let result = InteropManager::compute_settlement_fee(1_000_000u128, 10_001u32);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_exchange_rate_spread_i128_max_no_panic() {
+    let rate = ExchangeRate {
+        source_pilot: 0,
+        dest_pilot: 1,
+        rate: i128::MAX,
+        timestamp: 0,
+        bid_price: i128::MAX,
+        ask_price: i128::MAX,
+        max_volatility: u32::MAX,
+    };
+    // Must not panic on extreme spread inputs.
+    let _ = rate.mid_price();
+    let _ = rate.spread_bps();
+}
+
+#[test]
+fn test_exchange_rate_extreme_volatility_is_typed_error() {
+    let rate = ExchangeRate {
+        source_pilot: 0,
+        dest_pilot: 1,
+        rate: 1_000_000_000_000_000_000,
+        timestamp: 0,
+        bid_price: 1,
+        ask_price: i128::MAX,
+        max_volatility: 1,
+    };
+    // Volatility beyond max_volatility must surface as a typed error, not a panic.
+    let result = InteropManager::validate_exchange_rate(&rate, 0, 3600);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_validate_pilot_pair_u64_max_is_typed_error() {
+    let result = InteropManager::validate_pilot_pair(u64::MAX as u32, 1);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_oversized_metadata_payload_is_rejected() {
+    let env = create_test_env();
+    let mut tx = create_test_transaction(&env);
+    // Build a payload larger than the enforced maximum collection length.
+    let oversized = Bytes::from_slice(&env, &[0u8; 4096]);
+    tx.metadata = oversized;
+    assert!(CBDCLogger::validate_transaction(&tx).is_err());
+}
+
+#[test]
+fn test_over_length_settlement_path_is_typed_error() {
+    let env = create_test_env();
+    let mut tx_ids = Vec::new(&env);
+    // Push more ids than the maximum allowed settlement path length.
+    for _ in 0..(MAX_SETTLEMENT_PATH_LEN + 1) {
+        tx_ids.push_back(BytesN::zero());
+    }
+    let result = OfflineManager::create_batch_settlement(&env, tx_ids, 1_000_00);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_max_settlement_path_len_accepted() {
+    let env = create_test_env();
+    let mut tx_ids = Vec::new(&env);
+    for _ in 0..MAX_SETTLEMENT_PATH_LEN {
+        tx_ids.push_back(BytesN::zero());
+    }
+    let result = OfflineManager::create_batch_settlement(&env, tx_ids, 1_000_00);
+    assert!(result.is_ok());
+}
+
+// ============ Storage Footprint Regression Assertions ============
+
+#[test]
+fn test_storage_footprint_exchange_rate_within_budget() {
+    let env = create_test_env();
+    let rate = ExchangeRate {
+        source_pilot: 0,
+        dest_pilot: 1,
+        rate: 1_000_000_000_000_000_000,
+        timestamp: 0,
+        bid_price: 1,
+        ask_price: 2,
+        max_volatility: 500,
+    };
+    let bytes = rate.to_xdr(&env).len();
+    assert!(
+        bytes <= EXCHANGE_RATE_XDR_BUDGET,
+        "ExchangeRate XDR size {} exceeds budget {}",
+        bytes,
+        EXCHANGE_RATE_XDR_BUDGET
+    );
+}
+
+#[test]
+fn test_storage_footprint_settlement_record_within_budget() {
+    let env = create_test_env();
+    let record = SettlementRecord {
+        settlement_id: BytesN::zero(),
+        status: SettlementStatus::Created as u8,
+        source_pilot: 0,
+        dest_pilot: 1,
+        amount_source: 1_000_00,
+        amount_dest: 1_120_00,
+        created_at: 0,
+        updated_at: 0,
+    };
+    let bytes = record.to_xdr(&env).len();
+    assert!(
+        bytes <= SETTLEMENT_RECORD_XDR_BUDGET,
+        "SettlementRecord XDR size {} exceeds budget {}",
+        bytes,
+        SETTLEMENT_RECORD_XDR_BUDGET
+    );
+}
+
+#[test]
+fn test_storage_footprint_enum_discriminants_packed() {
+    // Enum discriminants must remain single-byte to keep XDR minimal.
+    assert_eq!(SettlementStatus::Created as u32, 0);
+    assert!(core::mem::size_of::<SettlementStatus>() <= 1);
+    assert!(core::mem::size_of::<InteropProtocol>() <= 1);
+}
+
+// ============ 1,000-Transaction Ledger Byte Benchmark ============
+
+#[test]
+fn test_ledger_byte_benchmark_1000_transactions() {
+    let env = create_test_env();
+    let mut total_bytes: u64 = 0;
+
+    for i in 0..1_000u64 {
+        let record = SettlementRecord {
+            settlement_id: BytesN::zero(),
+            status: SettlementStatus::Created as u8,
+            source_pilot: 0,
+            dest_pilot: 1,
+            amount_source: 1_000_00,
+            amount_dest: 1_120_00,
+            created_at: i,
+            updated_at: i,
+        };
+        total_bytes = total_bytes.saturating_add(record.to_xdr(&env).len() as u64);
+    }
+
+    // Bounded execution cost: total serialized bytes must stay under the
+    // per-1,000-transaction byte budget.
+    assert!(
+        total_bytes <= LEDGER_BYTES_PER_1000_TX_BUDGET,
+        "1,000-tx ledger bytes {} exceed budget {}",
+        total_bytes,
+        LEDGER_BYTES_PER_1000_TX_BUDGET
+    );
+}
+
 fn create_test_env() -> Env {
     Env::default()
 }

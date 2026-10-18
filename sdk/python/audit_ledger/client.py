@@ -15,7 +15,20 @@ from typing import Any, Dict, Generator, List, Optional, Sequence
 
 from .batch import BatchResult, BatchSubmitRequest, batch_get, batch_submit, batch_verify
 from .cache import CacheConfig, LRUCache
-from .models import Address, Event, EventId, EventType, Metadata, Page, ContractError, RPCError
+from .models import (
+    Address,
+    Event,
+    EventId,
+    EventType,
+    Metadata,
+    Page,
+    RuleFilter,
+    RulePage,
+    RuleStatus,
+    SuptechRule,
+    ContractError,
+    RPCError,
+)
 from .pagination import (
     MAX_PAGE_LIMIT,
     PageCursor,
@@ -93,6 +106,9 @@ def _parse_page(result: Any) -> Page[Any]:
         return Page(items=list(result), total=len(result), offset=0, limit=len(result), next_cursor=None)
     return Page(items=[], total=0, offset=0, limit=0, next_cursor=None)
 from .streaming import StreamConfig, stream_by_type, stream_events
+
+MAX_PAGE_SIZE = 100
+"""Hard cap on the number of items returned by any paginated rule query."""
 
 try:
     import stellar_sdk
@@ -529,6 +545,142 @@ class AuditLedgerClient:
             if ev_submitter is None or ev_submitter != submitter:
                 return False
         return True
+
+    # ------------------------------------------------------------------
+    # SupTech rule queries (cursor-based pagination)
+    # ------------------------------------------------------------------
+
+    def _clamp_page_limit(self, limit: Optional[int]) -> int:
+        """Clamp a requested page size to the enforced maximum of 100 items."""
+        if limit is None:
+            return MAX_PAGE_SIZE
+        try:
+            value = int(limit)
+        except (TypeError, ValueError):
+            return MAX_PAGE_SIZE
+        if value < 1:
+            return 1
+        return min(value, MAX_PAGE_SIZE)
+
+    @staticmethod
+    def _encode_cursor(cursor: Optional[Any]) -> Optional[str]:
+        if cursor is None:
+            return None
+        if isinstance(cursor, bytes):
+            return base64.b64encode(cursor).decode()
+        return str(cursor)
+
+    @staticmethod
+    def _decode_cursor(raw: Any) -> Optional[str]:
+        if raw is None:
+            return None
+        if isinstance(raw, dict):
+            raw = next(iter(raw.values()), None)
+            if raw is None:
+                return None
+        if isinstance(raw, bytes):
+            return base64.b64encode(raw).decode()
+        return str(raw)
+
+    def _parse_rule(self, raw: Any) -> SuptechRule:
+        if isinstance(raw, SuptechRule):
+            return raw
+        if isinstance(raw, dict):
+            return SuptechRule.from_dict(raw)
+        raise RPCError(f"Unexpected rule payload: {raw!r}")
+
+    def _parse_rule_page(self, result: Any, limit: int) -> RulePage:
+        """Normalise a contract response into a :class:`RulePage`."""
+        if isinstance(result, RulePage):
+            return result
+        if isinstance(result, dict):
+            raw_items = result.get("items") or result.get("rules") or []
+            next_cursor = result.get("next_cursor")
+        elif isinstance(result, (list, tuple)):
+            raw_items = list(result)
+            next_cursor = None
+        else:
+            raw_items = []
+            next_cursor = None
+
+        items = [self._parse_rule(item) for item in raw_items]
+        # Defensive: never surface more than the enforced page size.
+        if len(items) > limit:
+            items = items[:limit]
+            next_cursor = self._encode_cursor(items[-1].cursor) if items else None
+        return RulePage(items=items, next_cursor=self._decode_cursor(next_cursor))
+
+    def query_rules(
+        self,
+        filter: Optional[RuleFilter] = None,
+        cursor: Optional[Any] = None,
+        limit: Optional[int] = None,
+    ) -> RulePage:
+        """Query SupTech rules with cursor-based pagination and filtering.
+
+        :param filter: optional :class:`RuleFilter` restricting results by
+            ledger timestamp range, status and/or submitter address.
+        :param cursor: opaque cursor token returned as ``next_cursor`` by a
+            previous call. ``None`` starts from the beginning of the result set.
+        :param limit: requested page size; clamped to the maximum of 100 items.
+        :returns: a :class:`RulePage` carrying ``items`` and ``next_cursor``.
+        """
+        safe_limit = self._clamp_page_limit(limit)
+        params: Dict[str, Any] = {
+            "cursor": self._encode_cursor(cursor),
+            "limit": safe_limit,
+        }
+        if filter is not None:
+            params["filter"] = filter.to_dict() if hasattr(filter, "to_dict") else filter
+        result = self._invoke("query_rules", params)
+        return self._parse_rule_page(result, safe_limit)
+
+    def query_rules_by_status(
+        self,
+        status: RuleStatus,
+        cursor: Optional[Any] = None,
+        limit: Optional[int] = None,
+    ) -> RulePage:
+        """Paginated rule query filtered by rule status."""
+        return self.query_rules(filter=RuleFilter(status=status), cursor=cursor, limit=limit)
+
+    def query_rules_by_submitter(
+        self,
+        submitter: Address,
+        cursor: Optional[Any] = None,
+        limit: Optional[int] = None,
+    ) -> RulePage:
+        """Paginated rule query filtered by submitter address."""
+        return self.query_rules(filter=RuleFilter(submitter=submitter), cursor=cursor, limit=limit)
+
+    def query_rules_by_timestamp(
+        self,
+        from_timestamp: Optional[int] = None,
+        to_timestamp: Optional[int] = None,
+        cursor: Optional[Any] = None,
+        limit: Optional[int] = None,
+    ) -> RulePage:
+        """Paginated rule query filtered by ledger timestamp range."""
+        return self.query_rules(
+            filter=RuleFilter(from_timestamp=from_timestamp, to_timestamp=to_timestamp),
+            cursor=cursor,
+            limit=limit,
+        )
+
+    def iter_rules(
+        self,
+        filter: Optional[RuleFilter] = None,
+        limit: Optional[int] = None,
+    ) -> Generator[SuptechRule, None, None]:
+        """Iterate over every rule matching ``filter`` across all pages."""
+        cursor: Optional[Any] = None
+        while True:
+            page = self.query_rules(filter=filter, cursor=cursor, limit=limit)
+            for item in page.items:
+                yield item
+            if not page.next_cursor:
+                break
+            cursor = page.next_cursor
 
     def health_check(self) -> Dict[str, Any]:
         status: Dict[str, Any] = {
