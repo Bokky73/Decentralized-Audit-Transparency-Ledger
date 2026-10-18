@@ -57,6 +57,14 @@ pub mod carbon_credits;
 pub mod esg_reporting;
 pub mod rbac;
 
+// Role-Based Access Control (#686 #689 #688 #687): granular roles with
+// precedence hierarchies shared by supply chain and ML feature store.
+pub mod rbac;
+
+// On-chain ML feature vector lineage and hash anchoring
+// (issues #854, #855, #857).
+pub mod ml_feature_store;
+
 // Data retention, legal hold, GDPR erasure, and the immutable operational audit log.
 pub mod data_retention;
 
