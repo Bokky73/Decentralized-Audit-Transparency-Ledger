@@ -3,6 +3,48 @@
 use crate::sandbox_types::*;
 use soroban_sdk::{contracttype, Bytes, BytesN, Env};
 
+/// Maximum permitted length for graduation notes (prevents unbounded growth).
+const MAX_NOTES_LEN: usize = 1024;
+
+/// Maximum permitted value for percentage-based score fields (0-100).
+const MAX_SCORE: u32 = 100;
+
+/// Maximum permitted transactions count (deterministic upper bound).
+const MAX_TRANSACTIONS: u32 = 1_000_000;
+
+/// Maximum permitted days in sandbox (deterministic upper bound).
+const MAX_DAYS: u32 = 1_000;
+
+/// Validate that a score field is within the permitted 0..=100 range.
+fn validate_score(score: u32) -> Result<(), &'static str> {
+    if score > MAX_SCORE {
+        return Err("score exceeds 0-100 range");
+    }
+    Ok(())
+}
+
+/// Validate all mutable numeric fields on an assessment for overflow/bounds safety.
+fn validate_assessment_bounds(assessment: &GraduationAssessment) -> Result<(), &'static str> {
+    validate_score(assessment.compliance_score)?;
+    validate_score(assessment.user_satisfaction)?;
+    validate_score(assessment.tech_readiness_score)?;
+    if assessment.transactions_completed > MAX_TRANSACTIONS {
+        return Err("transactions_completed exceeds deterministic bound");
+    }
+    if assessment.days_in_sandbox > MAX_DAYS {
+        return Err("days_in_sandbox exceeds deterministic bound");
+    }
+    Ok(())
+}
+
+/// Validate that notes payload respects the bounded length limit.
+fn validate_notes_len(notes: &Bytes) -> Result<(), &'static str> {
+    if notes.len() > MAX_NOTES_LEN {
+        return Err("notes exceed maximum permitted length");
+    }
+    Ok(())
+}
+
 /// Graduation progress assessment.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,7 +136,10 @@ impl GraduationManager {
     pub fn evaluate_eligibility(
         assessment: &mut GraduationAssessment,
         criteria: &GraduationCriteria,
-    ) -> bool {
+    ) -> Result<bool, &'static str> {
+        // Enforce deterministic bounds before any comparison (overflow safety).
+        validate_assessment_bounds(assessment)?;
+
         // Check all criteria
         let tx_ok = assessment.transactions_completed >= criteria.min_transactions;
         let duration_ok = assessment.days_in_sandbox >= criteria.min_duration_days;
@@ -123,7 +168,7 @@ impl GraduationManager {
             && financial_ok;
 
         assessment.is_eligible = eligible;
-        eligible
+        Ok(eligible)
     }
 
     /// Approve graduation
@@ -131,6 +176,8 @@ impl GraduationManager {
         assessment: &mut GraduationAssessment,
         notes: Bytes,
     ) -> Result<(), &'static str> {
+        validate_notes_len(&notes)?;
+
         if !assessment.is_eligible {
             return Err("Participant does not meet graduation criteria");
         }
@@ -146,6 +193,8 @@ impl GraduationManager {
         assessment: &mut GraduationAssessment,
         reason: Bytes,
     ) -> Result<(), &'static str> {
+        validate_notes_len(&reason)?;
+
         assessment.decision = GraduationDecision::Rejected as u32;
         assessment.notes = reason;
 
@@ -157,6 +206,8 @@ impl GraduationManager {
         assessment: &mut GraduationAssessment,
         reason: Bytes,
     ) -> Result<(), &'static str> {
+        validate_notes_len(&reason)?;
+
         assessment.decision = GraduationDecision::Deferred as u32;
         assessment.notes = reason;
 
@@ -215,12 +266,50 @@ mod tests {
         assessment.user_satisfaction = 80;
         assessment.tech_readiness_score = 85;
         assessment.regulatory_approval = true;
+        assessment.financial_health_passed = true;
 
         let criteria = GraduationCriteria::default();
-        let eligible = GraduationManager::evaluate_eligibility(&mut assessment, &criteria);
+        let eligible = GraduationManager::evaluate_eligibility(&mut assessment, &criteria)
+            .expect("evaluation must succeed for valid inputs");
 
         assert!(eligible);
         assert!(assessment.is_eligible);
+    }
+
+    #[test]
+    fn test_eligibility_evaluation_bounds_rejects_out_of_range_score() {
+        let env = soroban_sdk::Env::default();
+        let mut assessment = GraduationManager::create_assessment(&env, BytesN::zero());
+        assessment.compliance_score = 150; // exceeds 0-100
+
+        let criteria = GraduationCriteria::default();
+        let result = GraduationManager::evaluate_eligibility(&mut assessment, &criteria);
+        assert_eq!(result, Err("score exceeds 0-100 range"));
+    }
+
+    #[test]
+    fn test_eligibility_evaluation_bounds_rejects_too_many_transactions() {
+        let env = soroban_sdk::Env::default();
+        let mut assessment = GraduationManager::create_assessment(&env, BytesN::zero());
+        assessment.transactions_completed = 2_000_000; // exceeds 1_000_000 bound
+
+        let criteria = GraduationCriteria::default();
+        let result = GraduationManager::evaluate_eligibility(&mut assessment, &criteria);
+        assert_eq!(
+            result,
+            Err("transactions_completed exceeds deterministic bound")
+        );
+    }
+
+    #[test]
+    fn test_eligibility_evaluation_bounds_rejects_too_many_days() {
+        let env = soroban_sdk::Env::default();
+        let mut assessment = GraduationManager::create_assessment(&env, BytesN::zero());
+        assessment.days_in_sandbox = 2_000; // exceeds 1_000 bound
+
+        let criteria = GraduationCriteria::default();
+        let result = GraduationManager::evaluate_eligibility(&mut assessment, &criteria);
+        assert_eq!(result, Err("days_in_sandbox exceeds deterministic bound"));
     }
 
     #[test]
@@ -234,5 +323,19 @@ mod tests {
 
         let readiness = GraduationManager::compute_readiness_percentage(&assessment);
         assert_eq!(readiness, 81); // Average of 80, 75, 90
+    }
+
+    #[test]
+    fn test_notes_length_rejected_when_too_long() {
+        let env = soroban_sdk::Env::default();
+        let mut assessment = GraduationManager::create_assessment(&env, BytesN::zero());
+        assessment.is_eligible = true;
+
+        let mut long_notes = soroban_sdk::Bytes::new(&env);
+        for _ in 0..2048u32 {
+            long_notes.push_back(b'a');
+        }
+        let result = GraduationManager::approve_graduation(&mut assessment, long_notes);
+        assert_eq!(result, Err("notes exceed maximum permitted length"));
     }
 }

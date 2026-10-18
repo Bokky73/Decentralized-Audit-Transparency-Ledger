@@ -49,6 +49,7 @@ pub mod supply_chain;
 pub mod digital_passport;
 pub mod carbon_credits;
 pub mod esg_reporting;
+pub mod rbac;
 
 // Data retention, legal hold, GDPR erasure, and the immutable operational audit log.
 pub mod data_retention;
@@ -7185,6 +7186,9 @@ pub mod sandbox_env;
 pub mod sandbox_supervision;
 pub mod sandbox_innovation;
 pub mod sandbox_graduation;
+
+#[cfg(test)]
+mod sandbox_graduation_tests;
 
 // FinOps Module
 pub mod finops;
