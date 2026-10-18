@@ -1,59 +1,21 @@
 #![no_std]
 
-use crate::cbdc_types::{BatchSettlement, CBDCTransaction, OfflineStatus};
-use soroban_sdk::{
-    contracterror, contracttype, Address, Bytes, BytesN, Env, Vec,
-};
+use crate::cbdc_types::{BatchSettlement, CBDCTransaction, CBDCInteropError, OfflineStatus};
+use crate::rbac::{RbacError, RbacManager, Role};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, Symbol, Vec};
 
-/// Maximum number of transaction IDs permitted in a single batch settlement.
-pub const MAX_BATCH_TRANSACTIONS: u32 = 1_000;
-/// Maximum byte length of transaction metadata.
-pub const MAX_METADATA_BYTES: u32 = 4_096;
-/// Default TTL extension (in ledgers) for archival-critical persistent records.
-pub const DEFAULT_TTL_EXTEND_LEDGERS: u32 = 100_000;
-/// Threshold (in ledgers) below which archival-critical records are bumped.
-pub const TTL_BUMP_THRESHOLD_LEDGERS: u32 = 10_000;
-/// Default page size for paginated read queries.
-pub const DEFAULT_PAGE_SIZE: u32 = 50;
-/// Maximum page size allowed for a single read query.
-pub const MAX_PAGE_SIZE: u32 = 500;
+/// Maximum offline transaction amount (prevents unbounded value growth).
+pub const MAX_OFFLINE_TX_AMOUNT: u128 = 1_000_000_000_000_000_000;
+/// Maximum byte length of offline transaction metadata.
+pub const MAX_OFFLINE_METADATA_BYTES: u32 = 4_096;
+/// Maximum number of transactions in a batch settlement.
+pub const MAX_OFFLINE_BATCH_SIZE: u32 = 1_000;
 
-/// Typed contract errors for the CBDC offline module.
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum OfflineError {
-    /// Signature cannot be empty.
-    EmptySignature = 1,
-    /// Signer public key cannot be empty.
-    EmptySignerPubkey = 2,
-    /// Transaction amount cannot be zero.
-    ZeroAmount = 3,
-    /// Invalid nonce (0 is reserved).
-    InvalidNonce = 4,
-    /// Transaction is not in pending state.
-    NotPending = 5,
-    /// Cannot fail an already reconciled transaction.
-    AlreadyReconciled = 6,
-    /// Batch cannot be empty.
-    EmptyBatch = 7,
-    /// Batch amount cannot be zero.
-    ZeroBatchAmount = 8,
-    /// Batch is not in pending state.
-    BatchNotPending = 9,
-    /// Nonce replay detected or invalid sequence.
-    NonceReplay = 10,
-    /// Offline transaction not found in storage.
-    TransactionNotFound = 11,
-    /// Batch settlement not found in storage.
-    BatchNotFound = 12,
-    /// Reconciliation queue is full.
-    QueueFull = 13,
-    /// Invalid pagination parameters.
-    InvalidPagination = 14,
-    /// Storage write failed.
-    StorageWriteFailed = 15,
-}
+/// Audit event topic for offline transaction operations.
+const AUDIT_TOPIC: &str = "cbdc_offline";
+/// Audit event outcome values.
+const AUDIT_OK: &str = "ok";
+const AUDIT_DENIED: &str = "denied";
 
 /// Represents an offline-signed transaction before reconciliation.
 #[contracttype]
@@ -129,11 +91,17 @@ impl ReconciliationState {
         self.failed_count > 0 || self.disputed_count > 0
     }
 
+    /// Reconciliation rate as a percentage (0-100), computed with saturating
+    /// arithmetic to avoid overflow on adversarial counts.
     pub fn reconciliation_rate(&self) -> u32 {
         if self.total_transactions == 0 {
             return 100;
         }
-        ((self.successful_count as u64 * 100) / self.total_transactions as u64) as u32
+        let numerator = self
+            .successful_count
+            .checked_mul(100)
+            .unwrap_or(u32::MAX);
+        numerator.saturating_div(self.total_transactions)
     }
 }
 
@@ -359,101 +327,57 @@ pub enum OfflineStorageKey {
 pub struct OfflineManager;
 
 impl OfflineManager {
-    // ── Storage helpers ──────────────────────────────────────────────
-
-    /// Bump the TTL of a persistent storage key when auto-bump is enabled.
-    fn maybe_bump_ttl(env: &Env, key: &OfflineStorageKey) {
-        let config: OfflineConfig = env
-            .storage()
-            .instance()
-            .get(&OfflineStorageKey::Config)
-            .unwrap_or_else(OfflineConfig::default);
-        if !config.ttl_auto_bump {
-            return;
+    /// Validate a CBDCTransaction's amount and metadata bounds.
+    fn validate_transaction_bounds(transaction: &CBDCTransaction) -> Result<(), &'static str> {
+        if transaction.amount_source == 0 {
+            return Err("Transaction amount cannot be zero");
         }
-        env.storage()
-            .persistent()
-            .extend_ttl(
-                key,
-                TTL_BUMP_THRESHOLD_LEDGERS,
-                config.ttl_extend_ledgers,
-            );
-    }
-
-    /// Read the module config from instance storage.
-    fn read_config(env: &Env) -> OfflineConfig {
-        env.storage()
-            .instance()
-            .get(&OfflineStorageKey::Config)
-            .unwrap_or_else(OfflineConfig::default)
-    }
-
-    /// Write the module config to instance storage.
-    fn write_config(env: &Env, config: &OfflineConfig) {
-        env.storage().instance().set(&OfflineStorageKey::Config, config);
-    }
-
-    /// Get the ordered list of all transaction hashes.
-    fn read_tx_index(env: &Env) -> Vec<BytesN<32>> {
-        env.storage()
-            .instance()
-            .get(&OfflineStorageKey::AllTransactions)
-            .unwrap_or_else(|| Vec::new(env))
-    }
-
-    /// Write the ordered list of all transaction hashes.
-    fn write_tx_index(env: &Env, index: &Vec<BytesN<32>>) {
-        env.storage()
-            .instance()
-            .set(&OfflineStorageKey::AllTransactions, index);
-    }
-
-    /// Get the ordered list of all batch IDs.
-    fn read_batch_index(env: &Env) -> Vec<BytesN<32>> {
-        env.storage()
-            .instance()
-            .get(&OfflineStorageKey::AllBatches)
-            .unwrap_or_else(|| Vec::new(env))
-    }
-
-    /// Write the ordered list of all batch IDs.
-    fn write_batch_index(env: &Env, index: &Vec<BytesN<32>>) {
-        env.storage().instance().set(&OfflineStorageKey::AllBatches, index);
-    }
-
-    // ── Public API ───────────────────────────────────────────────────
-
-    /// Initialize offline module configuration (idempotent).
-    pub fn init_config(env: &Env) {
-        let existing: Option<OfflineConfig> = env
-            .storage()
-            .instance()
-            .get(&OfflineStorageKey::Config);
-        if existing.is_none() {
-            self.write_config(env, &OfflineConfig::default());
+        if transaction.amount_source > MAX_OFFLINE_TX_AMOUNT {
+            return Err("Transaction amount exceeds maximum bound");
         }
+        if transaction.amount_dest > MAX_OFFLINE_TX_AMOUNT {
+            return Err("Destination amount exceeds maximum bound");
+        }
+        if transaction.metadata.len() as u32 > MAX_OFFLINE_METADATA_BYTES {
+            return Err("Transaction metadata exceeds maximum byte length");
+        }
+        Ok(())
     }
 
-    /// Create offline transaction with signature and persist to storage.
+    /// Create offline transaction with signature
     pub fn create_offline_transaction(
         env: &Env,
+        caller: &Address,
         transaction: CBDCTransaction,
         signature: Bytes,
         signer_pubkey: Bytes,
         nonce: u32,
-    ) -> Result<OfflineTransaction, OfflineError> {
+    ) -> Result<OfflineTransaction, &'static str> {
+        Self::require_authorization(env, caller, "create_offline_transaction")?;
+
         if signature.is_empty() {
-            return Err(OfflineError::EmptySignature);
+            Self::emit_denied_event(env, caller, "create_offline_transaction", "empty_signature");
+            return Err("Signature cannot be empty");
         }
         if signer_pubkey.is_empty() {
-            return Err(OfflineError::EmptySignerPubkey);
+            Self::emit_denied_event(env, caller, "create_offline_transaction", "empty_pubkey");
+            return Err("Signer public key cannot be empty");
+        }
+        if let Err(e) = Self::validate_transaction_bounds(&transaction) {
+            Self::emit_denied_event(env, caller, "create_offline_transaction", e);
+            return Err(e);
+        }
+        if nonce == 0 {
+            // Nonce can be 1+, 0 is reserved
+            Self::emit_denied_event(env, caller, "create_offline_transaction", "invalid_nonce");
+            return Err("Invalid nonce");
         }
 
         // Compute hash of transaction for offline verification
         let tx_hash = Self::compute_offline_tx_hash(env, &transaction, nonce);
 
-        let offline_tx = OfflineTransaction {
-            tx_hash: tx_hash.clone(),
+        let result = OfflineTransaction {
+            tx_hash,
             transaction,
             signature,
             signer_pubkey,
@@ -462,12 +386,17 @@ impl OfflineManager {
             reconciled_at: None,
             nonce,
         };
+        Self::emit_success_event(env, caller, "create_offline_transaction");
+        Ok(result)
+    }
 
-        // Persist transaction under its hash key.
-        env.storage()
-            .persistent()
-            .set(&OfflineStorageKey::Transaction(tx_hash.clone()), &offline_tx);
-        Self::maybe_bump_ttl(env, &OfflineStorageKey::Transaction(tx_hash.clone()));
+    /// Compute deterministic offline transaction hash
+    pub fn compute_offline_tx_hash(
+        env: &Env,
+        transaction: &CBDCTransaction,
+        nonce: u32,
+    ) -> BytesN<32> {
+        let mut input = Bytes::new(env);
 
         // Append to the ordered transaction index.
         let mut index = Self::read_tx_index(env);
@@ -500,6 +429,12 @@ impl OfflineManager {
         if tx.transaction.amount_source == 0 {
             return Err(OfflineError::ZeroAmount);
         }
+        if tx.transaction.amount_source > MAX_OFFLINE_TX_AMOUNT {
+            return Err("Transaction amount exceeds maximum bound");
+        }
+        if tx.transaction.metadata.len() as u32 > MAX_OFFLINE_METADATA_BYTES {
+            return Err("Transaction metadata exceeds maximum byte length");
+        }
         if tx.nonce == 0 {
             return Err(OfflineError::InvalidNonce);
         }
@@ -509,76 +444,97 @@ impl OfflineManager {
     /// Reconcile offline transaction to on-chain state and persist.
     pub fn reconcile_transaction(
         env: &Env,
-        tx_hash: &BytesN<32>,
-    ) -> Result<OfflineTransaction, OfflineError> {
-        let mut offline_tx = Self::get_offline_transaction(env, tx_hash)?;
+        caller: &Address,
+        offline_tx: &mut OfflineTransaction,
+    ) -> Result<(), &'static str> {
+        Self::require_authorization(env, caller, "reconcile_transaction")?;
+
         if offline_tx.status != OfflineStatus::PendingReconciliation as u32 {
-            return Err(OfflineError::NotPending);
+            Self::emit_denied_event(
+                env,
+                caller,
+                "reconcile_transaction",
+                "not_pending",
+            );
+            return Err("Transaction is not in pending state");
         }
 
         offline_tx.status = OfflineStatus::Reconciled as u32;
         offline_tx.reconciled_at = Some(env.ledger().timestamp());
 
-        env.storage()
-            .persistent()
-            .set(&OfflineStorageKey::Transaction(tx_hash.clone()), &offline_tx);
-        Self::maybe_bump_ttl(env, &OfflineStorageKey::Transaction(tx_hash.clone()));
-
-        Ok(offline_tx)
+        Self::emit_success_event(env, caller, "reconcile_transaction");
+        Ok(())
     }
 
     /// Mark transaction as failed reconciliation and persist.
     pub fn fail_reconciliation(
         env: &Env,
-        tx_hash: &BytesN<32>,
-    ) -> Result<OfflineTransaction, OfflineError> {
-        let mut offline_tx = Self::get_offline_transaction(env, tx_hash)?;
+        caller: &Address,
+        offline_tx: &mut OfflineTransaction,
+    ) -> Result<(), &'static str> {
+        Self::require_authorization(env, caller, "fail_reconciliation")?;
+
         if offline_tx.status == OfflineStatus::Reconciled as u32 {
-            return Err(OfflineError::AlreadyReconciled);
+            Self::emit_denied_event(
+                env,
+                caller,
+                "fail_reconciliation",
+                "already_reconciled",
+            );
+            return Err("Cannot fail already reconciled transaction");
         }
 
         offline_tx.status = OfflineStatus::FailedReconciliation as u32;
         offline_tx.reconciled_at = Some(env.ledger().timestamp());
 
-        env.storage()
-            .persistent()
-            .set(&OfflineStorageKey::Transaction(tx_hash.clone()), &offline_tx);
-        Self::maybe_bump_ttl(env, &OfflineStorageKey::Transaction(tx_hash.clone()));
-
-        Ok(offline_tx)
+        Self::emit_success_event(env, caller, "fail_reconciliation");
+        Ok(())
     }
 
     /// Create batch settlement from offline transaction IDs and persist.
     pub fn create_batch_settlement(
         env: &Env,
+        caller: &Address,
         tx_ids: Vec<BytesN<32>>,
         total_amount: u128,
-    ) -> Result<BatchSettlement, OfflineError> {
-        if tx_ids.len() == 0 {
-            return Err(OfflineError::EmptyBatch);
+    ) -> Result<BatchSettlement, &'static str> {
+        Self::require_authorization(env, caller, "create_batch_settlement")?;
+
+        let batch_len = tx_ids.len() as u32;
+        if batch_len == 0 {
+            Self::emit_denied_event(env, caller, "create_batch_settlement", "empty_batch");
+            return Err("Batch cannot be empty");
         }
-        if tx_ids.len() as u32 > MAX_BATCH_TRANSACTIONS {
-            return Err(OfflineError::EmptyBatch);
+        if batch_len > MAX_OFFLINE_BATCH_SIZE {
+            Self::emit_denied_event(env, caller, "create_batch_settlement", "batch_too_large");
+            return Err("Batch exceeds maximum transaction count");
         }
         if total_amount == 0 {
-            return Err(OfflineError::ZeroBatchAmount);
+            Self::emit_denied_event(env, caller, "create_batch_settlement", "zero_amount");
+            return Err("Batch amount cannot be zero");
+        }
+        if total_amount > MAX_OFFLINE_TX_AMOUNT {
+            Self::emit_denied_event(env, caller, "create_batch_settlement", "amount_exceeds_bound");
+            return Err("Batch total amount exceeds maximum bound");
         }
 
         let batch_id = Self::compute_batch_id(env, &tx_ids);
 
-        let batch = BatchSettlement {
-            batch_id: batch_id.clone(),
+        let result = BatchSettlement {
+            batch_id,
             transaction_ids: tx_ids,
             total_amount,
             settlement_status: OfflineStatus::PendingReconciliation as u32,
             created_at: env.ledger().timestamp(),
             settled_at: None,
         };
+        Self::emit_success_event(env, caller, "create_batch_settlement");
+        Ok(result)
+    }
 
-        env.storage()
-            .persistent()
-            .set(&OfflineStorageKey::Batch(batch_id.clone()), &batch);
-        Self::maybe_bump_ttl(env, &OfflineStorageKey::Batch(batch_id.clone()));
+    /// Compute deterministic batch ID
+    pub fn compute_batch_id(env: &Env, tx_ids: &Vec<BytesN<32>>) -> BytesN<32> {
+        let mut input = Bytes::new(env);
 
         let mut index = Self::read_batch_index(env);
         if !index.iter().any(|h| h == batch_id) {
@@ -603,22 +559,26 @@ impl OfflineManager {
     /// Settle batch on-chain and persist.
     pub fn settle_batch(
         env: &Env,
-        batch_id: &BytesN<32>,
-    ) -> Result<BatchSettlement, OfflineError> {
-        let mut batch = Self::get_batch_settlement(env, batch_id)?;
+        caller: &Address,
+        batch: &mut BatchSettlement,
+    ) -> Result<(), &'static str> {
+        Self::require_authorization(env, caller, "settle_batch")?;
+
         if batch.settlement_status != OfflineStatus::PendingReconciliation as u32 {
-            return Err(OfflineError::BatchNotPending);
+            Self::emit_denied_event(
+                env,
+                caller,
+                "settle_batch",
+                "not_pending",
+            );
+            return Err("Batch is not in pending state");
         }
 
         batch.settlement_status = OfflineStatus::Reconciled as u32;
         batch.settled_at = Some(env.ledger().timestamp());
 
-        env.storage()
-            .persistent()
-            .set(&OfflineStorageKey::Batch(batch_id.clone()), &batch);
-        Self::maybe_bump_ttl(env, &OfflineStorageKey::Batch(batch_id.clone()));
-
-        Ok(batch)
+        Self::emit_success_event(env, caller, "settle_batch");
+        Ok(())
     }
 
     /// Detect and prevent replay attacks using nonce.
@@ -641,10 +601,18 @@ impl OfflineManager {
 
         for status in statuses.iter() {
             match status {
-                s if s == OfflineStatus::Reconciled as u32 => state.successful_count += 1,
-                s if s == OfflineStatus::FailedReconciliation as u32 => state.failed_count += 1,
-                s if s == OfflineStatus::PendingReconciliation as u32 => state.pending_count += 1,
-                s if s == OfflineStatus::Disputed as u32 => state.disputed_count += 1,
+                s if s == OfflineStatus::Reconciled as u32 => {
+                    state.successful_count = state.successful_count.saturating_add(1);
+                }
+                s if s == OfflineStatus::FailedReconciliation as u32 => {
+                    state.failed_count = state.failed_count.saturating_add(1);
+                }
+                s if s == OfflineStatus::PendingReconciliation as u32 => {
+                    state.pending_count = state.pending_count.saturating_add(1);
+                }
+                s if s == OfflineStatus::Disputed as u32 => {
+                    state.disputed_count = state.disputed_count.saturating_add(1);
+                }
                 _ => {}
             }
         }
@@ -664,6 +632,69 @@ impl OfflineManager {
         );
         recomputed_hash == offline_tx.tx_hash
     }
+
+    /// Enforce RBAC gating: caller must be an authenticated, non-suspended
+    /// submitter (or higher). Emits a denied audit event on failure.
+    fn require_authorization(
+        env: &Env,
+        caller: &Address,
+        operation: &str,
+    ) -> Result<(), &'static str> {
+        caller.require_auth();
+
+        if RbacManager::is_suspended(env, caller) {
+            Self::emit_denied_event(env, caller, operation, "submitter_suspended");
+            return Err("Submitter is suspended");
+        }
+        if RbacManager::get_role(env, caller).is_none() {
+            Self::emit_denied_event(env, caller, operation, "no_role");
+            return Err("No role assigned");
+        }
+        if !RbacManager::has_role_min(env, caller, Role::Submitter) {
+            Self::emit_denied_event(env, caller, operation, "insufficient_role");
+            return Err("Insufficient role");
+        }
+        Ok(())
+    }
+
+    /// Emit a success audit event for a completed mutation.
+    fn emit_success_event(env: &Env, caller: &Address, operation: &str) {
+        let topic = Symbol::new(env, AUDIT_TOPIC);
+        let op = Symbol::new(env, operation);
+        let result = Symbol::new(env, AUDIT_OK);
+
+        env.events().publish(
+            (topic.clone(), op.clone(), caller.clone()),
+            (env.ledger().timestamp(), result.clone()),
+        );
+        env.events().publish(
+            (Symbol::new(env, "cbdc_offline_audit_ok"), op, result),
+            (caller.clone(), env.ledger().timestamp()),
+        );
+    }
+
+    /// Emit a denied audit event for a rejected mutation attempt.
+    fn emit_denied_event(
+        env: &Env,
+        caller: &Address,
+        operation: &str,
+        error_code: &str,
+    ) {
+        let topic = Symbol::new(env, AUDIT_TOPIC);
+        let op = Symbol::new(env, operation);
+        let result = Symbol::new(env, AUDIT_DENIED);
+        let code = Symbol::new(env, error_code);
+
+        env.events().publish(
+            (topic.clone(), op.clone(), caller.clone()),
+            (env.ledger().timestamp(), result.clone(), code),
+        );
+        env.events().publish(
+            (Symbol::new(env, "cbdc_offline_audit_denied"), op, result),
+            (caller.clone(), env.ledger().timestamp(), code),
+        );
+    }
+}
 
     // ── Deterministic cursor-based pagination & filtered reads ────────
 

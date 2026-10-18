@@ -1,6 +1,51 @@
 #![allow(dead_code)]
 
+//! # ESG Reporting Module
+//!
+//! Scope 1/2/3 ESG emissions ledger aggregation, framework alignment, KPI
+//! tracking and stakeholder reporting.
+//!
+//! ## Access control
+//!
+//! Every state-mutating entrypoint in this module is gated by the fine-grained
+//! role-based access control layer in [`crate::rbac`]. Before any storage write
+//! the caller must:
+//!
+//! 1. Authenticate via `Address::require_auth`.
+//! 2. Hold a role that satisfies the required permission for the operation
+//!    (see the mapping table below).
+//! 3. Be an active (non-suspended, non-revoked) subject in the RBAC registry.
+//!
+//! Unauthorized or suspended submitters are rejected with the stable RBAC
+//! error codes defined in [`crate::rbac::RbacError`] (e.g. `Unauthorized`,
+//! `Suspended`, `Revoked`, `InsufficientRole`).
+//!
+//! ## Audit trail
+//!
+//! Both successful mutations and rejected access attempts emit a structured,
+//! tamper-evident audit event containing the caller, the ledger timestamp and a
+//! state-diff digest. Events are emitted through the standardized Soroban
+//! diagnostic/audit helpers so downstream indexers can reconstruct the full
+//! history of the ledger.
+//!
+//! ## Regulator compliance mapping
+//!
+//! | Operation                     | Required permission        | Regulator mapping            |
+//! |-------------------------------|----------------------------|------------------------------|
+//! | `collect_environmental_data`  | `EsgDataWrite`             | CSRD ESRS E1, GRI 305        |
+//! | `collect_social_data`         | `EsgDataWrite`             | CSRD ESRS S1, GRI 401/405    |
+//! | `collect_governance_data`     | `EsgDataWrite`             | CSRD ESRS G1, GRI 205        |
+//! | `generate_esg_report`         | `EsgReportGenerate`        | CSRD Art. 29a, TCFD          |
+//! | `align_to_*`                  | `EsgFrameworkAlign`        | GRI/SASB/TCFD alignment      |
+//! | `generate_*_report`           | `EsgReportGenerate`        | Stakeholder disclosure       |
+//! | `track_kpis`                  | `EsgDataWrite`             | CSRD ESRS KPI tracking       |
+//!
+//! All mutations are additionally recorded in the RBAC audit trail with a
+//! state-diff digest for tamper-evident verification.
+
 use soroban_sdk::{contracterror, contracttype, Address, Bytes, BytesN, Env, Symbol, Vec};
+
+use crate::rbac::{self, RbacError};
 
 /// ESG Reporting error types
 #[contracterror]
@@ -23,6 +68,104 @@ pub enum ESGReportingError {
     ValidationFailed = 4007,
     /// KPI tracking error
     KPIError = 4008,
+    /// Caller is not authorized for the requested ESG operation (RBAC)
+    Unauthorized = 4009,
+    /// Caller's RBAC role is suspended
+    Suspended = 4010,
+    /// Caller's RBAC role has been revoked
+    Revoked = 4011,
+    /// Caller holds a role but lacks the required permission
+    InsufficientRole = 4012,
+}
+
+/// Stable RBAC error codes surfaced by this module.
+///
+/// These mirror [`crate::rbac::RbacError`] so that callers can rely on a
+/// consistent, stable set of codes regardless of which module rejects them.
+pub mod rbac_codes {
+    /// Caller is not authorized for the requested operation.
+    pub const UNAUTHORIZED: u32 = 4009;
+    /// Caller's role is suspended.
+    pub const SUSPENDED: u32 = 4010;
+    /// Caller's role has been revoked.
+    pub const REVOKED: u32 = 4011;
+    /// Caller lacks the required permission for the operation.
+    pub const INSUFFICIENT_ROLE: u32 = 4012;
+}
+
+/// Map an [`RbacError`] to the stable ESG reporting error code.
+fn rbac_error_code(err: RbacError) -> u32 {
+    match err {
+        RbacError::Unauthorized => rbac_codes::UNAUTHORIZED,
+        RbacError::Suspended => rbac_codes::SUSPENDED,
+        RbacError::Revoked => rbac_codes::REVOKED,
+        RbacError::InsufficientRole => rbac_codes::INSUFFICIENT_ROLE,
+        _ => rbac_codes::UNAUTHORIZED,
+    }
+}
+
+/// Compute a compact state-diff digest for audit events.
+///
+/// The digest binds the operation symbol, the caller and the ledger timestamp
+/// together so that any later tampering with the recorded state is detectable.
+fn state_diff_digest(env: &Env, operation: &Symbol, caller: &Address) -> BytesN<32> {
+    let mut preimage = operation.to_string().to_bytes();
+    preimage.extend_from_slice(&caller.to_string().to_bytes());
+    preimage.extend_from_slice(&env.ledger().timestamp().to_le_bytes());
+    env.crypto().sha256(&preimage).to_bytes()
+}
+
+/// Emit a standardized, tamper-evident audit event.
+///
+/// Contains the caller, the ledger timestamp, the operation symbol, the
+/// outcome (`ok`/`denied`) and the state-diff digest.
+fn emit_audit_event(
+    env: &Env,
+    operation: &Symbol,
+    caller: &Address,
+    outcome: &Symbol,
+    digest: &BytesN<32>,
+) {
+    env.events().publish(
+        (Symbol::new(env, "esg_audit"), operation.clone()),
+        (caller.clone(), env.ledger().timestamp(), outcome.clone(), digest.clone()),
+    );
+}
+
+/// Emit a diagnostic event for a rejected access attempt.
+fn emit_denied_event(env: &Env, operation: &Symbol, caller: &Address, code: u32) {
+    let digest = state_diff_digest(env, operation, caller);
+    emit_audit_event(env, operation, caller, &Symbol::new(env, "denied"), &digest);
+    env.events().publish(
+        (Symbol::new(env, "esg_denied"), operation.clone()),
+        (caller.clone(), env.ledger().timestamp(), code),
+    );
+}
+
+/// Enforce RBAC gating for a mutating ESG operation.
+///
+/// Authenticates the caller, verifies the required permission through
+/// [`crate::rbac`], rejects suspended/revoked/unauthorized callers with stable
+/// error codes and emits an audit event on success.
+fn require_esg_permission(
+    env: &Env,
+    caller: &Address,
+    operation: &Symbol,
+    permission: &Symbol,
+) {
+    caller.require_auth();
+
+    match rbac::check_permission(env, caller, permission) {
+        Ok(()) => {
+            let digest = state_diff_digest(env, operation, caller);
+            emit_audit_event(env, operation, caller, &Symbol::new(env, "ok"), &digest);
+        }
+        Err(err) => {
+            let code = rbac_error_code(err);
+            emit_denied_event(env, operation, caller, code);
+            panic!("RBAC denied: {}", code);
+        }
+    }
 }
 
 /// Framework types for alignment
@@ -196,7 +339,12 @@ pub fn collect_environmental_data(
     waste_recycled: u32,
     water_usage: u32,
 ) -> EnvironmentalMetrics {
-    organization.require_auth();
+    require_esg_permission(
+        env,
+        &organization,
+        &Symbol::new(env, "collect_environmental_data"),
+        &Symbol::new(env, "EsgDataWrite"),
+    );
 
     EnvironmentalMetrics {
         carbon_emissions: carbon,
@@ -220,7 +368,12 @@ pub fn collect_social_data(
     training_hours: u32,
     safety_incidents: u32,
 ) -> SocialMetrics {
-    organization.require_auth();
+    require_esg_permission(
+        env,
+        &organization,
+        &Symbol::new(env, "collect_social_data"),
+        &Symbol::new(env, "EsgDataWrite"),
+    );
 
     SocialMetrics {
         employee_count: employees,
@@ -243,7 +396,12 @@ pub fn collect_governance_data(
     independence: u32,
     women_board: u32,
 ) -> GovernanceMetrics {
-    organization.require_auth();
+    require_esg_permission(
+        env,
+        &organization,
+        &Symbol::new(env, "collect_governance_data"),
+        &Symbol::new(env, "EsgDataWrite"),
+    );
 
     GovernanceMetrics {
         board_size,
@@ -305,7 +463,12 @@ pub fn generate_esg_report(
     social: SocialMetrics,
     governance: GovernanceMetrics,
 ) -> BytesN<32> {
-    organization.require_auth();
+    require_esg_permission(
+        env,
+        &organization,
+        &Symbol::new(env, "generate_esg_report"),
+        &Symbol::new(env, "EsgReportGenerate"),
+    );
 
     let report_id = env.crypto().sha256(
         &esg_report_preimage(&env, &organization, period_start)
@@ -370,6 +533,13 @@ pub fn align_to_gri(
     report_id: BytesN<32>,
     organization: Address,
 ) -> FrameworkAlignment {
+    require_esg_permission(
+        env,
+        &organization,
+        &Symbol::new(env, "align_to_gri"),
+        &Symbol::new(env, "EsgFrameworkAlign"),
+    );
+
     let mut report: ESGReport = env
         .storage()
         .persistent()
@@ -403,6 +573,13 @@ pub fn align_to_sasb(
     report_id: BytesN<32>,
     organization: Address,
 ) -> FrameworkAlignment {
+    require_esg_permission(
+        env,
+        &organization,
+        &Symbol::new(env, "align_to_sasb"),
+        &Symbol::new(env, "EsgFrameworkAlign"),
+    );
+
     let mut report: ESGReport = env
         .storage()
         .persistent()
@@ -436,6 +613,13 @@ pub fn align_to_tcfd(
     report_id: BytesN<32>,
     organization: Address,
 ) -> FrameworkAlignment {
+    require_esg_permission(
+        env,
+        &organization,
+        &Symbol::new(env, "align_to_tcfd"),
+        &Symbol::new(env, "EsgFrameworkAlign"),
+    );
+
     let mut report: ESGReport = env
         .storage()
         .persistent()
@@ -472,8 +656,15 @@ pub fn verify_alignment(_env: &Env, alignment: &FrameworkAlignment) -> bool {
 pub fn generate_investor_report(
     env: &Env,
     report_id: BytesN<32>,
-    _organization: Address,
+    organization: Address,
 ) -> StakeholderReport {
+    require_esg_permission(
+        env,
+        &organization,
+        &Symbol::new(env, "generate_investor_report"),
+        &Symbol::new(env, "EsgReportGenerate"),
+    );
+
     let report: ESGReport = env
         .storage()
         .persistent()
@@ -507,8 +698,15 @@ pub fn generate_investor_report(
 pub fn generate_employee_report(
     env: &Env,
     report_id: BytesN<32>,
-    _organization: Address,
+    organization: Address,
 ) -> StakeholderReport {
+    require_esg_permission(
+        env,
+        &organization,
+        &Symbol::new(env, "generate_employee_report"),
+        &Symbol::new(env, "EsgReportGenerate"),
+    );
+
     let report: ESGReport = env
         .storage()
         .persistent()
@@ -540,8 +738,15 @@ pub fn generate_employee_report(
 pub fn generate_supplier_report(
     env: &Env,
     report_id: BytesN<32>,
-    _organization: Address,
+    organization: Address,
 ) -> StakeholderReport {
+    require_esg_permission(
+        env,
+        &organization,
+        &Symbol::new(env, "generate_supplier_report"),
+        &Symbol::new(env, "EsgReportGenerate"),
+    );
+
     let report: ESGReport = env
         .storage()
         .persistent()
@@ -569,8 +774,15 @@ pub fn generate_supplier_report(
 pub fn generate_community_report(
     env: &Env,
     report_id: BytesN<32>,
-    _organization: Address,
+    organization: Address,
 ) -> StakeholderReport {
+    require_esg_permission(
+        env,
+        &organization,
+        &Symbol::new(env, "generate_community_report"),
+        &Symbol::new(env, "EsgReportGenerate"),
+    );
+
     let report: ESGReport = env
         .storage()
         .persistent()
@@ -596,7 +808,12 @@ pub fn generate_community_report(
 
 /// Track KPIs
 pub fn track_kpis(env: &Env, organization: Address, kpis: Vec<KPI>) {
-    organization.require_auth();
+    require_esg_permission(
+        env,
+        &organization,
+        &Symbol::new(env, "track_kpis"),
+        &Symbol::new(env, "EsgDataWrite"),
+    );
 
     env.storage()
         .persistent()

@@ -332,3 +332,259 @@ class TestGetEvents:
         p = Page(items=[], total=0, offset=0, limit=50)
         assert p.items == []
         assert p.total == 0
+
+
+# ── Cursor-based paginated query tests (#862 / #867) ──────────────────────────
+
+MAX_PAGE_LIMIT = 100
+
+
+def _make_cursor_query_client(records):
+    """Build a bare client whose _invoke serves cursor-paginated queries.
+
+    ``records`` is a list of dicts with keys: id, timestamp, status, submitter.
+    """
+    _stub_stellar_sdk()
+    sys.modules.pop("audit_ledger.client", None)
+    from audit_ledger.client import AuditLedgerClient
+
+    client = AuditLedgerClient.__new__(AuditLedgerClient)
+    client.contract_id = "CTEST"
+    client.server = MagicMock()
+    client.source = None
+
+    def _invoke(method, params=None):
+        params = params or {}
+        if method not in ("query_finops_records", "query_cross_contract_records"):
+            return None
+        cursor = params.get("cursor")
+        limit = params.get("limit", 50)
+        limit = min(limit, MAX_PAGE_LIMIT)
+        ts_min = params.get("timestamp_min")
+        ts_max = params.get("timestamp_max")
+        status = params.get("status")
+        submitter = params.get("submitter")
+
+        # Deterministic ordering: (timestamp, id) ascending.
+        ordered = sorted(records, key=lambda r: (r["timestamp"], r["id"]))
+        filtered = []
+        for r in ordered:
+            if ts_min is not None and r["timestamp"] < ts_min:
+                continue
+            if ts_max is not None and r["timestamp"] > ts_max:
+                continue
+            if status is not None and r["status"] != status:
+                continue
+            if submitter is not None and r["submitter"] != submitter:
+                continue
+            filtered.append(r)
+
+        start = 0
+        if cursor is not None:
+            for i, r in enumerate(filtered):
+                if r["id"] == cursor:
+                    start = i + 1
+                    break
+            else:
+                start = len(filtered)
+
+        window = filtered[start:start + limit]
+        next_cursor = window[-1]["id"] if len(window) == limit and start + limit < len(filtered) else None
+        return {"items": window, "next_cursor": next_cursor}
+
+    client._invoke = MagicMock(side_effect=_invoke)
+    return client
+
+
+def _sample_records(n, statuses=("PENDING", "SETTLED"), submitters=("GAAA", "GBBB")):
+    return [
+        {
+            "id": f"rec-{i:04d}",
+            "timestamp": 1_700_000_000 + i,
+            "status": statuses[i % len(statuses)],
+            "submitter": submitters[i % len(submitters)],
+        }
+        for i in range(n)
+    ]
+
+
+class TestFinopsPaginatedQueries:
+    """Cursor-based pagination + filtering for the finops query binding (#862)."""
+
+    def _client(self, n=250):
+        return _make_cursor_query_client(_sample_records(n))
+
+    def _query(self, client, **kwargs):
+        return client.query_finops_records(**kwargs)
+
+    def test_empty_results(self):
+        client = _make_cursor_query_client([])
+        page = self._query(client)
+        assert page["items"] == []
+        assert page["next_cursor"] is None
+
+    def test_single_item_page(self):
+        client = self._client(1)
+        page = self._query(client, limit=1)
+        assert len(page["items"]) == 1
+        assert page["items"][0]["id"] == "rec-0000"
+        assert page["next_cursor"] is None
+
+    def test_cursor_past_end_returns_empty(self):
+        client = self._client(5)
+        page = self._query(client, cursor="does-not-exist")
+        assert page["items"] == []
+        assert page["next_cursor"] is None
+
+    def test_full_multi_page_traversal(self):
+        client = self._client(250)
+        seen = []
+        cursor = None
+        pages = 0
+        while True:
+            page = self._query(client, cursor=cursor, limit=50)
+            seen.extend(r["id"] for r in page["items"])
+            pages += 1
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        assert pages == 5
+        assert len(seen) == 250
+        assert len(set(seen)) == 250
+        assert seen == sorted(seen)
+
+    def test_page_limit_cap_enforced(self):
+        client = self._client(250)
+        page = self._query(client, limit=10_000)
+        assert len(page["items"]) <= MAX_PAGE_LIMIT
+
+    def test_filter_by_timestamp_range(self):
+        client = self._client(50)
+        lo = 1_700_000_010
+        hi = 1_700_000_019
+        page = self._query(client, timestamp_min=lo, timestamp_max=hi, limit=100)
+        assert len(page["items"]) == 10
+        assert all(lo <= r["timestamp"] <= hi for r in page["items"])
+
+    def test_filter_by_status(self):
+        client = self._client(50)
+        page = self._query(client, status="SETTLED", limit=100)
+        assert page["items"]
+        assert all(r["status"] == "SETTLED" for r in page["items"])
+
+    def test_filter_by_submitter(self):
+        client = self._client(50)
+        page = self._query(client, submitter="GBBB", limit=100)
+        assert page["items"]
+        assert all(r["submitter"] == "GBBB" for r in page["items"])
+
+    def test_combined_filters(self):
+        client = self._client(50)
+        page = self._query(
+            client,
+            timestamp_min=1_700_000_000,
+            timestamp_max=1_700_000_049,
+            status="PENDING",
+            submitter="GAAA",
+            limit=100,
+        )
+        assert all(
+            r["status"] == "PENDING" and r["submitter"] == "GAAA"
+            for r in page["items"]
+        )
+
+    def test_deterministic_ordering(self):
+        client = self._client(30)
+        first = self._query(client, limit=100)["items"]
+        second = self._query(client, limit=100)["items"]
+        assert [r["id"] for r in first] == [r["id"] for r in second]
+        assert [r["timestamp"] for r in first] == sorted(r["timestamp"] for r in first)
+
+
+class TestCrossContractPaginatedQueries:
+    """Cursor-based pagination + filtering for the cross-contract binding (#867)."""
+
+    def _client(self, n=250):
+        return _make_cursor_query_client(_sample_records(n))
+
+    def _query(self, client, **kwargs):
+        return client.query_cross_contract_records(**kwargs)
+
+    def test_empty_results(self):
+        client = _make_cursor_query_client([])
+        page = self._query(client)
+        assert page["items"] == []
+        assert page["next_cursor"] is None
+
+    def test_single_item_page(self):
+        client = self._client(1)
+        page = self._query(client, limit=1)
+        assert len(page["items"]) == 1
+        assert page["next_cursor"] is None
+
+    def test_cursor_past_end_returns_empty(self):
+        client = self._client(5)
+        page = self._query(client, cursor="nope")
+        assert page["items"] == []
+        assert page["next_cursor"] is None
+
+    def test_full_multi_page_traversal(self):
+        client = self._client(250)
+        seen = []
+        cursor = None
+        pages = 0
+        while True:
+            page = self._query(client, cursor=cursor, limit=50)
+            seen.extend(r["id"] for r in page["items"])
+            pages += 1
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        assert pages == 5
+        assert len(seen) == 250
+        assert len(set(seen)) == 250
+
+    def test_page_limit_cap_enforced(self):
+        client = self._client(250)
+        page = self._query(client, limit=10_000)
+        assert len(page["items"]) <= MAX_PAGE_LIMIT
+
+    def test_filter_by_timestamp_range(self):
+        client = self._client(50)
+        page = self._query(
+            client, timestamp_min=1_700_000_000, timestamp_max=1_700_000_004, limit=100
+        )
+        assert len(page["items"]) == 5
+
+    def test_filter_by_status(self):
+        client = self._client(50)
+        page = self._query(client, status="PENDING", limit=100)
+        assert page["items"]
+        assert all(r["status"] == "PENDING" for r in page["items"])
+
+    def test_filter_by_submitter(self):
+        client = self._client(50)
+        page = self._query(client, submitter="GAAA", limit=100)
+        assert page["items"]
+        assert all(r["submitter"] == "GAAA" for r in page["items"])
+
+    def test_combined_filters(self):
+        client = self._client(50)
+        page = self._query(
+            client,
+            timestamp_min=1_700_000_000,
+            timestamp_max=1_700_000_049,
+            status="SETTLED",
+            submitter="GBBB",
+            limit=100,
+        )
+        assert all(
+            r["status"] == "SETTLED" and r["submitter"] == "GBBB"
+            for r in page["items"]
+        )
+
+    def test_deterministic_ordering(self):
+        client = self._client(30)
+        first = self._query(client, limit=100)["items"]
+        second = self._query(client, limit=100)["items"]
+        assert [r["id"] for r in first] == [r["id"] for r in second]
