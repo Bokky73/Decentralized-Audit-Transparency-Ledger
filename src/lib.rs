@@ -16,6 +16,7 @@ pub mod disclosure;
 pub mod contract_event_privacy;
 pub mod data_sharing;
 pub mod tamper_evidence;
+pub mod rbac;
 pub mod compliance_validators;
 pub mod tax;
 pub mod vat_engine;
@@ -7296,3 +7297,6 @@ pub mod marketplace;
 
 #[cfg(test)]
 mod marketplace_tests;
+
+#[cfg(test)]
+mod cbdc_privacy_tests;
