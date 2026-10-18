@@ -871,4 +871,149 @@ proptest! {
             );
         }
     }
+
+    // ── State-machine invariants for ml_feature_store (issue #858) ───────────
+
+    #[test]
+    fn prop_feature_lineage_consistency_under_duplicates_and_reordering(
+        ops in random_feature_store_sequence_strategy()
+    ) {
+        let (env, owner, client) = create_feature_store();
+        run_feature_store_sequence(&env, &owner, &client, &ops);
+
+        // Invariant 1: lineage consistency — every stored feature's parent, if any,
+        // must exist and have a strictly smaller sequence number.
+        let total = client.total_features();
+        for i in 0..total {
+            let feature = client.get_feature_by_order(&i);
+            if let Some(parent_id) = feature.parent_id.clone() {
+                let parent = client.get_feature(&parent_id);
+                assert!(
+                    parent.sequence < feature.sequence,
+                    "parent sequence must precede child sequence"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prop_feature_hash_chain_integrity_after_recovery(
+        ops in random_feature_store_sequence_strategy()
+    ) {
+        let (env, owner, client) = create_feature_store();
+        run_feature_store_sequence(&env, &owner, &client, &ops);
+
+        // Invariant 2: hash-chain integrity must hold after simulated recovery
+        // (mid-batch rollbacks leave the chain in a verifiable state).
+        assert!(
+            client.verify_feature_integrity(),
+            "feature hash chain must remain valid after recovery"
+        );
+
+        let total = client.total_features();
+        if total >= 2 {
+            for i in 1..total {
+                let evt = client.get_feature_by_order(&i);
+                let prev = client.get_feature_by_order(&(i - 1));
+                assert_eq!(
+                    evt.prev_hash, prev.feature_hash,
+                    "feature[{i}].prev_hash must equal feature[{}].feature_hash",
+                    i - 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prop_no_duplicate_attestation_ids(ops in random_feature_store_sequence_strategy()) {
+        let (env, owner, client) = create_feature_store();
+        run_feature_store_sequence(&env, &owner, &client, &ops);
+
+        // Invariant 3: no duplicate attestation IDs may be recorded, even when
+        // duplicate submissions are replayed.
+        let total = client.total_attestations();
+        let mut seen: StdVec<BytesN<32>> = StdVec::new();
+        for i in 0..total {
+            let id = client.get_attestation_id_by_order(&i);
+            assert!(
+                !seen.iter().any(|v| v == &id),
+                "duplicate attestation id detected at index {i}"
+            );
+            seen.push(id);
+        }
+    }
+
+    #[test]
+    fn prop_duplicate_submissions_are_idempotent(
+        feature_id in any::<u64>(),
+        metadata in metadata_strategy()
+    ) {
+        let (env, owner, client) = create_feature_store();
+        env.ledger().set_timestamp(1000);
+
+        let first = client.try_submit_feature(
+            &owner,
+            &feature_id,
+            &bytes(&env, &metadata),
+            &None,
+        );
+        let second = client.try_submit_feature(
+            &owner,
+            &feature_id,
+            &bytes(&env, &metadata),
+            &None,
+        );
+
+        // A duplicate submission must not create a second feature entry.
+        if first.is_ok() && second.is_ok() {
+            assert_eq!(
+                client.total_features(),
+                1,
+                "duplicate submission must not append a new feature"
+            );
+        }
+    }
+
+    #[test]
+    fn prop_out_of_order_timestamps_preserve_chain(
+        ops in random_feature_store_sequence_strategy()
+    ) {
+        let (env, owner, client) = create_feature_store();
+        run_feature_store_sequence(&env, &owner, &client, &ops);
+
+        // Even with out-of-order timestamps, the chain must remain verifiable
+        // and sequence numbers must be strictly monotonic.
+        assert!(client.verify_feature_integrity());
+        let total = client.total_features();
+        let mut prev_seq = 0u64;
+        for i in 0..total {
+            let feature = client.get_feature_by_order(&i);
+            assert!(
+                feature.sequence >= prev_seq,
+                "sequence numbers must be non-decreasing"
+            );
+            prev_seq = feature.sequence;
+        }
+    }
+
+    #[test]
+    fn prop_mid_batch_rollback_leaves_consistent_state(
+        ops in random_feature_store_sequence_strategy()
+    ) {
+        let (env, owner, client) = create_feature_store();
+        run_feature_store_sequence(&env, &owner, &client, &ops);
+
+        // After a simulated mid-batch rollback, the store must still satisfy
+        // the aggregate accounting invariant.
+        let total = client.total_features();
+        let mut sum = 0u32;
+        for i in 0..total {
+            let feature = client.get_feature_by_order(&i);
+            sum = sum.saturating_add(client.feature_count(&feature.feature_type));
+        }
+        assert_eq!(
+            total, sum,
+            "total_features must equal sum of per-type counts after rollback"
+        );
+    }
 }

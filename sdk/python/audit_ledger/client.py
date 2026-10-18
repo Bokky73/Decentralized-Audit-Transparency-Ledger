@@ -16,9 +16,14 @@ from typing import Any, Dict, Generator, List, Optional, Sequence
 from .batch import BatchResult, BatchSubmitRequest, batch_get, batch_submit, batch_verify
 from .cache import CacheConfig, LRUCache
 from .models import Address, Event, EventId, EventType, Metadata, Page, ContractError, RPCError
-
-MAX_PAGE_LIMIT = 100
-"""Hard cap on the number of items returned by any paginated query."""
+from .pagination import (
+    MAX_PAGE_LIMIT,
+    PageCursor,
+    PageLimit,
+    clamp_limit,
+    decode_cursor,
+    encode_cursor,
+)
 
 
 def _encode_cursor(cursor: Optional[str]) -> Optional[str]:
@@ -360,7 +365,7 @@ class AuditLedgerClient:
                 yield item
             if not page.next_cursor:
                 break
-            cursor = page.next_cursor
+            cursor = page.next_cursor if isinstance(page.next_cursor, str) else getattr(page.next_cursor, "value", None)
 
     def iter_cross_contract(
         self,
@@ -386,7 +391,144 @@ class AuditLedgerClient:
                 yield item
             if not page.next_cursor:
                 break
-            cursor = page.next_cursor
+            cursor = page.next_cursor if isinstance(page.next_cursor, str) else getattr(page.next_cursor, "value", None)
+
+    def query_events(
+        self,
+        cursor: Optional[str] = None,
+        limit: int = 50,
+        *,
+        from_timestamp: Optional[int] = None,
+        to_timestamp: Optional[int] = None,
+        status: Optional[int] = None,
+        submitter: Optional[Address] = None,
+    ) -> Page[Event]:
+        """Cursor-based paginated query over events with multi-predicate filtering.
+
+        Mirrors the ``query_events`` binding in ``src/cbdc_privacy.rs``. The
+        ``limit`` is clamped to :data:`MAX_PAGE_LIMIT` (100). Results are ordered
+        deterministically by ledger order (ascending), which stays stable across
+        ledger upgrades and archival restores.
+
+        Returns a :class:`Page` whose ``next_cursor`` is ``None`` when the final
+        page has been reached.
+        """
+        safe_limit = clamp_limit(limit)
+        start = decode_cursor(cursor) if cursor is not None else 0
+        total = self.total_events()
+        items: List[Event] = []
+        idx = start
+        while idx < total and len(items) < safe_limit:
+            event = self.get_event_by_order(idx)
+            idx += 1
+            if not self._matches_filters(
+                event,
+                from_timestamp=from_timestamp,
+                to_timestamp=to_timestamp,
+                status=status,
+                submitter=submitter,
+            ):
+                continue
+            items.append(event)
+        next_cursor = encode_cursor(idx) if idx < total else None
+        return Page(
+            items=items,
+            total=total,
+            offset=start,
+            limit=safe_limit,
+            next_cursor=next_cursor,
+        )
+
+    def query_events_by_type(
+        self,
+        event_type: EventType,
+        cursor: Optional[str] = None,
+        limit: int = 50,
+        *,
+        from_timestamp: Optional[int] = None,
+        to_timestamp: Optional[int] = None,
+        status: Optional[int] = None,
+        submitter: Optional[Address] = None,
+    ) -> Page[Event]:
+        """Cursor-based paginated query restricted to a single event type."""
+        safe_limit = clamp_limit(limit)
+        start = decode_cursor(cursor) if cursor is not None else 0
+        total = self.event_count(event_type)
+        items: List[Event] = []
+        idx = start
+        while idx < total and len(items) < safe_limit:
+            event = self.get_event_by_type(event_type, idx)
+            idx += 1
+            if not self._matches_filters(
+                event,
+                from_timestamp=from_timestamp,
+                to_timestamp=to_timestamp,
+                status=status,
+                submitter=submitter,
+            ):
+                continue
+            items.append(event)
+        next_cursor = encode_cursor(idx) if idx < total else None
+        return Page(
+            items=items,
+            total=total,
+            offset=start,
+            limit=safe_limit,
+            next_cursor=next_cursor,
+        )
+
+    def iter_events(
+        self,
+        limit: int = 50,
+        *,
+        from_timestamp: Optional[int] = None,
+        to_timestamp: Optional[int] = None,
+        status: Optional[int] = None,
+        submitter: Optional[Address] = None,
+    ) -> Generator[Event, None, None]:
+        """Yield every event matching the filters, traversing all pages."""
+        cursor: Optional[str] = None
+        while True:
+            page = self.query_events(
+                cursor=cursor,
+                limit=limit,
+                from_timestamp=from_timestamp,
+                to_timestamp=to_timestamp,
+                status=status,
+                submitter=submitter,
+            )
+            for event in page.items:
+                yield event
+            if page.next_cursor is None:
+                break
+            cursor = page.next_cursor if isinstance(page.next_cursor, str) else getattr(page.next_cursor, "value", None)
+
+    @staticmethod
+    def _matches_filters(
+        event: Event,
+        *,
+        from_timestamp: Optional[int] = None,
+        to_timestamp: Optional[int] = None,
+        status: Optional[int] = None,
+        submitter: Optional[Address] = None,
+    ) -> bool:
+        if from_timestamp is not None:
+            ts = getattr(event, "timestamp", None)
+            if ts is None or ts < from_timestamp:
+                return False
+        if to_timestamp is not None:
+            ts = getattr(event, "timestamp", None)
+            if ts is None or ts > to_timestamp:
+                return False
+        if status is not None:
+            ev_status = getattr(event, "status", None)
+            if ev_status is None or ev_status != status:
+                return False
+        if submitter is not None:
+            ev_submitter = getattr(event, "submitter", None)
+            if ev_submitter is None or ev_submitter != submitter:
+                return False
+        return True
 
     def health_check(self) -> Dict[str, Any]:
         status: Dict[str, Any] = {

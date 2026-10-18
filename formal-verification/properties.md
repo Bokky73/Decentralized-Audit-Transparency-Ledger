@@ -426,6 +426,144 @@ rollbacks, and concurrent multi-actor access.
 
 ---
 
+## ML Feature Store Properties (`src/ml_feature_store.rs`)
+
+These properties cover the on-chain ML feature vector lineage and hash-anchoring
+module. They are exercised by the property-based suite in `src/proptest.rs`, the
+multi-actor concurrency suite in `src/concurrent_tests.rs`, and the
+fault-injection scenarios described below. Each property is stated as a state
+machine invariant over the abstract state
+`(features, anchors, merkle_roots, nonces, total_features)`.
+
+### MFS-01 — Feature Registration Idempotence Under Duplicate Submission
+
+| Field | Value |
+|-------|-------|
+| **Category** | safety |
+| **Description** | Submitting the same feature vector (identical `feature_id` and `feature_hash`) more than once must not create a second stored entry nor advance `total_features` a second time. The duplicate submission either reverts or is a no-op; in both cases the post-state equals the pre-state. |
+| **Invariant** | `register(fv); register(fv) ⇒ state_after == state_after_first_register` |
+| **Fault Scenario** | Duplicate submissions (same actor, repeated call; distinct actors, identical payload) |
+| **CVL Rule** | `featureRegistrationIdempotent` |
+| **K Claim** | — (pending) |
+| **Status** | 🔲 Pending |
+
+---
+
+### MFS-02 — Monotone Feature Counter
+
+| Field | Value |
+|-------|-------|
+| **Category** | safety |
+| **Description** | `total_features` is a monotone non-decreasing counter. No operation, including rollback of a partially applied batch, may decrease it. Each accepted, non-duplicate registration increments it by exactly 1. |
+| **Invariant** | `total_features' >= total_features ∧ (accepted ∧ ¬duplicate ⇒ total_features' == total_features + 1)` |
+| **Fault Scenario** | Mid-batch rollback, duplicate submissions |
+| **CVL Rule** | `totalFeaturesMonotone` |
+| **K Claim** | — (pending) |
+| **Status** | 🔲 Pending |
+
+---
+
+### MFS-03 — Out-of-Order Timestamp Rejection
+
+| Field | Value |
+|-------|-------|
+| **Category** | safety |
+| **Description** | A feature vector whose `timestamp` is strictly less than the timestamp of the most recently accepted vector for the same lineage must be rejected. Reordered events therefore cannot rewrite history; the accepted sequence of timestamps per lineage is non-decreasing. |
+| **Invariant** | `∀ lineage: timestamps(lineage) is non-decreasing` |
+| **Fault Scenario** | Out-of-order timestamps (shuffled event delivery, clock skew) |
+| **CVL Rule** | `timestampMonotonePerLineage` |
+| **K Claim** | — (pending) |
+| **Status** | 🔲 Pending |
+
+---
+
+### MFS-04 — Merkle Root Determinism and Proof Integrity
+
+| Field | Value |
+|-------|-------|
+| **Category** | safety |
+| **Description** | For a fixed set of anchored feature hashes, the computed Merkle root is deterministic and independent of insertion order. Every generated Merkle proof verifies against the stored root, and any single-bit mutation of a leaf or of the root causes verification to fail. |
+| **Invariant** | `root(perm(leaves)) == root(leaves) ∧ verify(proof(leaf), root) ∧ ¬verify(proof(leaf'), root) for leaf' ≠ leaf` |
+| **Fault Scenario** | Merkle proof and hash-chain integrity after simulated recovery |
+| **CVL Rule** | `merkleRootDeterministic`, `merkleProofSound` |
+| **K Claim** | — (pending) |
+| **Status** | 🔲 Pending |
+
+---
+
+### MFS-05 — Hash-Chain Linkage Across Anchors
+
+| Field | Value |
+|-------|-------|
+| **Category** | safety |
+| **Description** | For every anchor at position `n > 0`, `anchors[n].prev_hash == anchors[n-1].anchor_hash`. The genesis anchor has `prev_hash == [0x00; 32]`. After simulated recovery (replay of the accepted prefix), the recomputed chain is byte-for-byte identical to the stored chain. |
+| **Invariant** | `∀ n > 0: anchors[n].prev_hash == anchors[n-1].anchor_hash ∧ recovery(prefix) == stored_chain` |
+| **Fault Scenario** | Mid-batch rollback, hash-chain integrity after simulated recovery |
+| **CVL Rule** | `anchorHashChainIntegrity`, `recoveryPreservesChain` |
+| **K Claim** | — (pending) |
+| **Status** | 🔲 Pending |
+
+---
+
+### MFS-06 — Mid-Batch Rollback Atomicity
+
+| Field | Value |
+|-------|-------|
+| **Category** | safety |
+| **Description** | If a batch registration fails partway through (e.g. one element violates MFS-03 or a cap), the entire batch is rolled back: no feature, anchor, Merkle root, or nonce from that batch is persisted. The post-state equals the pre-state of the batch. |
+| **Invariant** | `batch_fails ⇒ state_after == state_before_batch` |
+| **Fault Scenario** | Mid-batch rollbacks (injected failure at every position of the batch) |
+| **CVL Rule** | `batchRollbackAtomic` |
+| **K Claim** | — (pending) |
+| **Status** | 🔲 Pending |
+
+---
+
+### MFS-07 — Nonce Strictly Monotone Per Submitter
+
+| Field | Value |
+|-------|-------|
+| **Category** | safety |
+| **Description** | For each submitter address, the stored nonce strictly increases with every accepted registration. Replay of a previously accepted submission under the same nonce is rejected. |
+| **Invariant** | `∀ addr: nonces(addr) strictly increases per accepted registration` |
+| **Fault Scenario** | Duplicate submissions, reordered events |
+| **CVL Rule** | `featureNonceStrictlyMonotone` |
+| **K Claim** | — (pending) |
+| **Status** | 🔲 Pending |
+
+---
+
+### MFS-08 — Concurrent Access Linearizability
+
+| Field | Value |
+|-------|-------|
+| **Category** | safety |
+| **Description** | Under concurrent access by multiple actors, the observed final state is equivalent to some sequential ordering of the accepted operations. No interleaving may produce a state that violates MFS-01 through MFS-07. |
+| **Invariant** | `∃ sequential order σ: concurrent_execution ≡ σ` |
+| **Fault Scenario** | Multi-actor concurrent access (`src/concurrent_tests.rs`) |
+| **CVL Rule** | — (in-Rust concurrency suite; formal spec pending) |
+| **K Claim** | — |
+| **Status** | 🔲 Pending |
+
+---
+
+## Fault-Injection Scenarios
+
+The following fault-injection scenarios are simulated by the test suite and must
+leave all MFS invariants intact:
+
+| ID | Scenario | Injection Point | Expected Outcome |
+|----|----------|-----------------|------------------|
+| FI-01 | Duplicate submission (same actor) | Repeated `register` with identical payload | Rejected or no-op; state unchanged (MFS-01) |
+| FI-02 | Duplicate submission (distinct actors) | Two actors submit identical payload | Exactly one accepted; counter advances once (MFS-01, MFS-07) |
+| FI-03 | Out-of-order timestamps | Shuffled delivery of a valid sequence | Reordered events rejected; accepted timestamps non-decreasing (MFS-03) |
+| FI-04 | Mid-batch rollback | Failure injected at position `k` of an `n`-element batch, for all `k` | Full rollback; post-state == pre-state (MFS-06) |
+| FI-05 | Recovery replay | Replay accepted prefix after simulated crash | Recomputed Merkle root and hash chain identical to stored (MFS-04, MFS-05) |
+| FI-06 | Leaf tampering | Single-bit mutation of an anchored leaf | Merkle proof verification fails (MFS-04) |
+| FI-07 | Concurrent interleaving | Randomized interleaving of multi-actor operations | Final state linearizable; no invariant violation (MFS-08) |
+
+---
+
 ## Verification Coverage Summary
 
 | Category | Total | Verified ✅ | Partial 🔶 | Pending 🔲 |
@@ -433,7 +571,8 @@ rollbacks, and concurrent multi-actor access.
 | safety | 27 | 9 | 8 | 10 |
 | access-control | 5 | 5 | 0 | 0 |
 | liveness | 1 | 0 | 1 | 0 |
-| **Total** | **33** | **14** | **9** | **10** |
+| ml-feature-store | 8 | 0 | 0 | 8 |
+| **Total** | **41** | **14** | **9** | **18** |
 
 ---
 

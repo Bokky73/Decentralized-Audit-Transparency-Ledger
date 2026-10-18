@@ -7159,11 +7159,21 @@ pub mod cbdc_interop;
 pub mod cbdc_offline;
 pub mod cbdc_privacy;
 
+// Cursor-based pagination & filtered batch queries for the CBDC privacy guard
+// (issue #852). Re-exported so SDK bindings and tests can reach the pagination
+// types and query entrypoints without a fully-qualified module path.
+pub use cbdc_privacy::{
+    PageCursor, PageLimit, QueryFilter, PaginatedQueryResult, CbdcPrivacyQuery, CbdcPrivacyQueryClient,
+};
+
 // Governance dashboard types & audit trail (issue #365 governance UI).
 pub mod governance_dashboard;
 
 #[cfg(test)]
 mod cbdc_tests;
+
+#[cfg(test)]
+mod cbdc_privacy_pagination_tests;
 
 
 // SupTech Integration Modules
@@ -7185,6 +7195,9 @@ pub mod sandbox_env;
 pub mod sandbox_supervision;
 pub mod sandbox_innovation;
 pub mod sandbox_graduation;
+
+// On-chain ML feature vector lineage and hash anchoring (issue #856, #858).
+pub mod ml_feature_store;
 
 // FinOps Module
 pub mod finops;
@@ -7209,6 +7222,18 @@ mod issue365_368_tests;
 
 #[cfg(test)]
 mod rbac_regression_coverage_tests;
+
+// RBAC gating integration tests for state-mutating entrypoints (issue #875).
+#[cfg(test)]
+mod rbac_gating_tests;
+
+// Property-based invariant tests for the ML feature store (issue #858).
+#[cfg(test)]
+mod proptest;
+
+// Multi-actor concurrency and fault-injection tests for the ML feature store (issue #858).
+#[cfg(test)]
+mod concurrent_tests;
 
 pub mod notifications;
 

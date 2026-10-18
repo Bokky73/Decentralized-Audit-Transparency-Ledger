@@ -73,6 +73,38 @@ export interface AuditLedgerClientOptions {
   validation?: ValidatorOptions | false;
 }
 
+/** Maximum number of items a single paginated query may return (#852). */
+export const MAX_PAGE_LIMIT = 100;
+
+/** Opaque cursor token returned by paginated queries (#852). */
+export type PageCursor = string | null;
+
+/** Filter options shared by the paginated CBDC privacy queries (#852). */
+export interface PageFilterOptions {
+  /** Inclusive lower bound on ledger timestamp. */
+  startTimestamp?: number;
+  /** Inclusive upper bound on ledger timestamp. */
+  endTimestamp?: number;
+  /** Status enum value to filter by. */
+  status?: string;
+  /** Submitter address to filter by. */
+  submitter?: string;
+}
+
+/** Options accepted by paginated query methods (#852). */
+export interface PageQueryOptions extends PageFilterOptions {
+  /** Opaque cursor from a previous page; omit or pass null for the first page. */
+  cursor?: PageCursor;
+  /** Requested page size; clamped to MAX_PAGE_LIMIT. */
+  limit?: number;
+}
+
+/** A single page of results plus the cursor for the next page (#852). */
+export interface Page<T> {
+  items: T[];
+  next_cursor: PageCursor;
+}
+
 export class AuditLedgerClient {
   transport: Transport;
   contractId?: string;
@@ -464,6 +496,80 @@ export class AuditLedgerClient {
     limit: number,
   ): Promise<Event[]> {
     return this.callTransport('get_events_by_time_range', [startTime, endTime, offset, limit]);
+  }
+
+  // ── #852 — Cursor-based pagination & filtered batch queries ─────────────
+
+  /** Clamp a requested page limit to the enforced maximum. */
+  private clampPageLimit(limit?: number): number {
+    if (limit === undefined || !Number.isFinite(limit)) return this.maxPageSize;
+    return Math.max(1, Math.min(Math.floor(limit), MAX_PAGE_LIMIT, this.maxPageSize));
+  }
+
+  /** Normalize filter options into the wire representation expected by the contract. */
+  private buildPageParams(options: PageQueryOptions): unknown[] {
+    const params: unknown[] = [options.cursor ?? null, this.clampPageLimit(options.limit)];
+    const filter: Record<string, unknown> = {};
+    if (options.startTimestamp !== undefined) filter.start_timestamp = options.startTimestamp;
+    if (options.endTimestamp !== undefined) filter.end_timestamp = options.endTimestamp;
+    if (options.status !== undefined) filter.status = options.status;
+    if (options.submitter !== undefined) filter.submitter = options.submitter;
+    params.push(filter);
+    return params;
+  }
+
+  /** Normalize a raw transport response into a `Page<T>`. */
+  private normalizePage<T>(raw: unknown): Page<T> {
+    if (Array.isArray(raw)) {
+      return { items: raw as T[], next_cursor: null };
+    }
+    const obj = (raw ?? {}) as { items?: T[]; next_cursor?: PageCursor };
+    return {
+      items: Array.isArray(obj.items) ? obj.items : [],
+      next_cursor: obj.next_cursor ?? null,
+    };
+  }
+
+  /** Paginated, filtered query over CBDC privacy records (#852). */
+  async queryPrivacyRecords<T = Event>(options: PageQueryOptions = {}): Promise<Page<T>> {
+    const raw = await this.callTransport<unknown>('query_privacy_records', this.buildPageParams(options));
+    return this.normalizePage<T>(raw);
+  }
+
+  /** Paginated, filtered query over disclosure requests (#852). */
+  async queryDisclosureRequests<T = Event>(options: PageQueryOptions = {}): Promise<Page<T>> {
+    const raw = await this.callTransport<unknown>('query_disclosure_requests', this.buildPageParams(options));
+    return this.normalizePage<T>(raw);
+  }
+
+  /** Paginated, filtered query over anonymity-tier records (#852). */
+  async queryAnonymityTiers<T = Event>(options: PageQueryOptions = {}): Promise<Page<T>> {
+    const raw = await this.callTransport<unknown>('query_anonymity_tiers', this.buildPageParams(options));
+    return this.normalizePage<T>(raw);
+  }
+
+  /**
+   * Traverse every page of a paginated query, invoking `onPage` for each page.
+   * Stops when `next_cursor` is null/undefined or when `maxPages` is reached.
+   */
+  async traversePrivacyRecords<T = Event>(
+    options: PageQueryOptions = {},
+    onPage: (page: Page<T>) => void | Promise<void>,
+    maxPages = Number.MAX_SAFE_INTEGER,
+  ): Promise<{ pages: number; items: number }> {
+    let cursor: PageCursor = options.cursor ?? null;
+    let pages = 0;
+    let items = 0;
+    for (;;) {
+      const page = await this.queryPrivacyRecords<T>({ ...options, cursor });
+      await onPage(page);
+      pages += 1;
+      items += page.items.length;
+      if (page.next_cursor === null || page.next_cursor === undefined) break;
+      cursor = page.next_cursor;
+      if (pages >= maxPages) break;
+    }
+    return { pages, items };
   }
 
   // ── Event replay (issue #238) ─────────────────────────────────────────

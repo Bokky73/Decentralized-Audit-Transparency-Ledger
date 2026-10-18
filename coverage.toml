@@ -176,8 +176,9 @@ description = "Carbon credit issuance, retirement, and market types"
 [[module]]
 name = "esg_reporting"
 path_prefix = "src/esg_reporting.rs"
-line = 60.0
-description = "ESG metrics collection and report generation"
+line = 75.0
+branch = 65.0
+description = "ESG metrics collection and report generation — RBAC-gated mutations with tamper-evident audit events (issue #875)"
 
 # ─ Tax & VAT ─────────────────────────────────────────────────────────────────
 [[module]]
@@ -335,7 +336,7 @@ name = "cbdc_privacy"
 path_prefix = "src/cbdc_privacy.rs"
 line = 90.0
 branch = 90.0
-description = "CBDC tiered anonymity and selective disclosure guard — hardened against overflow and unbounded growth (issue #849)"
+description = "CBDC privacy features — tiered anonymity, selective disclosure, cursor-based pagination, filtered batch queries, hardened against overflow and unbounded growth (issues #849, #852)"
 
 [[module]]
 name = "cbdc_interop"
@@ -526,6 +527,13 @@ name = "reputation_system"
 path_prefix = "src/reputation_system.rs"
 line = 50.0
 description = "On-chain reputation scoring"
+
+[[module]]
+name = "ml_feature_store"
+path_prefix = "src/ml_feature_store.rs"
+line = 90.0
+branch = 90.0
+description = "On-chain ML feature vector lineage and hash anchoring — invariant and chaos resilience suite (issue #858)"
 
 [[module]]
 name = "privacy_metrics"

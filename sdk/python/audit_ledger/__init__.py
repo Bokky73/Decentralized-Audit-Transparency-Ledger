@@ -22,6 +22,15 @@ Public API
 - :func:`batch_get`           — free-function batch retrieval (#245).
 - :func:`batch_verify`        — free-function batch verification (#245).
 
+Pagination (#852)
+~~~~~~~~~~~~~~~~~
+- :class:`PageCursor`         — opaque cursor token for deterministic pagination.
+- :class:`PageLimit`          — page size cap (max 100 items).
+- :class:`QueryFilter`        — multi-predicate query filter.
+- :func:`paginate`            — apply cursor/limit to a collection.
+- :func:`query_paginated`     — filtered, cursor-based query helper.
+- :func:`iter_pages`          — full multi-page traversal generator.
+
 Social impact
 ~~~~~~~~~~~~~
 - :class:`SocialImpactMetrics`        — on-chain social impact snapshot model.
@@ -92,6 +101,14 @@ from .confidential import (
     ConfidentialEventPayload,
     ConfidentialMetadataHelper,
 )
+from .pagination import (
+    PageCursor,
+    PageLimit,
+    QueryFilter,
+    paginate,
+    query_paginated,
+    iter_pages,
+)
 
 
 
@@ -112,6 +129,13 @@ __all__ = [
     # Models
     "Event",
     "Page",
+    # Pagination (#852)
+    "PageCursor",
+    "PageLimit",
+    "QueryFilter",
+    "paginate",
+    "query_paginated",
+    "iter_pages",
     # Contract event collaboration (issue #431)
     "CRDTOperation",
     "EventCRDT",

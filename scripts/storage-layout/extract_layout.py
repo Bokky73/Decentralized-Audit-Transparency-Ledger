@@ -300,9 +300,6 @@ def parse_variants(block: str) -> list:
         # Determine tombstone status
         tombstone = any(kw in comment.lower() for kw in TOMBSTONE_KEYWORDS)
 
-        # Determine storage tier classification
-        tier = classify_tier(name, comment)
-
         # Match variant patterns:
         # Unit:   Name
         # Tuple:  Name(T1, T2, ...)
@@ -312,6 +309,7 @@ def parse_variants(block: str) -> list:
         struct_match = re.match(r"^([A-Za-z][A-Za-z0-9_]*)\s*\{(.+)\}$", variant_text, re.DOTALL)
         if struct_match:
             name = struct_match.group(1)
+            tier = classify_tier(name, comment)
             inner = struct_match.group(2)
             fields = parse_fields_struct(inner)
             variants.append({
@@ -334,6 +332,7 @@ def parse_variants(block: str) -> list:
         tuple_match = re.match(r"^([A-Za-z][A-Za-z0-9_]*)\s*\((.+)\)$", variant_text, re.DOTALL)
         if tuple_match:
             name = tuple_match.group(1)
+            tier = classify_tier(name, comment)
             inner = tuple_match.group(2)
             fields = parse_fields_tuple(inner)
             variants.append({
@@ -356,6 +355,7 @@ def parse_variants(block: str) -> list:
         unit_match = re.match(r"^([A-Za-z][A-Za-z0-9_]*)$", variant_text)
         if unit_match:
             name = unit_match.group(1)
+            tier = classify_tier(name, comment)
             variants.append({
                 "ordinal": ordinal,
                 "name": name,

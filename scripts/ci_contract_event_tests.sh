@@ -72,7 +72,11 @@ export RUST_TEST_THREADS=1
 # generated sequences (duplicate submissions, out-of-order timestamps,
 # mid-batch rollbacks) are reproducible across CI runs and shards.
 export SUPPLY_CHAIN_TEST_SEED="${SUPPLY_CHAIN_TEST_SEED:-0x5EEDC0DE}"
+# Deterministic seeds for the ML feature store invariant/chaos suite so that
+# property-based and fault-injection runs are reproducible across CI shards.
 export PROPTEST_CASES="${PROPTEST_CASES:-1024}"
+export PROPTEST_MAX_SHRINK_ITERS="${PROPTEST_MAX_SHRINK_ITERS:-4096}"
+export ML_FEATURE_STORE_CHAOS_SEED="${ML_FEATURE_STORE_CHAOS_SEED:-0x5eed}"
 
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/shard-${SHARD_INDEX}.log"
@@ -88,6 +92,11 @@ PINNED_TEST_TARGETS=(
   "supply_chain_chaos"
   "concurrent_tests"
 )
+
+# Test target that exercises src/ml_feature_store.rs invariants, concurrency and
+# fault injection. It is pinned to shard 0 so the coverage gate always runs it.
+ML_FEATURE_STORE_TEST_TARGET="${ML_FEATURE_STORE_TEST_TARGET:-ml_feature_store_invariants}"
+ML_FEATURE_STORE_TEST_SHARD="${ML_FEATURE_STORE_TEST_SHARD:-0}"
 
 list_tests() {
   local output
@@ -214,6 +223,23 @@ if (( ${#shard_tests[@]} == 0 )); then
 fi
 
 echo "Running ${#shard_tests[@]} tests for shard $SHARD_INDEX/$TOTAL_SHARDS" | tee -a "$LOG_FILE"
+
+run_ml_feature_store_suite() {
+  if (( SHARD_INDEX != ML_FEATURE_STORE_TEST_SHARD )); then
+    return 0
+  fi
+
+  echo "=== ${ML_FEATURE_STORE_TEST_TARGET} (shard ${SHARD_INDEX}/${TOTAL_SHARDS}) ===" | tee -a "$LOG_FILE"
+  if "$CARGO_BIN" test --test "$ML_FEATURE_STORE_TEST_TARGET" -- --nocapture --test-threads=1 >> "$LOG_FILE" 2>&1; then
+    echo "PASS: ${ML_FEATURE_STORE_TEST_TARGET}" | tee -a "$LOG_FILE"
+    return 0
+  fi
+
+  echo "FAIL: ${ML_FEATURE_STORE_TEST_TARGET}" | tee -a "$LOG_FILE"
+  return 1
+}
+
+run_ml_feature_store_suite || exit 1
 
 run_test_with_retry() {
   local test_name="$1"

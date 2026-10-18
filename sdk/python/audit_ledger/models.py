@@ -4,7 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Generic, List, Optional, TypeVar
+from typing import Any, Dict, Generic, List, Optional, TypeVar, Union
+
+# ---------------------------------------------------------------------------
+# Pagination constants (#852)
+# ---------------------------------------------------------------------------
+
+MAX_PAGE_LIMIT = 100
+"""Hard cap on the number of items returned by a single paginated query."""
+
+DEFAULT_PAGE_LIMIT = 20
+"""Default page size used when the caller does not supply a limit."""
 
 # ---------------------------------------------------------------------------
 # Type aliases (#243)
@@ -27,9 +37,6 @@ ErrorCode = int
 
 T = TypeVar("T")
 
-#: Hard upper bound on the number of items a single page may contain.
-MAX_PAGE_LIMIT = 100
-
 
 # ---------------------------------------------------------------------------
 # Cursor-based pagination primitives (#862, #867)
@@ -46,9 +53,17 @@ class PageCursor:
 
     Attributes:
         value: Opaque cursor token; ``None`` starts from the beginning.
+        token: Alias for ``value``.
     """
 
     value: Optional[str] = None
+    token: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.value is None and self.token is not None:
+            object.__setattr__(self, "value", self.token)
+        elif self.token is None and self.value is not None:
+            object.__setattr__(self, "token", self.value)
 
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, object]]) -> "PageCursor":
@@ -62,12 +77,12 @@ class PageCursor:
         """
         if not d:
             return cls()
-        raw = d.get("value")
+        raw = d.get("value") if "value" in d else d.get("cursor")
         return cls(value=None if raw is None else str(raw))
 
     def to_dict(self) -> Dict[str, object]:
         """Serialise the cursor for an RPC request payload."""
-        return {"value": self.value}
+        return {"value": self.value, "cursor": self.value}
 
 
 @dataclass(frozen=True)
@@ -79,7 +94,7 @@ class PageLimit:
             ``[1, MAX_PAGE_LIMIT]``.
     """
 
-    value: int = MAX_PAGE_LIMIT
+    value: int = DEFAULT_PAGE_LIMIT
 
     def __post_init__(self) -> None:
         if self.value < 1:
@@ -92,13 +107,14 @@ class PageLimit:
     @classmethod
     def from_dict(cls, d: Optional[Dict[str, object]]) -> "PageLimit":
         """Build a limit from a raw contract-response dict."""
-        if not d or d.get("value") is None:
+        if not d or (d.get("value") is None and d.get("limit") is None):
             return cls()
-        return cls(value=int(d["value"]))  # type: ignore[arg-type]
+        raw = d.get("value") if "value" in d else d.get("limit")
+        return cls(value=int(raw))  # type: ignore[arg-type]
 
     def to_dict(self) -> Dict[str, object]:
         """Serialise the limit for an RPC request payload."""
-        return {"value": self.value}
+        return {"value": self.value, "limit": self.value}
 
 
 class QueryStatus(str, Enum):
@@ -197,10 +213,12 @@ class Page(Generic[T]):
         total: Total number of items available (legacy offset pagination).
         offset: Zero-based index of the first item on this page (legacy).
         limit: Maximum number of items requested per page.
+        next_cursor: Opaque cursor token for fetching the next page, or
+            ``None`` when this is the last page.
     """
 
     items: List[T]
-    next_cursor: Optional[PageCursor] = None
+    next_cursor: Optional[Union[PageCursor, str]] = None
     total: int = 0
     offset: int = 0
     limit: int = MAX_PAGE_LIMIT
@@ -235,11 +253,13 @@ class Page(Generic[T]):
                 items.append(raw)  # type: ignore[arg-type]
 
         raw_cursor = d.get("next_cursor")
-        next_cursor: Optional[PageCursor]
+        next_cursor: Optional[Union[PageCursor, str]]
         if raw_cursor is None or raw_cursor == "":
             next_cursor = None
         elif isinstance(raw_cursor, dict):
             next_cursor = PageCursor.from_dict(raw_cursor)
+        elif isinstance(raw_cursor, PageCursor):
+            next_cursor = raw_cursor
         else:
             next_cursor = PageCursor(value=str(raw_cursor))
 
@@ -250,6 +270,44 @@ class Page(Generic[T]):
             offset=int(d.get("offset", 0)),  # type: ignore[arg-type]
             limit=int(d.get("limit", MAX_PAGE_LIMIT)),  # type: ignore[arg-type]
         )
+
+
+# ---------------------------------------------------------------------------
+# Multi-predicate event filtering (#852)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EventFilter:
+    """Multi-predicate filter for paginated event queries.
+
+    All predicates are optional; ``None`` means "no constraint".  When
+    several are supplied they are combined with logical AND.
+
+    Attributes:
+        start_timestamp: Inclusive lower bound on the ledger timestamp.
+        end_timestamp: Inclusive upper bound on the ledger timestamp.
+        status: Optional status enum value (e.g. ``"active"``).
+        submitter: Optional Stellar address of the event submitter.
+    """
+
+    start_timestamp: Optional[int] = None
+    end_timestamp: Optional[int] = None
+    status: Optional[str] = None
+    submitter: Optional[Address] = None
+
+    def to_dict(self) -> Dict[str, object]:
+        """Serialise only the predicates that were actually supplied."""
+        result: Dict[str, object] = {}
+        if self.start_timestamp is not None:
+            result["start_timestamp"] = self.start_timestamp
+        if self.end_timestamp is not None:
+            result["end_timestamp"] = self.end_timestamp
+        if self.status is not None:
+            result["status"] = self.status
+        if self.submitter is not None:
+            result["submitter"] = self.submitter
+        return result
 
 
 # ---------------------------------------------------------------------------

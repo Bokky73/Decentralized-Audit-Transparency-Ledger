@@ -60,18 +60,21 @@ export interface EventPage {
  */
 export type PageCursor = string;
 
-/** Maximum number of items a single page may contain. */
+/** Maximum number of items a single page may contain (capped at 100). */
 export const MAX_PAGE_LIMIT = 100;
 
 /** Requested page size, capped at {@link MAX_PAGE_LIMIT}. */
 export type PageLimit = number;
 
-/** Status of a tracked FinOps / cross-contract record. */
+/** Status enum used to filter FinOps, cross-contract, and privacy query results. */
 export enum QueryStatus {
   Pending = 0,
   Success = 1,
+  Active = 1,
   Failed = 2,
+  Archived = 2,
   Cancelled = 3,
+  Revoked = 3,
 }
 
 /** Inclusive ledger timestamp range filter. */
@@ -86,6 +89,10 @@ export interface TimestampRangeFilter {
 export interface QueryFilter {
   /** Filter by ledger timestamp range. */
   timestamp?: TimestampRangeFilter;
+  /** Inclusive lower bound on ledger timestamp. */
+  timestamp_from?: number;
+  /** Inclusive upper bound on ledger timestamp. */
+  timestamp_to?: number;
   /** Filter by record status. */
   status?: QueryStatus;
   /** Filter by submitter address. */
@@ -106,6 +113,9 @@ export interface Page<T> {
   /** Cursor for the next page, or `null` when the end has been reached. */
   next_cursor: PageCursor | null;
 }
+
+/** Paginated query result carrying a cursor for the next page. Alias for {@link Page}. */
+export type PaginatedResult<T = Event> = Page<T>;
 
 export interface CacheStats {
   hits: number;
