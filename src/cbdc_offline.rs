@@ -1,7 +1,21 @@
 #![no_std]
 
-use crate::cbdc_types::{BatchSettlement, CBDCTransaction, OfflineStatus};
-use soroban_sdk::{contracttype, Bytes, BytesN, Env, Vec};
+use crate::cbdc_types::{BatchSettlement, CBDCTransaction, CBDCInteropError, OfflineStatus};
+use crate::rbac::{RbacError, RbacManager, Role};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, Symbol, Vec};
+
+/// Maximum offline transaction amount (prevents unbounded value growth).
+pub const MAX_OFFLINE_TX_AMOUNT: u128 = 1_000_000_000_000_000_000;
+/// Maximum byte length of offline transaction metadata.
+pub const MAX_OFFLINE_METADATA_BYTES: u32 = 4_096;
+/// Maximum number of transactions in a batch settlement.
+pub const MAX_OFFLINE_BATCH_SIZE: u32 = 1_000;
+
+/// Audit event topic for offline transaction operations.
+const AUDIT_TOPIC: &str = "cbdc_offline";
+/// Audit event outcome values.
+const AUDIT_OK: &str = "ok";
+const AUDIT_DENIED: &str = "denied";
 
 /// Represents an offline-signed transaction before reconciliation.
 #[contracttype]
@@ -77,11 +91,17 @@ impl ReconciliationState {
         self.failed_count > 0 || self.disputed_count > 0
     }
 
+    /// Reconciliation rate as a percentage (0-100), computed with saturating
+    /// arithmetic to avoid overflow on adversarial counts.
     pub fn reconciliation_rate(&self) -> u32 {
         if self.total_transactions == 0 {
             return 100;
         }
-        ((self.successful_count as u64 * 100) / self.total_transactions as u64) as u32
+        let numerator = self
+            .successful_count
+            .checked_mul(100)
+            .unwrap_or(u32::MAX);
+        numerator.saturating_div(self.total_transactions)
     }
 }
 
@@ -89,25 +109,56 @@ impl ReconciliationState {
 pub struct OfflineManager;
 
 impl OfflineManager {
+    /// Validate a CBDCTransaction's amount and metadata bounds.
+    fn validate_transaction_bounds(transaction: &CBDCTransaction) -> Result<(), &'static str> {
+        if transaction.amount_source == 0 {
+            return Err("Transaction amount cannot be zero");
+        }
+        if transaction.amount_source > MAX_OFFLINE_TX_AMOUNT {
+            return Err("Transaction amount exceeds maximum bound");
+        }
+        if transaction.amount_dest > MAX_OFFLINE_TX_AMOUNT {
+            return Err("Destination amount exceeds maximum bound");
+        }
+        if transaction.metadata.len() as u32 > MAX_OFFLINE_METADATA_BYTES {
+            return Err("Transaction metadata exceeds maximum byte length");
+        }
+        Ok(())
+    }
+
     /// Create offline transaction with signature
     pub fn create_offline_transaction(
         env: &Env,
+        caller: &Address,
         transaction: CBDCTransaction,
         signature: Bytes,
         signer_pubkey: Bytes,
         nonce: u32,
     ) -> Result<OfflineTransaction, &'static str> {
+        Self::require_authorization(env, caller, "create_offline_transaction")?;
+
         if signature.is_empty() {
+            Self::emit_denied_event(env, caller, "create_offline_transaction", "empty_signature");
             return Err("Signature cannot be empty");
         }
         if signer_pubkey.is_empty() {
+            Self::emit_denied_event(env, caller, "create_offline_transaction", "empty_pubkey");
             return Err("Signer public key cannot be empty");
+        }
+        if let Err(e) = Self::validate_transaction_bounds(&transaction) {
+            Self::emit_denied_event(env, caller, "create_offline_transaction", e);
+            return Err(e);
+        }
+        if nonce == 0 {
+            // Nonce can be 1+, 0 is reserved
+            Self::emit_denied_event(env, caller, "create_offline_transaction", "invalid_nonce");
+            return Err("Invalid nonce");
         }
 
         // Compute hash of transaction for offline verification
         let tx_hash = Self::compute_offline_tx_hash(env, &transaction, nonce);
 
-        Ok(OfflineTransaction {
+        let result = OfflineTransaction {
             tx_hash,
             transaction,
             signature,
@@ -116,7 +167,9 @@ impl OfflineManager {
             created_at: env.ledger().timestamp(),
             reconciled_at: None,
             nonce,
-        })
+        };
+        Self::emit_success_event(env, caller, "create_offline_transaction");
+        Ok(result)
     }
 
     /// Compute deterministic offline transaction hash
@@ -125,7 +178,6 @@ impl OfflineManager {
         transaction: &CBDCTransaction,
         nonce: u32,
     ) -> BytesN<32> {
-        
         let mut input = Bytes::new(env);
 
         // Hash transaction fields
@@ -150,6 +202,12 @@ impl OfflineManager {
         if tx.transaction.amount_source == 0 {
             return Err("Transaction amount cannot be zero");
         }
+        if tx.transaction.amount_source > MAX_OFFLINE_TX_AMOUNT {
+            return Err("Transaction amount exceeds maximum bound");
+        }
+        if tx.transaction.metadata.len() as u32 > MAX_OFFLINE_METADATA_BYTES {
+            return Err("Transaction metadata exceeds maximum byte length");
+        }
         if tx.nonce == 0 {
             // Nonce can be 1+, 0 is reserved
             return Err("Invalid nonce");
@@ -160,9 +218,18 @@ impl OfflineManager {
     /// Reconcile offline transaction to on-chain state
     pub fn reconcile_transaction(
         env: &Env,
+        caller: &Address,
         offline_tx: &mut OfflineTransaction,
     ) -> Result<(), &'static str> {
+        Self::require_authorization(env, caller, "reconcile_transaction")?;
+
         if offline_tx.status != OfflineStatus::PendingReconciliation as u32 {
+            Self::emit_denied_event(
+                env,
+                caller,
+                "reconcile_transaction",
+                "not_pending",
+            );
             return Err("Transaction is not in pending state");
         }
 
@@ -170,52 +237,78 @@ impl OfflineManager {
         offline_tx.status = OfflineStatus::Reconciled as u32;
         offline_tx.reconciled_at = Some(env.ledger().timestamp());
 
+        Self::emit_success_event(env, caller, "reconcile_transaction");
         Ok(())
     }
 
     /// Mark transaction as failed reconciliation
     pub fn fail_reconciliation(
         env: &Env,
+        caller: &Address,
         offline_tx: &mut OfflineTransaction,
     ) -> Result<(), &'static str> {
+        Self::require_authorization(env, caller, "fail_reconciliation")?;
+
         if offline_tx.status == OfflineStatus::Reconciled as u32 {
+            Self::emit_denied_event(
+                env,
+                caller,
+                "fail_reconciliation",
+                "already_reconciled",
+            );
             return Err("Cannot fail already reconciled transaction");
         }
 
         offline_tx.status = OfflineStatus::FailedReconciliation as u32;
         offline_tx.reconciled_at = Some(env.ledger().timestamp());
 
+        Self::emit_success_event(env, caller, "fail_reconciliation");
         Ok(())
     }
 
     /// Create batch settlement from offline transactions
     pub fn create_batch_settlement(
         env: &Env,
+        caller: &Address,
         tx_ids: Vec<BytesN<32>>,
         total_amount: u128,
     ) -> Result<BatchSettlement, &'static str> {
-        if tx_ids.len() == 0 {
+        Self::require_authorization(env, caller, "create_batch_settlement")?;
+
+        let batch_len = tx_ids.len() as u32;
+        if batch_len == 0 {
+            Self::emit_denied_event(env, caller, "create_batch_settlement", "empty_batch");
             return Err("Batch cannot be empty");
         }
+        if batch_len > MAX_OFFLINE_BATCH_SIZE {
+            Self::emit_denied_event(env, caller, "create_batch_settlement", "batch_too_large");
+            return Err("Batch exceeds maximum transaction count");
+        }
         if total_amount == 0 {
+            Self::emit_denied_event(env, caller, "create_batch_settlement", "zero_amount");
             return Err("Batch amount cannot be zero");
+        }
+        if total_amount > MAX_OFFLINE_TX_AMOUNT {
+            Self::emit_denied_event(env, caller, "create_batch_settlement", "amount_exceeds_bound");
+            return Err("Batch total amount exceeds maximum bound");
         }
 
         let batch_id = Self::compute_batch_id(env, &tx_ids);
 
-        Ok(BatchSettlement {
+        let result = BatchSettlement {
             batch_id,
             transaction_ids: tx_ids,
             total_amount,
             settlement_status: OfflineStatus::PendingReconciliation as u32,
             created_at: env.ledger().timestamp(),
             settled_at: None,
-        })
+        };
+        Self::emit_success_event(env, caller, "create_batch_settlement");
+        Ok(result)
     }
 
     /// Compute deterministic batch ID
     pub fn compute_batch_id(env: &Env, tx_ids: &Vec<BytesN<32>>) -> BytesN<32> {
-        
         let mut input = Bytes::new(env);
 
         for tx_id in tx_ids.iter() {
@@ -228,15 +321,25 @@ impl OfflineManager {
     /// Settle batch on-chain
     pub fn settle_batch(
         env: &Env,
+        caller: &Address,
         batch: &mut BatchSettlement,
     ) -> Result<(), &'static str> {
+        Self::require_authorization(env, caller, "settle_batch")?;
+
         if batch.settlement_status != OfflineStatus::PendingReconciliation as u32 {
+            Self::emit_denied_event(
+                env,
+                caller,
+                "settle_batch",
+                "not_pending",
+            );
             return Err("Batch is not in pending state");
         }
 
         batch.settlement_status = OfflineStatus::Reconciled as u32;
         batch.settled_at = Some(env.ledger().timestamp());
 
+        Self::emit_success_event(env, caller, "settle_batch");
         Ok(())
     }
 
@@ -260,10 +363,18 @@ impl OfflineManager {
 
         for status in statuses.iter() {
             match status {
-                s if s == OfflineStatus::Reconciled as u32 => state.successful_count += 1,
-                s if s == OfflineStatus::FailedReconciliation as u32 => state.failed_count += 1,
-                s if s == OfflineStatus::PendingReconciliation as u32 => state.pending_count += 1,
-                s if s == OfflineStatus::Disputed as u32 => state.disputed_count += 1,
+                s if s == OfflineStatus::Reconciled as u32 => {
+                    state.successful_count = state.successful_count.saturating_add(1);
+                }
+                s if s == OfflineStatus::FailedReconciliation as u32 => {
+                    state.failed_count = state.failed_count.saturating_add(1);
+                }
+                s if s == OfflineStatus::PendingReconciliation as u32 => {
+                    state.pending_count = state.pending_count.saturating_add(1);
+                }
+                s if s == OfflineStatus::Disputed as u32 => {
+                    state.disputed_count = state.disputed_count.saturating_add(1);
+                }
                 _ => {}
             }
         }
@@ -282,6 +393,68 @@ impl OfflineManager {
             offline_tx.nonce,
         );
         recomputed_hash == offline_tx.tx_hash
+    }
+
+    /// Enforce RBAC gating: caller must be an authenticated, non-suspended
+    /// submitter (or higher). Emits a denied audit event on failure.
+    fn require_authorization(
+        env: &Env,
+        caller: &Address,
+        operation: &str,
+    ) -> Result<(), &'static str> {
+        caller.require_auth();
+
+        if RbacManager::is_suspended(env, caller) {
+            Self::emit_denied_event(env, caller, operation, "submitter_suspended");
+            return Err("Submitter is suspended");
+        }
+        if RbacManager::get_role(env, caller).is_none() {
+            Self::emit_denied_event(env, caller, operation, "no_role");
+            return Err("No role assigned");
+        }
+        if !RbacManager::has_role_min(env, caller, Role::Submitter) {
+            Self::emit_denied_event(env, caller, operation, "insufficient_role");
+            return Err("Insufficient role");
+        }
+        Ok(())
+    }
+
+    /// Emit a success audit event for a completed mutation.
+    fn emit_success_event(env: &Env, caller: &Address, operation: &str) {
+        let topic = Symbol::new(env, AUDIT_TOPIC);
+        let op = Symbol::new(env, operation);
+        let result = Symbol::new(env, AUDIT_OK);
+
+        env.events().publish(
+            (topic.clone(), op.clone(), caller.clone()),
+            (env.ledger().timestamp(), result.clone()),
+        );
+        env.events().publish(
+            (Symbol::new(env, "cbdc_offline_audit_ok"), op, result),
+            (caller.clone(), env.ledger().timestamp()),
+        );
+    }
+
+    /// Emit a denied audit event for a rejected mutation attempt.
+    fn emit_denied_event(
+        env: &Env,
+        caller: &Address,
+        operation: &str,
+        error_code: &str,
+    ) {
+        let topic = Symbol::new(env, AUDIT_TOPIC);
+        let op = Symbol::new(env, operation);
+        let result = Symbol::new(env, AUDIT_DENIED);
+        let code = Symbol::new(env, error_code);
+
+        env.events().publish(
+            (topic.clone(), op.clone(), caller.clone()),
+            (env.ledger().timestamp(), result.clone(), code),
+        );
+        env.events().publish(
+            (Symbol::new(env, "cbdc_offline_audit_denied"), op, result),
+            (caller.clone(), env.ledger().timestamp(), code),
+        );
     }
 }
 

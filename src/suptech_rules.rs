@@ -7,17 +7,35 @@ use soroban_sdk::xdr::ToXdr;
 /// Hard cap on the number of items returned in a single page.
 pub const MAX_PAGE_LIMIT: u32 = 100;
 
+/// Hard cap on the number of rules allowed in a single rule set, preventing
+/// unbounded vector growth in [`RuleSet`].
+pub const MAX_RULES_PER_SET: u32 = 1_000;
+
+/// Hard cap on the number of rule evaluations produced in a single
+/// [`RulesEngine::execute_ruleset`] run, preventing unbounded vector growth.
+pub const MAX_EVALUATIONS_PER_RUN: u32 = 10_000;
+
+/// Maximum allowed length (bytes) for a rule name.
+pub const MAX_RULE_NAME_LEN: u32 = 256;
+
+/// Maximum allowed length (bytes) for a rule condition.
+pub const MAX_RULE_CONDITION_LEN: u32 = 1_024;
+
+/// Maximum allowed length (bytes) for a rule action.
+pub const MAX_RULE_ACTION_LEN: u32 = 1_024;
+
 /// Cursor token used for deterministic cursor-based pagination.
 ///
 /// The cursor encodes the composite sort key `(ledger_sequence, id)` of the
 /// last item returned on the previous page. Ordering on this composite key is
 /// stable across ledger upgrades and archival restores, so traversal is
-/// reproducible.
+/// reproducible. `ledger_sequence` is u64 so timestamps past the u32 range
+/// (year 2106) cannot truncate.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PageCursor {
     /// Ledger sequence of the last returned item.
-    pub ledger_sequence: u32,
+    pub ledger_sequence: u64,
     /// Tie-breaking identifier of the last returned item.
     pub id: BytesN<32>,
 }
@@ -159,8 +177,9 @@ pub struct SupervisionRulePage {
 ///
 /// Returns `Ordering::Less` when `a` sorts before `b`. Ordering is total and
 /// deterministic, which keeps pagination stable across ledger upgrades and
-/// archival restores.
-fn compare_keys(a: &(u32, BytesN<32>), b: &(u32, BytesN<32>)) -> core::cmp::Ordering {
+/// archival restores. `ledger_sequence` is u64 to avoid truncating timestamps
+/// past the u32 range (year 2106).
+fn compare_keys(a: &(u64, BytesN<32>), b: &(u64, BytesN<32>)) -> core::cmp::Ordering {
     match a.0.cmp(&b.0) {
         core::cmp::Ordering::Equal => a.1.to_array().cmp(&b.1.to_array()),
         other => other,
@@ -255,9 +274,19 @@ impl RulesEngine {
         if name.is_empty() {
             return Err("Rule name cannot be empty");
         }
+        if name.len() > MAX_RULE_NAME_LEN {
+            return Err("Rule name exceeds maximum length");
+        }
 
         if condition.is_empty() {
             return Err("Rule condition cannot be empty");
+        }
+        if condition.len() > MAX_RULE_CONDITION_LEN {
+            return Err("Rule condition exceeds maximum length");
+        }
+
+        if action.len() > MAX_RULE_ACTION_LEN {
+            return Err("Rule action exceeds maximum length");
         }
 
         if severity > 10 {
@@ -362,6 +391,9 @@ impl RulesEngine {
         if new_condition.is_empty() {
             return Err("New condition cannot be empty");
         }
+        if new_condition.len() > MAX_RULE_CONDITION_LEN {
+            return Err("New condition exceeds maximum length");
+        }
 
         rule.condition = new_condition;
         rule.updated_at = env.ledger().timestamp();
@@ -412,6 +444,10 @@ impl RulesEngine {
         ruleset: &mut RuleSet,
         rule_id: BytesN<32>,
     ) -> Result<(), &'static str> {
+        if (ruleset.rules.len() as u32) >= MAX_RULES_PER_SET {
+            return Err("Rule set at maximum capacity");
+        }
+
         // Check for duplicates
         for existing_rule in ruleset.rules.iter() {
             if existing_rule == rule_id {
@@ -461,6 +497,9 @@ impl RulesEngine {
         let mut evaluations = Vec::new(env);
 
         for rule in rules.iter() {
+            if (evaluations.len() as u32) >= MAX_EVALUATIONS_PER_RUN {
+                break;
+            }
             if !rule.is_active {
                 continue;
             }
@@ -503,7 +542,7 @@ impl RulesEngine {
         let effective = limit.effective();
 
         // Collect matching keys and sort deterministically.
-        let mut keys: Vec<(u32, BytesN<32>)> = Vec::new(env);
+        let mut keys: Vec<(u64, BytesN<32>)> = Vec::new(env);
         for log in logs.iter() {
             if !filter.matches_timestamp(log.executed_at) {
                 continue;
@@ -511,7 +550,7 @@ impl RulesEngine {
             if !filter.matches_submitter(&log.subject) {
                 continue;
             }
-            keys.push_back((log.executed_at as u32, log.log_id.clone()));
+            keys.push_back((log.executed_at, log.log_id.clone()));
         }
         sort_keys(&mut keys);
 
@@ -556,7 +595,7 @@ impl RulesEngine {
         filter.validate()?;
         let effective = limit.effective();
 
-        let mut keys: Vec<(u32, BytesN<32>)> = Vec::new(env);
+        let mut keys: Vec<(u64, BytesN<32>)> = Vec::new(env);
         for alert in alerts.iter() {
             if !filter.matches_timestamp(alert.triggered_at) {
                 continue;
@@ -567,7 +606,7 @@ impl RulesEngine {
             if !filter.matches_submitter(&alert.institution) {
                 continue;
             }
-            keys.push_back((alert.triggered_at as u32, alert.alert_id.clone()));
+            keys.push_back((alert.triggered_at, alert.alert_id.clone()));
         }
         sort_keys(&mut keys);
 
@@ -612,12 +651,12 @@ impl RulesEngine {
         filter.validate()?;
         let effective = limit.effective();
 
-        let mut keys: Vec<(u32, BytesN<32>)> = Vec::new(env);
+        let mut keys: Vec<(u64, BytesN<32>)> = Vec::new(env);
         for rule in rules.iter() {
             if !filter.matches_timestamp(rule.created_at) {
                 continue;
             }
-            keys.push_back((rule.created_at as u32, rule.rule_id.clone()));
+            keys.push_back((rule.created_at, rule.rule_id.clone()));
         }
         sort_keys(&mut keys);
 
@@ -682,7 +721,7 @@ impl RulesEngine {
 ///
 /// A simple, allocation-free sort keeps the CPU/memory footprint well within
 /// Soroban single-invocation limits for the capped page sizes used here.
-fn sort_keys(keys: &mut Vec<(u32, BytesN<32>)>) {
+fn sort_keys(keys: &mut Vec<(u64, BytesN<32>)>) {
     let len = keys.len();
     if len < 2 {
         return;

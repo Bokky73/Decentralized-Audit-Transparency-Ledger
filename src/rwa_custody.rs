@@ -356,8 +356,15 @@ pub struct CustodianRecord {
 
 impl CustodianRecord {
     /// Whether this custodian supports a given asset class.
+    ///
+    /// Returns `false` for asset classes whose bit index would exceed the
+    /// u32 bitmask width (>= 32), preventing a shift overflow.
     pub fn supports_asset_class(&self, class: AssetClass) -> bool {
-        (self.supported_asset_classes & (1 << class as u32)) != 0
+        let bit = class as u32;
+        if bit >= 32 {
+            return false;
+        }
+        (self.supported_asset_classes & (1 << bit)) != 0
     }
 
     /// Whether the custodian meets minimum reputation for a given asset class.
@@ -374,11 +381,17 @@ impl CustodianRecord {
 
     /// Compute a custody solvency ratio: insurance_coverage / total_value_held.
     /// Returns `None` if total_value_held is zero. Result is in basis points (×10_000).
+    ///
+    /// Uses saturating arithmetic so the numerator can never overflow u128 even
+    /// for extreme insurance coverage values.
     pub fn solvency_ratio_bps(&self) -> Option<u128> {
         if self.total_value_held == 0 {
             return None;
         }
-        Some((self.insurance_coverage * 10_000) / self.total_value_held)
+        let scaled = self
+            .insurance_coverage
+            .saturating_mul(10_000u128);
+        Some(scaled / self.total_value_held)
     }
 }
 
@@ -538,12 +551,20 @@ pub struct CollateralRecord {
 impl CollateralRecord {
     /// Current effective LTV based on latest valuation vs pledged value.
     /// Returns basis points (e.g., 7500 = 75%).
+    ///
+    /// All multiplications use saturating arithmetic so extreme pledged values
+    /// and LTV ratios cannot overflow u128.
     pub fn effective_ltv_bps(&self) -> u32 {
         if self.current_value == 0 {
             return 10_000; // 100% — effectively worthless collateral
         }
-        let loan_value = (self.pledged_value * self.ltv_bps as u128) / 10_000;
-        ((loan_value * 10_000) / self.current_value) as u32
+        let loan_value = (self.pledged_value as u128)
+            .saturating_mul(self.ltv_bps as u128)
+            .saturating_div(10_000);
+        let effective = loan_value
+            .saturating_mul(10_000u128)
+            .saturating_div(self.current_value as u128);
+        effective as u32
     }
 
     /// Whether a margin call should be triggered based on current valuation.
