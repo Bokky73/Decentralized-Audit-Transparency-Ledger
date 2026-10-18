@@ -11,6 +11,17 @@ use soroban_sdk::{Address, Bytes, BytesN, Symbol, Vec};
 use crate::support::fixture::{Fixture, BASE_TIMESTAMP};
 use crate::support::measure::{Bench, CaseSpec};
 
+/// Maximum page size enforced by the paginated query bindings.
+const MAX_PAGE_LIMIT: u32 = 100;
+/// Number of feature vectors seeded into every feature-store query fixture.
+const SEEDED_FEATURES: u32 = 10;
+/// Number of disclosure records seeded into every CBDC privacy query fixture.
+const SEEDED_DISCLOSURES: u32 = 10;
+/// Number of tiered anonymity records seeded into every CBDC privacy fixture.
+const SEEDED_TIERS: u32 = 10;
+/// Ledger timestamp window used by the filtered query benchmarks.
+const FILTER_WINDOW: u64 = 10_000;
+
 /// Number of events seeded per event type into every query fixture.
 ///
 /// Bounded by the 64 KiB per-entry cap on the ledger's instance storage: the
@@ -53,6 +64,8 @@ pub fn run(bench: &mut Bench) {
     paginated_scans(bench);
     full_ledger_scans(bench);
     configuration_reads(bench);
+    feature_store_paginated_queries(bench);
+    cbdc_privacy_paginated_queries(bench);
 }
 
 /// Single-record lookups and version/history reads.
@@ -644,6 +657,305 @@ fn configuration_reads(bench: &mut Bench) {
             1
         },
     );
+}
+
+/// Paginated and filtered reads over the on-chain ML feature store.
+///
+/// Every case reports a `page` unit so the per-row CPU/memory cost of the new
+/// cursor-based bindings is directly comparable against the Soroban
+/// single-invocation budget. Limits sweep the full range up to
+/// [`MAX_PAGE_LIMIT`] to prove the cap is enforced.
+fn feature_store_paginated_queries(bench: &mut Bench) {
+    for limit in [1u32, 10, 50, MAX_PAGE_LIMIT] {
+        let name = format!("list_features/limit_{limit}");
+        let notes = format!("cursor page of up to {limit} feature vectors from {SEEDED_FEATURES} seeded");
+        bench.measure(
+            CaseSpec::new("queries", &name, "list_features")
+                .unit("page")
+                .notes(&notes),
+            move || {
+                let (fixture, _) = seeded_features();
+                (fixture, limit)
+            },
+            |fixture, limit, _| fixture.client.list_features(&None, limit).len() as u64,
+        );
+    }
+
+    bench.measure(
+        CaseSpec::new("queries", "list_features_by_submitter/limit_50", "list_features_by_submitter")
+            .unit("page")
+            .notes("filtered by submitter address"),
+        || {
+            let (fixture, _) = seeded_features();
+            (fixture, ())
+        },
+        |fixture, _, _| {
+            let submitter = fixture.submitter.clone();
+            fixture
+                .client
+                .list_features_by_submitter(&submitter, &None, 50)
+                .len() as u64
+        },
+    );
+
+    bench.measure(
+        CaseSpec::new("queries", "list_features_by_time_range/limit_50", "list_features_by_time_range")
+            .unit("page")
+            .notes("filtered by ledger timestamp range"),
+        || {
+            let (fixture, _) = seeded_features();
+            (fixture, ())
+        },
+        |fixture, _, _| {
+            fixture
+                .client
+                .list_features_by_time_range(
+                    &(BASE_TIMESTAMP - 1),
+                    &(BASE_TIMESTAMP + FILTER_WINDOW),
+                    &None,
+                    50,
+                )
+                .len() as u64
+        },
+    );
+
+    bench.measure(
+        CaseSpec::new("queries", "list_features_filtered/limit_50", "list_features_filtered")
+            .unit("page")
+            .notes("multi-predicate: timestamp range + status + submitter"),
+        || {
+            let (fixture, _) = seeded_features();
+            (fixture, ())
+        },
+        |fixture, _, _| {
+            let submitter = fixture.submitter.clone();
+            fixture
+                .client
+                .list_features_filtered(
+                    &(BASE_TIMESTAMP - 1),
+                    &(BASE_TIMESTAMP + FILTER_WINDOW),
+                    &Some(ml_feature_store::FeatureStatus::Active),
+                    &Some(submitter),
+                    &None,
+                    50,
+                )
+                .len() as u64
+        },
+    );
+
+    bench.measure(
+        CaseSpec::new("queries", "list_features_empty/limit_50", "list_features_filtered")
+            .unit("page")
+            .notes("empty result set (predicate matches nothing)"),
+        || {
+            let (fixture, _) = seeded_features();
+            (fixture, ())
+        },
+        |fixture, _, _| {
+            fixture
+                .client
+                .list_features_filtered(
+                    &(BASE_TIMESTAMP + FILTER_WINDOW),
+                    &(BASE_TIMESTAMP + FILTER_WINDOW * 2),
+                    &None,
+                    &None,
+                    &None,
+                    50,
+                )
+                .len() as u64
+        },
+    );
+
+    bench.measure(
+        CaseSpec::new("queries", "list_features_cursor_past_end/limit_50", "list_features")
+            .unit("page")
+            .notes("cursor past the end of the dataset (terminal page)"),
+        || {
+            let (fixture, _) = seeded_features();
+            let cursor = Some(ml_feature_store::PageCursor {
+                last_index: SEEDED_FEATURES + 1_000,
+            });
+            (fixture, cursor)
+        },
+        |fixture, cursor, _| fixture.client.list_features(cursor, 50).len() as u64,
+    );
+}
+
+/// Paginated and filtered reads over the CBDC privacy guard.
+fn cbdc_privacy_paginated_queries(bench: &mut Bench) {
+    for limit in [1u32, 10, 50, MAX_PAGE_LIMIT] {
+        let name = format!("list_disclosures/limit_{limit}");
+        let notes = format!("cursor page of up to {limit} disclosure records from {SEEDED_DISCLOSURES} seeded");
+        bench.measure(
+            CaseSpec::new("queries", &name, "list_disclosures")
+                .unit("page")
+                .notes(&notes),
+            move || {
+                let (fixture, _) = seeded_disclosures();
+                (fixture, limit)
+            },
+            |fixture, limit, _| fixture.client.list_disclosures(&None, limit).len() as u64,
+        );
+    }
+
+    bench.measure(
+        CaseSpec::new("queries", "list_disclosures_by_submitter/limit_50", "list_disclosures_by_submitter")
+            .unit("page")
+            .notes("filtered by submitter address"),
+        || {
+            let (fixture, _) = seeded_disclosures();
+            (fixture, ())
+        },
+        |fixture, _, _| {
+            let submitter = fixture.submitter.clone();
+            fixture
+                .client
+                .list_disclosures_by_submitter(&submitter, &None, 50)
+                .len() as u64
+        },
+    );
+
+    bench.measure(
+        CaseSpec::new("queries", "list_disclosures_by_time_range/limit_50", "list_disclosures_by_time_range")
+            .unit("page")
+            .notes("filtered by ledger timestamp range"),
+        || {
+            let (fixture, _) = seeded_disclosures();
+            (fixture, ())
+        },
+        |fixture, _, _| {
+            fixture
+                .client
+                .list_disclosures_by_time_range(
+                    &(BASE_TIMESTAMP - 1),
+                    &(BASE_TIMESTAMP + FILTER_WINDOW),
+                    &None,
+                    50,
+                )
+                .len() as u64
+        },
+    );
+
+    bench.measure(
+        CaseSpec::new("queries", "list_disclosures_filtered/limit_50", "list_disclosures_filtered")
+            .unit("page")
+            .notes("multi-predicate: timestamp range + status + submitter"),
+        || {
+            let (fixture, _) = seeded_disclosures();
+            (fixture, ())
+        },
+        |fixture, _, _| {
+            let submitter = fixture.submitter.clone();
+            fixture
+                .client
+                .list_disclosures_filtered(
+                    &(BASE_TIMESTAMP - 1),
+                    &(BASE_TIMESTAMP + FILTER_WINDOW),
+                    &Some(cbdc_privacy::DisclosureStatus::Active),
+                    &Some(submitter),
+                    &None,
+                    50,
+                )
+                .len() as u64
+        },
+    );
+
+    bench.measure(
+        CaseSpec::new("queries", "list_disclosures_empty/limit_50", "list_disclosures_filtered")
+            .unit("page")
+            .notes("empty result set (predicate matches nothing)"),
+        || {
+            let (fixture, _) = seeded_disclosures();
+            (fixture, ())
+        },
+        |fixture, _, _| {
+            fixture
+                .client
+                .list_disclosures_filtered(
+                    &(BASE_TIMESTAMP + FILTER_WINDOW),
+                    &(BASE_TIMESTAMP + FILTER_WINDOW * 2),
+                    &None,
+                    &None,
+                    &None,
+                    50,
+                )
+                .len() as u64
+        },
+    );
+
+    bench.measure(
+        CaseSpec::new("queries", "list_disclosures_cursor_past_end/limit_50", "list_disclosures")
+            .unit("page")
+            .notes("cursor past the end of the dataset (terminal page)"),
+        || {
+            let (fixture, _) = seeded_disclosures();
+            let cursor = Some(cbdc_privacy::PageCursor {
+                last_index: SEEDED_DISCLOSURES + 1_000,
+            });
+            (fixture, cursor)
+        },
+        |fixture, cursor, _| fixture.client.list_disclosures(cursor, 50).len() as u64,
+    );
+
+    for limit in [1u32, 10, 50, MAX_PAGE_LIMIT] {
+        let name = format!("list_tiers/limit_{limit}");
+        let notes = format!("cursor page of up to {limit} tier records from {SEEDED_TIERS} seeded");
+        bench.measure(
+            CaseSpec::new("queries", &name, "list_tiers")
+                .unit("page")
+                .notes(&notes),
+            move || {
+                let (fixture, _) = seeded_tiers();
+                (fixture, limit)
+            },
+            |fixture, limit, _| fixture.client.list_tiers(&None, limit).len() as u64,
+        );
+    }
+
+    bench.measure(
+        CaseSpec::new("queries", "list_tiers_filtered/limit_50", "list_tiers_filtered")
+            .unit("page")
+            .notes("multi-predicate: timestamp range + status + submitter"),
+        || {
+            let (fixture, _) = seeded_tiers();
+            (fixture, ())
+        },
+        |fixture, _, _| {
+            let submitter = fixture.submitter.clone();
+            fixture
+                .client
+                .list_tiers_filtered(
+                    &(BASE_TIMESTAMP - 1),
+                    &(BASE_TIMESTAMP + FILTER_WINDOW),
+                    &Some(cbdc_privacy::TierStatus::Active),
+                    &Some(submitter),
+                    &None,
+                    50,
+                )
+                .len() as u64
+        },
+    );
+}
+
+/// Fixture with a populated ML feature-store index surface.
+fn seeded_features() -> (Fixture, ()) {
+    let fixture = Fixture::new();
+    fixture.seed_features(SEEDED_FEATURES, BASE_TIMESTAMP);
+    (fixture, ())
+}
+
+/// Fixture with a populated CBDC disclosure index surface.
+fn seeded_disclosures() -> (Fixture, ()) {
+    let fixture = Fixture::new();
+    fixture.seed_disclosures(SEEDED_DISCLOSURES, BASE_TIMESTAMP);
+    (fixture, ())
+}
+
+/// Fixture with a populated CBDC tier index surface.
+fn seeded_tiers() -> (Fixture, ()) {
+    let fixture = Fixture::new();
+    fixture.seed_tiers(SEEDED_TIERS, BASE_TIMESTAMP);
+    (fixture, ())
 }
 
 /// Register a permissive schema version for `event_type`.
