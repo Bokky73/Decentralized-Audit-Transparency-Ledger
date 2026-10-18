@@ -1,12 +1,21 @@
 #[cfg(test)]
 mod tests {
     use crate::finops::*;
-    use soroban_sdk::{bytes, vec, Address, BytesN, Env, Symbol};
+    use crate::rbac::{RbacStorageKey, Role};
+    use soroban_sdk::{bytes, vec, Address, Bytes, BytesN, Env, Symbol};
 
     fn create_test_env() -> Env {
         let env = Env::default();
         env.mock_all_auths();
         env
+    }
+
+    /// Grant an Admin role directly (mocked auth covers signature checks;
+    /// the RBAC role check reads storage).
+    fn grant_role(env: &Env, caller: &Address) {
+        env.storage()
+            .persistent()
+            .set(&RbacStorageKey::Role(caller.clone()), &Role::Admin);
     }
 
     fn sample_name(env: &Env) -> Bytes {
@@ -31,6 +40,7 @@ mod tests {
     fn test_register_cost_center() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let id = register_cost_center(
             env.clone(),
@@ -52,6 +62,7 @@ mod tests {
     fn test_duplicate_cost_center_fails() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         register_cost_center(
             env.clone(),
@@ -77,6 +88,7 @@ mod tests {
     fn test_update_cost_center_budget() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let id = register_cost_center(
             env.clone(),
@@ -96,6 +108,7 @@ mod tests {
     fn test_deactivate_cost_center() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let id = register_cost_center(
             env.clone(),
@@ -117,6 +130,7 @@ mod tests {
     fn test_allocate_cost() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let cc_id = register_cost_center(
             env.clone(),
@@ -150,6 +164,7 @@ mod tests {
     fn test_create_chargeback() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let cc_id = register_cost_center(
             env.clone(),
@@ -176,6 +191,7 @@ mod tests {
     fn test_create_showback() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let cc_id = register_cost_center(
             env.clone(),
@@ -202,6 +218,7 @@ mod tests {
     fn test_approve_chargeback() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let cc_id = register_cost_center(
             env.clone(),
@@ -235,6 +252,7 @@ mod tests {
     fn test_record_resource() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let resource_id = record_resource(
             env.clone(),
@@ -260,6 +278,7 @@ mod tests {
     fn test_generate_rightsizing() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let resource_id = record_resource(
             env.clone(),
@@ -285,6 +304,7 @@ mod tests {
     fn test_record_anomaly() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let resource_id = BytesN::from_slice(&env, b"resource-anomaly-test");
         let anomaly_id = record_anomaly(
@@ -312,6 +332,7 @@ mod tests {
     fn test_detect_anomalies() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let resource_id = BytesN::from_slice(&env, b"resource-anomaly-test-2");
         record_anomaly(
@@ -331,6 +352,7 @@ mod tests {
     fn test_resolve_anomaly() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let resource_id = BytesN::from_slice(&env, b"resource-anomaly-test-3");
         let anomaly_id = record_anomaly(
@@ -358,6 +380,7 @@ mod tests {
     fn test_create_budget() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let cc_id = register_cost_center(
             env.clone(),
@@ -390,6 +413,7 @@ mod tests {
     fn test_check_budget_alert() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let cc_id = register_cost_center(
             env.clone(),
@@ -421,6 +445,7 @@ mod tests {
     fn test_generate_dashboard() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let cc_id = register_cost_center(
             env.clone(),
@@ -458,6 +483,7 @@ mod tests {
     fn test_get_cost_summary() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let cc_id = register_cost_center(
             env.clone(),
@@ -488,6 +514,7 @@ mod tests {
     fn test_cost_center_count() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         assert_eq!(get_cost_center_count(env.clone()), 0);
 
@@ -506,6 +533,7 @@ mod tests {
     fn test_active_anomaly_count() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         assert_eq!(get_active_anomaly_count(env.clone()), 0);
 

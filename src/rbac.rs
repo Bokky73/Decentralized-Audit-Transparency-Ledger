@@ -115,6 +115,19 @@ impl RbacManager {
         }
     }
 
+    /// Role check used by granular module gating (issues #860, supply-chain).
+    ///
+    /// Resolves the resolved role hierarchy for `caller` and rejects the
+    /// operation with the stable [`RbacError`] code when the caller is
+    /// suspended or does not satisfy `required_role`. Callers of this
+    /// function perform their own authentication via `Address::require_auth`.
+    pub fn check_role(env: &Env, caller: &Address, required_role: Role) -> Result<(), RbacError> {
+        if Self::is_suspended(env, caller) {
+            return Err(RbacError::SubmitterSuspended);
+        }
+        Self::require_role_min(env, caller, required_role)
+    }
+
     /// Bootstraps initial superadmin role during contract initialization.
     pub fn initialize_admin(env: &Env, admin: &Address) {
         let key = RbacStorageKey::Role(admin.clone());

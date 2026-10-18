@@ -464,7 +464,19 @@ impl AuditLedger {
         composer.require_auth();
         Self::require_xct_role(&env, &composer, Role::Submitter, RbacRole::Submitter);
 
-        let comp_id: u32 = env.storage().instance().get(&DataKey::CrossContractCount).unwrap_or(0);
+        // Deterministic payload bounds (#864): a malformed or hostile
+        // composition can never blow the instance-storage entry limit or the
+        // compute budget via an unbounded refs vector.
+        if refs.len() > MAX_REFS {
+            panic_with_error!(&env, XContractError::LimitExceeded);
+        }
+        require_bounded_bytes(&env, &metadata, MAX_METADATA_LEN);
+        for i in 0..refs.len() {
+            let event_ref = refs.get(i).unwrap();
+            require_valid_event_ref(&env, event_ref);
+        }
+
+        let comp_id: u32 = bump_u32_counter(&env, &DataKey::CrossContractCount);
 
         let composition = CrossContractEvent {
             id: comp_id,
@@ -501,7 +513,7 @@ impl AuditLedger {
         let mut seen: Vec<BytesN<32>> = Vec::new(&env);
         for i in 0..refs.len() {
             let r = refs.get(i).unwrap();
-            if r.event_id == zero {
+            if r.event_id == zero || r.event_hash == zero {
                 return false;
             }
             if seen.contains(&r.event_id) {
@@ -526,7 +538,16 @@ impl AuditLedger {
         submitter.require_auth();
         Self::require_xct_role(&env, &submitter, Role::Submitter, RbacRole::Submitter);
 
-        let ext_id: u32 = env.storage().instance().get(&DataKey::ExternalEventCount).unwrap_or(0);
+        // Deterministic payload bounds (#864).
+        require_non_empty_bytes(&env, &external_id);
+        require_bounded_bytes(&env, &external_id, MAX_EXTERNAL_ID_LEN);
+        require_bounded_bytes(&env, &metadata, MAX_METADATA_LEN);
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        if payload_hash == zero {
+            panic_with_error!(&env, XContractError::InvalidEventRef);
+        }
+
+        let ext_id: u32 = bump_u32_counter(&env, &DataKey::ExternalEventCount);
 
         let ext = ExternalEvent {
             id: ext_id,
@@ -561,7 +582,29 @@ impl AuditLedger {
         caller.require_auth();
         Self::require_xct_admin(&env, &caller);
 
-        let wf_id: u32 = env.storage().instance().get(&DataKey::WorkflowCount).unwrap_or(0);
+        // Deterministic payload bounds (#864).
+        if steps.is_empty() {
+            panic_with_error!(&env, XContractError::InvalidInput);
+        }
+        if steps.len() > MAX_WORKFLOW_STEPS {
+            panic_with_error!(&env, XContractError::LimitExceeded);
+        }
+        for i in 0..steps.len() {
+            let step = steps.get(i).unwrap();
+            // `WorkflowExecution.step_events` is indexed positionally (see
+            // `verify_cross_chain_workflow` and `start_workflow`), so a
+            // definition whose steps are out of order is malformed.
+            if step.index != i {
+                panic_with_error!(&env, XContractError::InvalidWorkflowStep);
+            }
+            // `max_delay_secs == 0` means "no limit"; otherwise the window
+            // must be consistent.
+            if step.max_delay_secs != 0 && step.max_delay_secs < step.min_delay_secs {
+                panic_with_error!(&env, XContractError::InvalidWorkflowStep);
+            }
+        }
+
+        let wf_id: u32 = bump_u32_counter(&env, &DataKey::WorkflowCount);
 
         let wf = WorkflowDefinition {
             id: wf_id,
@@ -717,6 +760,8 @@ impl AuditLedger {
     /// Return all workflow definitions (paginated by count starting at 0).
     /// Each definition read applies the automated TTL bump policy.
     pub fn list_workflows(env: Env, start: u32, limit: u32) -> Vec<WorkflowDefinition> {
+        // Deterministic page bound (#864).
+        let limit = limit.min(MAX_PAGE_SIZE);
         let total: u32 = env.storage().instance().get(&DataKey::WorkflowCount).unwrap_or(0);
         let mut out: Vec<WorkflowDefinition> = Vec::new(&env);
         let end = (start.saturating_add(limit)).min(total);
@@ -778,6 +823,8 @@ impl AuditLedger {
     /// Return cross-contract compositions (paginated). Each composition read
     /// applies the automated TTL bump policy.
     pub fn get_cross_contract_events(env: Env, start: u32, limit: u32) -> Vec<CrossContractEvent> {
+        // Deterministic page bound (#864).
+        let limit = limit.min(MAX_PAGE_SIZE);
         let total: u32 = env.storage().instance().get(&DataKey::CrossContractCount).unwrap_or(0);
         let mut out: Vec<CrossContractEvent> = Vec::new(&env);
         let end = (start.saturating_add(limit)).min(total);
@@ -1004,6 +1051,13 @@ impl AuditLedger {
             Some(e) => e,
             None => panic_with_error!(env, ContractError::EventDoesNotExist),
         };
+
+        // Idempotency guard (#864): a completed, failed or cancelled
+        // execution can never be re-completed (or have its finish
+        // timestamp rewritten after the fact).
+        if exec.status != WorkflowStatus::InProgress {
+            panic_with_error!(&env, ContractError::WorkflowNotInProgress);
+        }
 
         exec.status = WorkflowStatus::Completed;
         exec.finished_at = env.ledger().timestamp();
