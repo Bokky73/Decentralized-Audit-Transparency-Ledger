@@ -164,6 +164,13 @@ pub struct DisputeConfig {
 }
 
 // ============================================================================
+// TTL Configuration
+// ============================================================================
+
+/// Default TTL (in ledgers) for dispute resolution persistent state.
+const DEFAULT_DISPUTE_TTL: u32 = 5000;
+
+// ============================================================================
 // Storage Keys
 // ============================================================================
 
@@ -187,6 +194,8 @@ pub enum DisputeKey {
     Appeal(u32),
     /// Next appeal ID counter
     AppealCounter,
+    /// Storage TTL in ledgers for dispute resolution state
+    Ttl,
 }
 
 // ============================================================================
@@ -280,6 +289,9 @@ impl DAODisputeResolution {
         env.storage()
             .instance()
             .set(&DisputeKey::AppealCounter, &0u32);
+        env.storage()
+            .instance()
+            .set(&DisputeKey::Ttl, &DEFAULT_DISPUTE_TTL);
 
         // Bootstrap the owner as the RBAC super-admin.
         RbacManager::initialize_admin(&env, &owner);
@@ -358,6 +370,8 @@ impl DAODisputeResolution {
         env.storage()
             .instance()
             .set(&DisputeKey::Dispute(dispute_id), &dispute);
+
+        Self::bump_instance_ttl(&env);
 
         // TODO: Collect stake from plaintiff
 
@@ -753,20 +767,39 @@ impl DAODisputeResolution {
         Ok(appeal_id)
     }
 
+    /// Update the storage TTL (in ledgers) for dispute resolution state (owner-only).
+    pub fn set_dispute_ttl(env: Env, ttl_ledgers: u32) {
+        Self::get_owner(&env).require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DisputeKey::Ttl, &ttl_ledgers);
+
+        log!(
+            &env,
+            "DAODisputeResolution: TTL updated - ttl_ledgers={}",
+            ttl_ledgers
+        );
+    }
+
     // ========================================================================
     // Query Functions
     // ========================================================================
 
     /// Get dispute details
     pub fn get_dispute(env: Env, dispute_id: u32) -> Option<Dispute> {
-        env.storage()
+        let dispute = env.storage()
             .instance()
-            .get(&DisputeKey::Dispute(dispute_id))
+            .get(&DisputeKey::Dispute(dispute_id));
+        Self::bump_instance_ttl(&env);
+        dispute
     }
 
     /// Get configuration
     pub fn get_dispute_config(env: Env) -> DisputeConfig {
-        Self::get_config(&env)
+        let config = Self::get_config(&env);
+        Self::bump_instance_ttl(&env);
+        config
     }
 
     // ========================================================================
@@ -778,6 +811,23 @@ impl DAODisputeResolution {
             .instance()
             .get(&DisputeKey::Owner)
             .unwrap_or_else(|| panic_with_error!(env, DisputeError::Unauthorized))
+    }
+
+    /// Extend the TTL of instance storage so dispute resolution state is not
+    /// reclaimed for archival rent. Called automatically after every state
+    /// mutation and on reads.
+    fn bump_instance_ttl(env: &Env) {
+        let ttl: u32 = env
+            .storage()
+            .instance()
+            .get(&DisputeKey::Ttl)
+            .unwrap_or(DEFAULT_DISPUTE_TTL);
+        if ttl > 0 {
+            let current_ledger = env.ledger().sequence();
+            env.storage()
+                .instance()
+                .extend_ttl(current_ledger + ttl, ttl);
+        }
     }
 
     fn get_config(env: &Env) -> DisputeConfig {
@@ -820,30 +870,5 @@ impl DAODisputeResolution {
             .set(&DisputeKey::AppealCounter, &next);
 
         current
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_dispute_filing() {
-        // Tests for dispute creation
-    }
-
-    #[test]
-    fn test_juror_voting() {
-        // Tests for voting mechanism
-    }
-
-    #[test]
-    fn test_dispute_resolution() {
-        // Tests for finalization
-    }
-
-    #[test]
-    fn test_appeals() {
-        // Tests for appeal mechanism
     }
 }
