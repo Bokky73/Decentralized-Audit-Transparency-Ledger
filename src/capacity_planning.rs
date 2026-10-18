@@ -114,6 +114,16 @@ pub enum CapacityStorageKey {
     Policy,
 }
 
+/// Deterministic bounds to cap on-chain storage, memory and CPU usage.
+const MAX_TELEMETRY_SNAPSHOTS: u32 = 1000;
+const MAX_BATCH_SIZE: u32 = 10_000;
+const MAX_REPLICAS: u32 = 10_000;
+const MAX_CPU_BASIS_PTS: u32 = 10_000; // 100.00%
+const MAX_TPS: u32 = 1_000_000;
+const MAX_MEMORY_MB: u32 = 1_000_000;
+const MAX_FORECAST_HOURS: u32 = 8_760; // 1 year
+const MAX_CONFIDENCE_PCT: u32 = 100;
+
 // ── Capacity Planning Functions ──────────────────────────────────────────
 
 pub struct CapacityPlanning;
@@ -127,19 +137,32 @@ impl CapacityPlanning {
     ) {
         caller.require_auth();
 
+        // Reject malformed metric payloads.
+        if metric.current_tps > MAX_TPS
+            || metric.peak_tps > MAX_TPS
+            || metric.cpu_utilization_basis_pts > MAX_CPU_BASIS_PTS
+            || metric.memory_mb_used > MAX_MEMORY_MB
+        {
+            panic_with_error!(env, CapacityError::InvalidRecommendation);
+        }
+
         let count: u32 = env
             .storage()
             .persistent()
             .get(&CapacityStorageKey::TelemetryCount)
             .unwrap_or(0);
 
-        let next_idx = count % 1000; // Ring buffer of 1,000 snapshots
+        // Ring buffer: deterministic, bounded snapshot count.
+        let next_idx = count % MAX_TELEMETRY_SNAPSHOTS;
         let key = CapacityStorageKey::TelemetrySnapshot(next_idx);
         env.storage().persistent().set(&key, &metric);
 
+        let next_count = count
+            .checked_add(1)
+            .unwrap_or(MAX_TELEMETRY_SNAPSHOTS);
         env.storage()
             .persistent()
-            .set(&CapacityStorageKey::TelemetryCount, &(count + 1));
+            .set(&CapacityStorageKey::TelemetryCount, &next_count);
     }
 
     /// Register or update a multi-tenant quota tier
@@ -149,6 +172,18 @@ impl CapacityPlanning {
         tier: QuotaTier,
     ) {
         admin.require_auth();
+
+        // Reject malformed / out-of-bounds tier parameters.
+        if tier.max_daily_events == 0
+            || tier.max_burst_tps > MAX_TPS
+            || tier.storage_quota_bytes == 0
+            || tier.max_batch_size == 0
+            || tier.max_batch_size > MAX_BATCH_SIZE
+            || tier.cost_per_m_events_stroops == 0
+        {
+            panic_with_error!(env, CapacityError::InvalidPolicyBounds);
+        }
+
         let key = CapacityStorageKey::Tier(tier.tier_id);
         env.storage().persistent().set(&key, &tier);
     }
@@ -188,6 +223,11 @@ impl CapacityPlanning {
     ) -> bool {
         submitter.require_auth();
 
+        // Reject empty or oversized batches to bound per-call work.
+        if event_count == 0 || event_count > MAX_BATCH_SIZE {
+            panic_with_error!(env, CapacityError::InvalidRecommendation);
+        }
+
         let sub_key = CapacityStorageKey::SubmitterQuota(submitter.clone());
         let mut sub_record: SubmitterQuotaRecord = match env.storage().persistent().get(&sub_key) {
             Some(r) => r,
@@ -215,6 +255,11 @@ impl CapacityPlanning {
             cost_per_m_events_stroops: 5_000_000,
         });
 
+        // Enforce per-batch size cap from the tier's own policy.
+        if event_count > tier.max_batch_size {
+            panic_with_error!(env, CapacityError::InvalidRecommendation);
+        }
+
         let now = env.ledger().timestamp();
         // 24-hour sliding window reset
         if now >= sub_record.window_start + 86400 {
@@ -223,15 +268,31 @@ impl CapacityPlanning {
             sub_record.is_throttled = false;
         }
 
-        if sub_record.events_in_current_window + (event_count as u64) > tier.max_daily_events {
+        let added = event_count as u64;
+        let projected = sub_record
+            .events_in_current_window
+            .checked_add(added)
+            .unwrap_or(u64::MAX);
+
+        if projected > tier.max_daily_events {
             sub_record.is_throttled = true;
             env.storage().persistent().set(&sub_key, &sub_record);
             panic_with_error!(env, CapacityError::QuotaExceeded);
         }
 
-        sub_record.events_in_current_window += event_count as u64;
-        let batch_cost = ((event_count as u64) * tier.cost_per_m_events_stroops) / 1_000_000;
-        sub_record.total_cost_billed_stroops += batch_cost;
+        sub_record.events_in_current_window = projected;
+
+        // Overflow-safe batch cost: (event_count * cost_per_m) / 1_000_000
+        let batch_cost = added
+            .checked_mul(tier.cost_per_m_events_stroops)
+            .and_then(|v| v.checked_div(1_000_000))
+            .unwrap_or(0);
+
+        let new_total = sub_record
+            .total_cost_billed_stroops
+            .checked_add(batch_cost)
+            .unwrap_or(u64::MAX);
+        sub_record.total_cost_billed_stroops = new_total;
 
         env.storage().persistent().set(&sub_key, &sub_record);
         true
@@ -245,7 +306,15 @@ impl CapacityPlanning {
     ) {
         reporter.require_auth();
 
-        if rec.recommended_min_replicas == 0 || rec.recommended_max_replicas < rec.recommended_min_replicas {
+        if rec.recommended_min_replicas == 0
+            || rec.recommended_max_replicas < rec.recommended_min_replicas
+            || rec.recommended_max_replicas > MAX_REPLICAS
+            || rec.recommended_cpu_millicores == 0
+            || rec.recommended_memory_mb > MAX_MEMORY_MB
+            || rec.forecast_horizon_hours == 0
+            || rec.forecast_horizon_hours > MAX_FORECAST_HOURS
+            || rec.confidence_score_percent > MAX_CONFIDENCE_PCT
+        {
             panic_with_error!(env, CapacityError::InvalidRecommendation);
         }
 
@@ -262,7 +331,13 @@ impl CapacityPlanning {
     ) {
         admin.require_auth();
 
-        if policy.min_replicas == 0 || policy.max_replicas < policy.min_replicas {
+        if policy.min_replicas == 0
+            || policy.max_replicas < policy.min_replicas
+            || policy.max_replicas > MAX_REPLICAS
+            || policy.min_replicas > MAX_REPLICAS
+            || policy.target_cpu_percent > MAX_CPU_BASIS_PTS
+            || policy.cooldown_period_seconds == 0
+        {
             panic_with_error!(env, CapacityError::InvalidPolicyBounds);
         }
 

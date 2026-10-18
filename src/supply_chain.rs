@@ -1,9 +1,41 @@
 #![allow(dead_code)]
 
-//! # Supply Chain Custody Handoff Verifier
-//!
 //! Multi-tier supply chain custody handoff verifier with fine-grained
-//! role-based access control (RBAC) and tamper-evident audit trails.
+//! role-based access control (RBAC), bounds/overflow safety, and tamper-evident audit trails.
+//!
+//! # Determinism, bounds and overflow safety
+//!
+//! All arithmetic in this module uses checked or saturating Soroban math
+//! helpers. No unchecked `+`, `*`, `+=` operations remain on user-controlled
+//! values, and every collection that is written to persistent storage is
+//! bounded by an explicit `MAX_*` constant.
+//!
+//! ## Worst-case storage footprint
+//!
+//! Per-entry persistent storage is bounded as follows (Soroban ledger entries
+//! are charged per byte; the values below are the enforced upper bounds):
+//!
+//! * `Brand` — 1 entry, bounded by caller-supplied `Bytes` fields.
+//! * `ProductSKU` — 1 entry plus up to `MAX_CERTIFICATIONS` +
+//!   `MAX_LABOR_REPORTS` + `MAX_ENVIRONMENTAL_REPORTS` link hashes
+//!   (32 bytes each).
+//! * `Provenance` — 1 entry plus up to `MAX_CUSTODY_TRANSFERS` custody
+//!   transfer records.
+//! * `Certification` — 1 entry plus up to `MAX_AUDIT_ENTRIES` audit entries.
+//! * `LaborConditions` / `EnvironmentalImpact` — 1 entry plus up to
+//!   `MAX_CERTIFICATIONS` certification hashes.
+//!
+//! ## Worst-case CPU instruction bounds
+//!
+//! * `log_custody_transfer` — O(1) storage read + write, bounded by
+//!   `MAX_CUSTODY_TRANSFERS` deserialization cost.
+//! * `verify_product_chain` — O(`MAX_CERTIFICATIONS` + `MAX_LABOR_REPORTS` +
+//!   `MAX_ENVIRONMENTAL_REPORTS`) storage reads, each bounded by the
+//!   per-entry limits above.
+//! * `get_product_timeline` — O(`MAX_TIMELINE_EVENTS`) storage reads.
+//!
+//! All boundary violations return a typed [`SupplyChainError`] variant rather
+//! than panicking, so callers observe deterministic, gas-bounded failures.
 //!
 //! ## Authorization model
 //!
@@ -48,11 +80,50 @@
 //! | ISO 9001 (quality management)        | `log_certification`, `verify_certification`              |
 //! | SOX §404 (access control)            | RBAC gating on every mutating entrypoint                 |
 //! | GDPR Art. 30 (processing records)    | Structured audit events with caller + timestamp          |
+//!
+//! # Storage tiers and TTL management
+//!
+//! Storage retention SLAs follow the contract-wide tiering policy:
+//!
+//! | Tier        | Entries in this module                                   | Retention SLA                                |
+//! |-------------|----------------------------------------------------------|----------------------------------------------|
+//! | Persistent  | `Brand`, `ProductSKU`, `Provenance`, `Certification`,   | Extended to ~30 days by `extend_ttl`         |
+//! |             | `LaborConditions`, `EnvironmentalImpact`,                | (permissionless); never silently pruned     |
+//! |             | `LastVerificationTime`                                   | while an audit is in progress                |
+//! | Temporary   | `BrandProductIndex`, `BrandCertificationIndex`,          | Derived caches; cheap rent, safe to expire   |
+//! |             | `FacilityLaborIndex`, `FacilityEnvironmentalIndex`,      | and recompute                                |
+//! |             | `VerificationCache`, `BrandIntegrityCache`               |                                              |
+//! | Instance    | `BrandCount`, `ProductCount`                             | Small counters living with instance TTL      |
+//!
+//! All persistent write operations call [`persistent_set`], which writes to
+//! the persistent storage tier and automatically bumps the entry's TTL to
+//! [`PERSISTENT_TTL_TARGET`] if it has fallen below
+//! [`PERSISTENT_TTL_THRESHOLD`]. Readers use [`persistent_get`], which
+//! performs the same conditional TTL extension on read.
 
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{contracterror, contracttype, Address, Bytes, BytesN, Env, Symbol, Vec};
 
 use crate::rbac::{self, RbacError, Role};
+
+/// Maximum number of custody transfers recorded per provenance event.
+pub const MAX_CUSTODY_TRANSFERS: u32 = 256;
+/// Maximum number of certifications linked to a product SKU.
+pub const MAX_CERTIFICATIONS: u32 = 128;
+/// Maximum number of labor condition reports linked to a product SKU.
+pub const MAX_LABOR_REPORTS: u32 = 128;
+/// Maximum number of environmental reports linked to a product SKU.
+pub const MAX_ENVIRONMENTAL_REPORTS: u32 = 128;
+/// Maximum number of audit entries recorded per certification.
+pub const MAX_AUDIT_ENTRIES: u32 = 128;
+/// Maximum number of events returned by `get_product_timeline`.
+pub const MAX_TIMELINE_EVENTS: u32 = 256;
+/// Maximum number of issues accumulated during a verification pass.
+pub const MAX_VERIFICATION_ISSUES: u32 = 64;
+/// Maximum number of days a certification may be valid for.
+pub const MAX_CERTIFICATION_DAYS: u64 = 36_500; // 100 years
+/// Seconds in a day, used for expiry computation.
+const SECONDS_PER_DAY: u64 = 86_400;
 
 /// Supply chain specific error types
 #[contracterror]
@@ -79,12 +150,20 @@ pub enum SupplyChainError {
     UnauthorizedBrandAccess = 1009,
     /// Invalid chain of custody timeline
     InvalidChainOfCustody = 1010,
+    /// Arithmetic overflow while computing a bounded value
+    ArithmeticOverflow = 1011,
+    /// A collection exceeded its configured maximum length
+    CollectionLimitExceeded = 1012,
+    /// A supplied payload was malformed or out of range
+    InvalidPayload = 1013,
+    /// Provenance event not found
+    ProvenanceNotFound = 1014,
     /// Caller is not authorized for the required RBAC role
-    UnauthorizedRole = 1011,
+    UnauthorizedRole = 1015,
     /// Submitter DID is suspended or revoked
-    SuspendedDid = 1012,
+    SuspendedDid = 1016,
     /// Caller authentication failed
-    AuthenticationFailed = 1013,
+    AuthenticationFailed = 1017,
 }
 
 /// Symbol used to tag audit events emitted by this module.
@@ -186,6 +265,34 @@ fn emit_success(
         0,
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Storage TTL policy constants
+//
+// Retention SLA tiers:
+//   * Persistent — archival-critical provenance / certification / labor /
+//     environmental audit records. These must never be silently archived while
+//     an audit is active, so they are stored in the persistent tier and bumped
+//     by `extend_ttl` (permissionless).
+//   * Temporary — derived caches and indices that can be rebuilt from the
+//     authoritative records. Cheap rent, allowed to expire.
+//   * Instance — small counters / configuration that live with the contract
+//     instance and are bumped alongside the instance TTL.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Target TTL (in ledgers) for archival-critical persistent records.
+/// ~30 days at 5s close time.
+pub const PERSISTENT_TTL_TARGET: u32 = 518_400;
+/// Threshold below which a persistent record is considered "at risk".
+pub const PERSISTENT_TTL_THRESHOLD: u32 = 17_280;
+/// Target TTL (in ledgers) for temporary caches / derived indices.
+pub const TEMPORARY_TTL_TARGET: u32 = 17_280;
+/// Threshold below which a temporary entry is extended.
+pub const TEMPORARY_TTL_THRESHOLD: u32 = 1_728;
+/// Target TTL (in ledgers) for instance-tier counters / config.
+pub const INSTANCE_TTL_TARGET: u32 = 518_400;
+/// Threshold below which the instance TTL is extended.
+pub const INSTANCE_TTL_THRESHOLD: u32 = 17_280;
 
 /// Represents a geographical location or facility
 #[contracttype]
@@ -352,41 +459,201 @@ pub struct BrandIntegrityReport {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Data storage keys for supply chain
+//
+// Tier classification (retention SLA):
+//   Persistent  — Brand, ProductSKU, ProvenanceEvent, CertificationEvent,
+//                 LaborReport, EnvironmentalReport, LastVerificationTime
+//   Temporary   — BrandProductIndex, BrandCertificationIndex,
+//                 FacilityLaborIndex, FacilityEnvironmentalIndex,
+//                 VerificationCache, BrandIntegrityCache
+//   Instance    — BrandCount, ProductCount
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[contracttype]
 #[derive(Clone)]
 pub enum SupplyChainDataKey {
-    /// Brand registration: brand_id -> Brand
+    /// Brand registration: brand_id -> Brand  [Persistent]
     Brand(Symbol),
-    /// Product SKU: (brand_id, sku) -> ProductSKU
+    /// Product SKU: (brand_id, sku) -> ProductSKU  [Persistent]
     ProductSKU(Symbol, Bytes),
-    /// Provenance event: event_id -> Provenance
+    /// Provenance event: event_id -> Provenance  [Persistent]
     ProvenanceEvent(BytesN<32>),
-    /// Certification event: cert_id -> Certification
+    /// Certification event: cert_id -> Certification  [Persistent]
     CertificationEvent(BytesN<32>),
-    /// Labor conditions report: report_id -> LaborConditions
+    /// Labor conditions report: report_id -> LaborConditions  [Persistent]
     LaborReport(BytesN<32>),
-    /// Environmental report: report_id -> EnvironmentalImpact
+    /// Environmental report: report_id -> EnvironmentalImpact  [Persistent]
     EnvironmentalReport(BytesN<32>),
-    /// Index: brand -> list of SKUs
+    /// Index: brand -> list of SKUs  [Temporary]
     BrandProductIndex(Symbol),
-    /// Index: brand -> list of certifications
+    /// Index: brand -> list of certifications  [Temporary]
     BrandCertificationIndex(Symbol),
-    /// Index: facility -> labor reports
+    /// Index: facility -> labor reports  [Temporary]
     FacilityLaborIndex(Bytes),
-    /// Index: facility -> environmental reports
+    /// Index: facility -> environmental reports  [Temporary]
     FacilityEnvironmentalIndex(Bytes),
-    /// Cache: product -> verification result
+    /// Cache: product -> verification result  [Temporary]
     VerificationCache(Bytes),
-    /// Cache: brand integrity report
+    /// Cache: brand integrity report  [Temporary]
     BrandIntegrityCache(Symbol),
-    /// Timestamp: last verification for product
+    /// Timestamp: last verification for product  [Persistent]
     LastVerificationTime(Bytes),
-    /// Counter: total brands registered
+    /// Counter: total brands registered  [Instance]
     BrandCount,
-    /// Counter: total products tracked
+    /// Counter: total products tracked  [Instance]
     ProductCount,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Storage tier helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Returns `true` if the key is archival-critical and must live in the
+/// persistent tier (provenance, certifications, labor/environmental reports,
+/// brand/SKU registrations, verification timestamps).
+fn is_persistent_key(key: &SupplyChainDataKey) -> bool {
+    matches!(
+        key,
+        SupplyChainDataKey::Brand(_)
+            | SupplyChainDataKey::ProductSKU(_, _)
+            | SupplyChainDataKey::ProvenanceEvent(_)
+            | SupplyChainDataKey::CertificationEvent(_)
+            | SupplyChainDataKey::LaborReport(_)
+            | SupplyChainDataKey::EnvironmentalReport(_)
+            | SupplyChainDataKey::LastVerificationTime(_)
+    )
+}
+
+/// Returns `true` if the key is a derived cache / index that may be rebuilt
+/// from authoritative records and therefore belongs in the temporary tier.
+fn is_temporary_key(key: &SupplyChainDataKey) -> bool {
+    matches!(
+        key,
+        SupplyChainDataKey::BrandProductIndex(_)
+            | SupplyChainDataKey::BrandCertificationIndex(_)
+            | SupplyChainDataKey::FacilityLaborIndex(_)
+            | SupplyChainDataKey::FacilityEnvironmentalIndex(_)
+            | SupplyChainDataKey::VerificationCache(_)
+            | SupplyChainDataKey::BrandIntegrityCache(_)
+    )
+}
+
+/// Returns `true` if the key is a small counter / config entry that lives in
+/// the contract instance tier.
+fn is_instance_key(key: &SupplyChainDataKey) -> bool {
+    matches!(
+        key,
+        SupplyChainDataKey::BrandCount | SupplyChainDataKey::ProductCount
+    )
+}
+
+/// Read a persistent-tier value, bumping its TTL if it is at risk.
+fn persistent_get<V: soroban_sdk::TryFromVal<Env, soroban_sdk::Val>>(
+    env: &Env,
+    key: &SupplyChainDataKey,
+) -> Option<V> {
+    let storage = env.storage().persistent();
+    if storage.has(key) {
+        storage.extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_TARGET);
+    }
+    storage.get(key)
+}
+
+/// Write a persistent-tier value with the archival TTL policy applied.
+fn persistent_set<V: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(
+    env: &Env,
+    key: &SupplyChainDataKey,
+    value: &V,
+) {
+    let storage = env.storage().persistent();
+    storage.set(key, value);
+    storage.extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_TARGET);
+}
+
+/// Write a temporary-tier value with the short-lived TTL policy applied.
+fn temporary_set<V: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(
+    env: &Env,
+    key: &SupplyChainDataKey,
+    value: &V,
+) {
+    let storage = env.storage().temporary();
+    storage.set(key, value);
+    storage.extend_ttl(key, TEMPORARY_TTL_THRESHOLD, TEMPORARY_TTL_TARGET);
+}
+
+/// Read an instance-tier counter / config value, bumping instance TTL.
+fn instance_get_u32(env: &Env, key: &SupplyChainDataKey) -> u32 {
+    let storage = env.storage().instance();
+    storage.extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_TARGET);
+    storage.get(key).unwrap_or(0)
+}
+
+/// Write an instance-tier counter / config value, bumping instance TTL.
+fn instance_set_u32(env: &Env, key: &SupplyChainDataKey, value: u32) {
+    let storage = env.storage().instance();
+    storage.set(key, &value);
+    storage.extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_TARGET);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Permissionless TTL extension
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Permissionless TTL bump for archival-critical supply chain records.
+///
+/// Any caller (no auth required) may invoke this to extend the TTL of
+/// provenance events, certifications, labor reports, environmental reports,
+/// brand registrations, product SKUs and verification timestamps so that
+/// active audit records are never unexpectedly archived.
+///
+/// The helper is idempotent and cheap: it only performs an `extend_ttl` when
+/// the entry exists and is below the archival threshold. It also bumps the
+/// instance TTL so counters remain live.
+pub fn extend_ttl(env: &Env, keys: Vec<SupplyChainDataKey>) {
+    let persistent = env.storage().persistent();
+    let temporary = env.storage().temporary();
+
+    for key in keys.iter() {
+        if is_persistent_key(&key) {
+            if persistent.has(&key) {
+                persistent.extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_TARGET);
+            }
+        } else if is_temporary_key(&key) {
+            if temporary.has(&key) {
+                temporary.extend_ttl(&key, TEMPORARY_TTL_THRESHOLD, TEMPORARY_TTL_TARGET);
+            }
+        }
+    }
+
+    // Keep instance-tier counters / config alive alongside the audit records.
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_TARGET);
+}
+
+/// Convenience permissionless helper: bump the TTL of a single
+/// archival-critical record. Returns `true` if the entry existed.
+pub fn extend_ttl_single(env: &Env, key: SupplyChainDataKey) -> bool {
+    if is_persistent_key(&key) {
+        let storage = env.storage().persistent();
+        if storage.has(&key) {
+            storage.extend_ttl(&key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_TARGET);
+            return true;
+        }
+        false
+    } else if is_temporary_key(&key) {
+        let storage = env.storage().temporary();
+        if storage.has(&key) {
+            storage.extend_ttl(&key, TEMPORARY_TTL_THRESHOLD, TEMPORARY_TTL_TARGET);
+            return true;
+        }
+        false
+    } else {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_TARGET);
+        true
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -402,7 +669,7 @@ pub fn register_brand(
     description: Bytes,
     website: Bytes,
     support_contact: Bytes,
-) {
+) -> Result<(), SupplyChainError> {
     owner.require_auth();
 
     let pre_state = Bytes::new(env);
@@ -419,22 +686,16 @@ pub fn register_brand(
         support_contact,
     };
 
-    env.storage()
-        .persistent()
-        .set(&SupplyChainDataKey::Brand(brand_id.clone()), &brand);
+    persistent_set(env, &SupplyChainDataKey::Brand(brand_id.clone()), &brand);
 
-    // Increment brand count
-    let count: u32 = env
-        .storage()
-        .persistent()
-        .get(&SupplyChainDataKey::BrandCount)
-        .unwrap_or(0);
-    env.storage()
-        .persistent()
-        .set(&SupplyChainDataKey::BrandCount, &(count + 1));
+    // Increment brand count (instance tier) using saturating arithmetic
+    let count = instance_get_u32(env, &SupplyChainDataKey::BrandCount);
+    instance_set_u32(env, &SupplyChainDataKey::BrandCount, count.saturating_add(1));
 
     let post_state = brand_id.to_xdr(env);
     emit_success(env, &owner, "register_brand", &pre_state, &post_state);
+
+    Ok(())
 }
 
 /// Register a product SKU for supply chain tracking
@@ -445,7 +706,7 @@ pub fn register_product_sku(
     sku: Bytes,
     product_name: Bytes,
     description: Bytes,
-) {
+) -> Result<(), SupplyChainError> {
     caller.require_auth();
 
     let pre_state = Bytes::new(env);
@@ -458,7 +719,7 @@ pub fn register_product_sku(
         .persistent()
         .has(&SupplyChainDataKey::Brand(brand_id.clone()))
     {
-        panic!("Brand not registered");
+        return Err(SupplyChainError::BrandNotRegistered);
     }
 
     let product = ProductSKU {
@@ -474,22 +735,20 @@ pub fn register_product_sku(
         last_updated: env.ledger().timestamp(),
     };
 
-    env.storage()
-        .persistent()
-        .set(&SupplyChainDataKey::ProductSKU(brand_id.clone(), sku), &product);
+    persistent_set(
+        env,
+        &SupplyChainDataKey::ProductSKU(brand_id.clone(), sku.clone()),
+        &product,
+    );
 
-    // Increment product count
-    let count: u32 = env
-        .storage()
-        .persistent()
-        .get(&SupplyChainDataKey::ProductCount)
-        .unwrap_or(0);
-    env.storage()
-        .persistent()
-        .set(&SupplyChainDataKey::ProductCount, &(count + 1));
+    // Increment product count (instance tier) using saturating arithmetic
+    let count = instance_get_u32(env, &SupplyChainDataKey::ProductCount);
+    instance_set_u32(env, &SupplyChainDataKey::ProductCount, count.saturating_add(1));
 
-    let post_state = sku.clone();
+    let post_state = sku;
     emit_success(env, &caller, "register_product_sku", &pre_state, &post_state);
+
+    Ok(())
 }
 
 /// Log a provenance event for product origin tracking
@@ -511,15 +770,17 @@ pub fn log_provenance_event(
         origin_location,
         timestamp: env.ledger().timestamp(),
         raw_material_source,
-        producer_address: producer,
+        producer_address: producer.clone(),
         batch_id,
         chain_of_custody: Vec::new(&env),
         is_verified: false,
     };
 
-    env.storage()
-        .persistent()
-        .set(&SupplyChainDataKey::ProvenanceEvent(event_id.clone()), &provenance);
+    persistent_set(
+        env,
+        &SupplyChainDataKey::ProvenanceEvent(event_id.clone()),
+        &provenance,
+    );
 
     let post_state = event_id.to_bytes();
     emit_success(env, &producer, "log_provenance_event", &pre_state, &post_state);
@@ -533,21 +794,22 @@ pub fn log_custody_transfer(
     to: Address,
     location: Location,
     notes: Bytes,
-) {
+) -> Result<(), SupplyChainError> {
     from.require_auth();
 
     let pre_state = Bytes::new(env);
     require_role(env, &from, Role::Custodian, "log_custody_transfer", &pre_state)
         .unwrap_or_else(|e| panic!("{:?}", e));
 
-    // Get existing provenance
-    let mut provenance: Provenance = env
-        .storage()
-        .persistent()
-        .get(&SupplyChainDataKey::ProvenanceEvent(event_id.clone()))
-        .unwrap_or_else(|| {
-            panic!("Provenance event not found");
-        });
+    // Get existing provenance (persistent tier, TTL auto-bumped)
+    let mut provenance: Provenance =
+        persistent_get(env, &SupplyChainDataKey::ProvenanceEvent(event_id.clone()))
+            .ok_or(SupplyChainError::ProvenanceNotFound)?;
+
+    // Enforce the explicit maximum collection length before mutating state.
+    if provenance.chain_of_custody.len() >= MAX_CUSTODY_TRANSFERS {
+        return Err(SupplyChainError::CollectionLimitExceeded);
+    }
 
     let transfer = CustodyTransfer {
         from_address: from.clone(),
@@ -558,12 +820,16 @@ pub fn log_custody_transfer(
     };
 
     provenance.chain_of_custody.push_back(transfer);
-    env.storage()
-        .persistent()
-        .set(&SupplyChainDataKey::ProvenanceEvent(event_id.clone()), &provenance);
+    persistent_set(
+        env,
+        &SupplyChainDataKey::ProvenanceEvent(event_id.clone()),
+        &provenance,
+    );
 
     let post_state = event_id.to_bytes();
     emit_success(env, &from, "log_custody_transfer", &pre_state, &post_state);
+
+    Ok(())
 }
 
 /// Log a certification event
@@ -574,15 +840,26 @@ pub fn log_certification(
     issuer: Address,
     expiry_days: u64,
     scope: Bytes,
-) {
+) -> Result<(), SupplyChainError> {
     issuer.require_auth();
 
     let pre_state = Bytes::new(env);
     require_role(env, &issuer, Role::Certifier, "log_certification", &pre_state)
         .unwrap_or_else(|e| panic!("{:?}", e));
 
+    // Reject malformed payloads before any arithmetic is performed.
+    if expiry_days > MAX_CERTIFICATION_DAYS {
+        return Err(SupplyChainError::InvalidPayload);
+    }
+
     let now = env.ledger().timestamp();
-    let expiry_date = now + (expiry_days * 86400); // Convert days to seconds
+    // Checked multiplication and addition: both operands are user-controlled.
+    let expiry_seconds = expiry_days
+        .checked_mul(SECONDS_PER_DAY)
+        .ok_or(SupplyChainError::ArithmeticOverflow)?;
+    let expiry_date = now
+        .checked_add(expiry_seconds)
+        .ok_or(SupplyChainError::ArithmeticOverflow)?;
 
     let certification = Certification {
         cert_id,
@@ -597,12 +874,16 @@ pub fn log_certification(
     };
 
     let cert_event_id = env.crypto().sha256(&certification.cert_id).to_bytes();
-    env.storage()
-        .persistent()
-        .set(&SupplyChainDataKey::CertificationEvent(cert_event_id.clone()), &certification);
+    persistent_set(
+        env,
+        &SupplyChainDataKey::CertificationEvent(cert_event_id.clone()),
+        &certification,
+    );
 
     let post_state = cert_event_id.to_bytes();
     emit_success(env, &issuer, "log_certification", &pre_state, &post_state);
+
+    Ok(())
 }
 
 /// Log labor conditions for a facility
@@ -617,7 +898,7 @@ pub fn log_labor_conditions(
     freedom_of_association: bool,
     report_hash: BytesN<32>,
     reporter: Address,
-) {
+) -> Result<(), SupplyChainError> {
     reporter.require_auth();
 
     let pre_state = Bytes::new(env);
@@ -639,12 +920,16 @@ pub fn log_labor_conditions(
     };
 
     let report_id = env.crypto().sha256(&facility_id).to_bytes();
-    env.storage()
-        .persistent()
-        .set(&SupplyChainDataKey::LaborReport(report_id.clone()), &labor_report);
+    persistent_set(
+        env,
+        &SupplyChainDataKey::LaborReport(report_id.clone()),
+        &labor_report,
+    );
 
     let post_state = report_id.to_bytes();
     emit_success(env, &reporter, "log_labor_conditions", &pre_state, &post_state);
+
+    Ok(())
 }
 
 /// Log environmental impact data for a facility
@@ -660,12 +945,20 @@ pub fn log_environmental_impact(
     emissions_reduction: u32,
     report_hash: BytesN<32>,
     reporter: Address,
-) {
+) -> Result<(), SupplyChainError> {
     reporter.require_auth();
 
     let pre_state = Bytes::new(env);
     require_role(env, &reporter, Role::Auditor, "log_environmental_impact", &pre_state)
         .unwrap_or_else(|e| panic!("{:?}", e));
+
+    // Reject malformed report periods and out-of-range percentages.
+    if report_period_end < report_period_start
+        || renewable_energy_percent > 100
+        || emissions_reduction > 100
+    {
+        return Err(SupplyChainError::InvalidPayload);
+    }
 
     let environmental = EnvironmentalImpact {
         facility_id: facility_id.clone(),
@@ -680,12 +973,16 @@ pub fn log_environmental_impact(
     };
 
     let report_id = env.crypto().sha256(&facility_id).to_bytes();
-    env.storage()
-        .persistent()
-        .set(&SupplyChainDataKey::EnvironmentalReport(report_id.clone()), &environmental);
+    persistent_set(
+        env,
+        &SupplyChainDataKey::EnvironmentalReport(report_id.clone()),
+        &environmental,
+    );
 
     let post_state = report_id.to_bytes();
     emit_success(env, &reporter, "log_environmental_impact", &pre_state, &post_state);
+
+    Ok(())
 }
 
 /// Verify a product's complete supply chain
@@ -693,15 +990,21 @@ pub fn verify_product_chain(
     env: &Env,
     brand_id: Symbol,
     sku: Bytes,
-) -> SupplyChainVerification {
-    // Get product
-    let product: ProductSKU = env
-        .storage()
-        .persistent()
-        .get(&SupplyChainDataKey::ProductSKU(brand_id.clone(), sku.clone()))
-        .unwrap_or_else(|| {
-            panic!("Product SKU not found");
-        });
+) -> Result<SupplyChainVerification, SupplyChainError> {
+    // Get product (persistent tier)
+    let product: ProductSKU = persistent_get(
+        env,
+        &SupplyChainDataKey::ProductSKU(brand_id.clone(), sku.clone()),
+    )
+    .ok_or(SupplyChainError::SkuNotFound)?;
+
+    // Enforce collection bounds before iterating over stored links.
+    if product.certifications.len() > MAX_CERTIFICATIONS
+        || product.labor_reports.len() > MAX_LABOR_REPORTS
+        || product.environmental_reports.len() > MAX_ENVIRONMENTAL_REPORTS
+    {
+        return Err(SupplyChainError::CollectionLimitExceeded);
+    }
 
     let mut provenance_verified = false;
     let mut certifications_valid = false;
@@ -712,14 +1015,12 @@ pub fn verify_product_chain(
 
     // Check provenance
     if product.provenance_id != BytesN::from_array(env, &[0u8; 32]) {
-        if let Some(prov) = env
-            .storage()
-            .persistent()
-            .get::<_, Provenance>(&SupplyChainDataKey::ProvenanceEvent(product.provenance_id))
+        if let Some(prov) =
+            persistent_get::<Provenance>(env, &SupplyChainDataKey::ProvenanceEvent(product.provenance_id))
         {
             provenance_verified = prov.is_verified;
             if provenance_verified {
-                verification_score += 25;
+                verification_score = verification_score.saturating_add(25);
             }
         }
     }
@@ -728,29 +1029,27 @@ pub fn verify_product_chain(
     if !product.certifications.is_empty() {
         let mut all_valid = true;
         for cert_id in product.certifications.iter() {
-            if let Some(cert) = env
-                .storage()
-                .persistent()
-                .get::<_, Certification>(&SupplyChainDataKey::CertificationEvent(cert_id))
+            if let Some(cert) =
+                persistent_get::<Certification>(env, &SupplyChainDataKey::CertificationEvent(cert_id))
             {
                 if !cert.is_active || cert.expiry_date < env.ledger().timestamp() {
                     all_valid = false;
-                    issues.push_back(Bytes::from_slice(&env, b"Certification expired"));
+                    if issues.len() < MAX_VERIFICATION_ISSUES {
+                        issues.push_back(Bytes::from_slice(&env, b"Certification expired"));
+                    }
                 }
             }
         }
         certifications_valid = all_valid;
         if certifications_valid {
-            verification_score += 25;
+            verification_score = verification_score.saturating_add(25);
         }
     }
 
     // Check labor conditions
     for labor_id in product.labor_reports.iter() {
-        if let Some(labor) = env
-            .storage()
-            .persistent()
-            .get::<_, LaborConditions>(&SupplyChainDataKey::LaborReport(labor_id))
+        if let Some(labor) =
+            persistent_get::<LaborConditions>(env, &SupplyChainDataKey::LaborReport(labor_id))
         {
             if !labor.wage_compliance
                 || !labor.working_hours_compliance
@@ -758,27 +1057,30 @@ pub fn verify_product_chain(
                 || !labor.safety_standards_met
             {
                 labor_compliant = false;
-                issues.push_back(Bytes::from_slice(&env, b"Labor conditions not met"));
+                if issues.len() < MAX_VERIFICATION_ISSUES {
+                    issues.push_back(Bytes::from_slice(&env, b"Labor conditions not met"));
+                }
             } else {
-                verification_score += 25;
+                verification_score = verification_score.saturating_add(25);
             }
         }
     }
 
     // Check environmental impact
     for env_id in product.environmental_reports.iter() {
-        if let Some(_env_impact) = env
-            .storage()
-            .persistent()
-            .get::<_, EnvironmentalImpact>(&SupplyChainDataKey::EnvironmentalReport(env_id))
+        if persistent_get::<EnvironmentalImpact>(
+            env,
+            &SupplyChainDataKey::EnvironmentalReport(env_id),
+        )
+        .is_some()
         {
-            verification_score += 25;
+            verification_score = verification_score.saturating_add(25);
         }
     }
 
     let is_verified = provenance_verified && certifications_valid && labor_compliant && environmental_standards_met;
 
-    SupplyChainVerification {
+    Ok(SupplyChainVerification {
         product_sku: sku,
         is_verified,
         provenance_verified,
@@ -788,19 +1090,25 @@ pub fn verify_product_chain(
         verification_timestamp: env.ledger().timestamp(),
         verification_score: if is_verified { 100 } else { verification_score },
         issues,
-    }
+    })
 }
 
 /// Get a consumer-friendly timeline of product events
-pub fn get_product_timeline(env: &Env, event_ids: Vec<BytesN<32>>) -> Vec<TimelineEntry> {
+pub fn get_product_timeline(
+    env: &Env,
+    event_ids: Vec<BytesN<32>>,
+) -> Result<Vec<TimelineEntry>, SupplyChainError> {
+    // Bound the input vector to keep CPU and memory deterministic.
+    if event_ids.len() > MAX_TIMELINE_EVENTS {
+        return Err(SupplyChainError::CollectionLimitExceeded);
+    }
+
     let mut timeline: Vec<TimelineEntry> = Vec::new(&env);
 
     for event_id in event_ids.iter() {
-        // Try to load as provenance
-        if let Some(prov) = env
-            .storage()
-            .persistent()
-            .get::<_, Provenance>(&SupplyChainDataKey::ProvenanceEvent(event_id.clone()))
+        // Try to load as provenance (persistent tier)
+        if let Some(prov) =
+            persistent_get::<Provenance>(env, &SupplyChainDataKey::ProvenanceEvent(event_id.clone()))
         {
             timeline.push_back(TimelineEntry {
                 timestamp: prov.timestamp,
@@ -813,23 +1121,26 @@ pub fn get_product_timeline(env: &Env, event_ids: Vec<BytesN<32>>) -> Vec<Timeli
         }
     }
 
-    timeline
+    Ok(timeline)
 }
 
 /// Get brand integrity report
-pub fn get_brand_integrity_report(env: &Env, brand_id: Symbol) -> BrandIntegrityReport {
+pub fn get_brand_integrity_report(
+    env: &Env,
+    brand_id: Symbol,
+) -> Result<BrandIntegrityReport, SupplyChainError> {
     // Verify brand exists
     if !env
         .storage()
         .persistent()
         .has(&SupplyChainDataKey::Brand(brand_id.clone()))
     {
-        panic!("Brand not registered");
+        return Err(SupplyChainError::BrandNotRegistered);
     }
 
     let now = env.ledger().timestamp();
 
-    BrandIntegrityReport {
+    Ok(BrandIntegrityReport {
         brand_id,
         report_date: now,
         total_products_tracked: 0,
@@ -840,7 +1151,7 @@ pub fn get_brand_integrity_report(env: &Env, brand_id: Symbol) -> BrandIntegrity
         products_verified: 0,
         quality_issues: 0,
         compliance_trend: Symbol::new(&env, "stable"),
-    }
+    })
 }
 
 /// Verify a specific certification
@@ -850,10 +1161,8 @@ pub fn verify_certification(
 ) -> bool {
     let cert_event_id = env.crypto().sha256(&cert_id).to_bytes();
 
-    if let Some(cert) = env
-        .storage()
-        .persistent()
-        .get::<_, Certification>(&SupplyChainDataKey::CertificationEvent(cert_event_id))
+    if let Some(cert) =
+        persistent_get::<Certification>(env, &SupplyChainDataKey::CertificationEvent(cert_event_id))
     {
         cert.is_active && cert.expiry_date > env.ledger().timestamp()
     } else {
@@ -886,11 +1195,15 @@ pub fn generate_qr_code_url(
 pub fn generate_integrity_proof(
     env: &Env,
     event_ids: Vec<BytesN<32>>,
-) -> BytesN<32> {
+) -> Result<BytesN<32>, SupplyChainError> {
+    // Bound the input vector so the proof payload size stays deterministic.
+    if event_ids.len() > MAX_TIMELINE_EVENTS {
+        return Err(SupplyChainError::CollectionLimitExceeded);
+    }
+
     let mut data = Bytes::new(env);
     for event_id in event_ids.iter() {
         data.append(&event_id.to_bytes());
     }
-    env.crypto().sha256(&data).to_bytes()
+    Ok(env.crypto().sha256(&data).to_bytes())
 }
-

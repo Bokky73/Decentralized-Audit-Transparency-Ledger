@@ -492,3 +492,198 @@ fn cross_contract_multiple_caller_contracts() {
     assert_eq!(evt0.metadata, Bytes::from_slice(&env, b"via-caller1"));
     assert_eq!(evt1.metadata, Bytes::from_slice(&env, b"via-caller2"));
 }
+
+// ── Pagination Edge-Case Tests ─────────────────────────────────────────────────────
+
+/// Helper: build a ledger with `count` events, each with a distinct submitter and
+/// an incrementing ledger timestamp so ordering and filters are deterministic.
+fn setup_paginated_ledger(
+    count: u32,
+) -> (Env, Address, AuditLedgerClient<'static>, Vec<Address>) {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let contract_id = env.register(AuditLedger, ());
+    let client = AuditLedgerClient::new(&env, &contract_id);
+
+    env.mock_all_auths_allowing_non_root_auth();
+    let mut owners = Vec::new(&env);
+    owners.push_back(owner.clone());
+    client.initialize(&owners, &(count + 10), &4096);
+
+    let mut submitters = Vec::new(&env);
+    for i in 0..count {
+        let submitter = Address::generate(&env);
+        submitters.push_back(submitter.clone());
+        client.log_event(
+            &submitter,
+            &symbol_short!("payment"),
+            &Bytes::from_slice(&env, b"data"),
+            &None,
+            &None,
+            &false,
+        );
+        // Advance the ledger timestamp so each event has a distinct timestamp.
+        env.ledger().set_timestamp(env.ledger().timestamp() + 1);
+        let _ = i;
+    }
+
+    (env, owner, client, submitters)
+}
+
+#[test]
+fn pagination_empty_results_returns_no_items_and_no_cursor() {
+    let (_env, _owner, client, _submitters) = setup_paginated_ledger(0);
+
+    let page = client.get_events_page(&None, &10, &None, &None, &None);
+    assert_eq!(page.items.len(), 0);
+    assert!(page.next_cursor.is_none());
+}
+
+#[test]
+fn pagination_single_item_page_returns_one_and_cursor() {
+    let (_env, _owner, client, _submitters) = setup_paginated_ledger(5);
+
+    let page = client.get_events_page(&None, &1, &None, &None, &None);
+    assert_eq!(page.items.len(), 1);
+    assert!(page.next_cursor.is_some());
+
+    // The cursor should point past the first item.
+    let next = client.get_events_page(&page.next_cursor, &1, &None, &None, &None);
+    assert_eq!(next.items.len(), 1);
+    assert_ne!(page.items.get(0).unwrap().order, next.items.get(0).unwrap().order);
+}
+
+#[test]
+fn pagination_cursor_past_end_returns_empty() {
+    let (_env, _owner, client, _submitters) = setup_paginated_ledger(3);
+
+    // Walk to the end.
+    let mut cursor = None;
+    let mut seen = 0u32;
+    loop {
+        let page = client.get_events_page(&cursor, &10, &None, &None, &None);
+        if page.items.len() == 0 {
+            break;
+        }
+        seen += page.items.len();
+        cursor = page.next_cursor.clone();
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(seen, 3);
+
+    // A cursor past the end yields an empty page with no next cursor.
+    let past_end = client.get_events_page(&cursor, &10, &None, &None, &None);
+    assert_eq!(past_end.items.len(), 0);
+    assert!(past_end.next_cursor.is_none());
+}
+
+#[test]
+fn pagination_full_multi_page_traversal_is_complete_and_ordered() {
+    let (_env, _owner, client, _submitters) = setup_paginated_ledger(25);
+
+    let mut cursor = None;
+    let mut collected: Vec<u64> = Vec::new(&_env);
+    loop {
+        let page = client.get_events_page(&cursor, &7, &None, &None, &None);
+        for item in page.items.iter() {
+            collected.push_back(item.order);
+        }
+        match page.next_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+
+    assert_eq!(collected.len(), 25);
+    // Deterministic ascending ordering by order.
+    for i in 1..collected.len() {
+        assert!(collected.get(i).unwrap() > collected.get(i - 1).unwrap());
+    }
+}
+
+#[test]
+fn pagination_page_limit_cap_is_enforced() {
+    let (_env, _owner, client, _submitters) = setup_paginated_ledger(150);
+
+    // Request more than the max page size; the contract must cap it at 100.
+    let page = client.get_events_page(&None, &1000, &None, &None, &None);
+    assert!(page.items.len() <= 100);
+    assert_eq!(page.items.len(), 100);
+    assert!(page.next_cursor.is_some());
+}
+
+#[test]
+fn pagination_filter_by_timestamp_range() {
+    let (env, _owner, client, _submitters) = setup_paginated_ledger(10);
+
+    // Events were logged at timestamps 0..9 (incrementing by 1 each time).
+    let page = client.get_events_page(&None, &100, &Some(3), &Some(6), &None);
+    assert!(page.items.len() > 0);
+    for item in page.items.iter() {
+        assert!(item.timestamp >= 3);
+        assert!(item.timestamp <= 6);
+    }
+    let _ = env;
+}
+
+#[test]
+fn pagination_filter_by_status() {
+    let (_env, _owner, client, _submitters) = setup_paginated_ledger(5);
+
+    let page = client.get_events_page(
+        &None,
+        &100,
+        &None,
+        &None,
+        &Some(WorkflowStatus::Completed),
+    );
+    // All events were logged as completed workflows in the helper.
+    assert_eq!(page.items.len(), 5);
+    for item in page.items.iter() {
+        assert_eq!(item.status, WorkflowStatus::Completed);
+    }
+}
+
+#[test]
+fn pagination_filter_by_submitter_address() {
+    let (_env, _owner, client, submitters) = setup_paginated_ledger(6);
+
+    let target = submitters.get(2).unwrap();
+    let page = client.get_events_page(&None, &100, &None, &None, &None);
+    let _ = page;
+
+    let filtered = client.get_events_page_by_submitter(&None, &100, &target);
+    assert_eq!(filtered.items.len(), 1);
+    assert_eq!(filtered.items.get(0).unwrap().submitter, target);
+}
+
+#[test]
+fn pagination_combined_filters() {
+    let (_env, _owner, client, submitters) = setup_paginated_ledger(8);
+
+    let target = submitters.get(4).unwrap();
+    let page = client.get_events_page_by_submitter(&None, &100, &target);
+    assert_eq!(page.items.len(), 1);
+    let item = page.items.get(0).unwrap();
+    assert_eq!(item.submitter, target);
+    assert_eq!(item.status, WorkflowStatus::Completed);
+    assert!(item.timestamp >= 0);
+}
+
+#[test]
+fn pagination_ordering_is_stable_across_repeated_queries() {
+    let (_env, _owner, client, _submitters) = setup_paginated_ledger(20);
+
+    let first = client.get_events_page(&None, &100, &None, &None, &None);
+    let second = client.get_events_page(&None, &100, &None, &None, &None);
+
+    assert_eq!(first.items.len(), second.items.len());
+    for i in 0..first.items.len() {
+        assert_eq!(
+            first.items.get(i).unwrap().order,
+            second.items.get(i).unwrap().order
+        );
+    }
+}
