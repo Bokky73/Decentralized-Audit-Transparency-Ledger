@@ -43,7 +43,10 @@ pub struct ConfidentialMetadata {
     pub event_type: Symbol,
     pub encrypted_payload: Bytes,
     pub policy: AccessControlPolicy,
-    pub zk_proof: Bytes,
+    /// SHA-256 commitment over the submitted ZK proof. Storing only the
+    /// commitment instead of the full proof slashes the per-event rent
+    /// footprint while preserving tamper-evidence of the proof of record.
+    pub zk_proof_hash: BytesN<32>,
     pub key_id: BytesN<32>,
     pub created_at: u64,
 }
@@ -58,6 +61,36 @@ pub struct EncryptionKeyRecord {
     pub registered_at: u64,
     pub rotated_at: u64,
 }
+
+// ── Storage TTL / rent constants (issue #911) ───────────────────────────────
+
+/// Bump persistent keys when their remaining TTL falls below this many ledgers.
+pub const TTL_BUMP_THRESHOLD_LEDGERS: u32 = 10_000;
+
+/// Default TTL extension window (ledgers) for operator-facing records such as
+/// encryption key registrations. Evenly divisible refresh cycle ≈ 8 days at
+/// ~5s ledger cadence; bumps are idempotent and cumulative.
+pub const DEFAULT_TTL_EXTEND_LEDGERS: u32 = 100_000;
+
+/// Archival TTL extension window (ledgers) for confidential event envelopes:
+/// evidence-grade records must survive far longer than operator records.
+pub const ARCHIVE_TTL_EXTEND_LEDGERS: u32 = 200_000;
+
+/// Maximum size (bytes) of an `encrypted_payload` envelope; caps the rent paid
+/// per archived confidential event.
+pub const MAX_ENCRYPTED_PAYLOAD_BYTES: u32 = 65_536;
+
+/// Maximum size (bytes) of a submitted ZK proof; proofs are verified then
+/// discarded — only a 32-byte hash is stored, so oversized proofs never reach
+/// persistence.
+pub const MAX_ZK_PROOF_BYTES: u32 = 1_024;
+
+/// Maximum number of addresses permitted in a `CustomAllowlist` policy.
+pub const MAX_POLICY_PARTIES: u32 = 128;
+
+/// Maximum number of events allowed in a single privacy-preserving analytics
+/// aggregation batch; bounds the in-memory accumulator its compute footprint.
+pub const MAX_AGGREGATE_BATCH: u32 = 256;
 
 /// Privacy-preserving analytics aggregation result (aggregated without decrypting).
 #[contracttype]
@@ -195,6 +228,14 @@ impl ConfidentialEventLedger {
     ) -> Result<BytesN<32>, ConfidentialError> {
         Self::require_submitter(&env, &submitter, "log_confidential_event")?;
 
+        // Bound the rent footprint: reject oversized envelopes and proofs
+        // before any storage is touched.
+        if encrypted_metadata.len() > MAX_ENCRYPTED_PAYLOAD_BYTES
+            || zk_proof.len() > MAX_ZK_PROOF_BYTES
+        {
+            panic_with_error!(&env, ConfidentialError::PayloadTooLarge);
+        }
+
         // Verify ZK proof of valid encryption format without revealing underlying plaintext
         if !Self::verify_zk_proof(&env, &zk_proof, &encrypted_metadata) {
             Self::emit_denied(
@@ -206,7 +247,7 @@ impl ConfidentialEventLedger {
             panic_with_error!(&env, ConfidentialError::InvalidZKProof);
         }
 
-        // Validate policy configuration
+        // Validate policy configuration and its cardinality bounds
         match &access_policy {
             AccessControlPolicy::CustomAllowlist(list) => {
                 if list.is_empty() {
@@ -218,6 +259,9 @@ impl ConfidentialEventLedger {
                     );
                     panic_with_error!(&env, ConfidentialError::InvalidPolicy);
                 }
+                if list.len() > MAX_POLICY_PARTIES {
+                    panic_with_error!(&env, ConfidentialError::PolicyTooLarge);
+                }
             }
             AccessControlPolicy::ThresholdDecryption { threshold, authorized_parties } => {
                 if *threshold == 0 || *threshold > authorized_parties.len() {
@@ -228,6 +272,9 @@ impl ConfidentialEventLedger {
                         ConfidentialError::InvalidPolicy as u32,
                     );
                     panic_with_error!(&env, ConfidentialError::InvalidPolicy);
+                }
+                if authorized_parties.len() > MAX_POLICY_PARTIES {
+                    panic_with_error!(&env, ConfidentialError::PolicyTooLarge);
                 }
             }
             _ => {}
@@ -245,20 +292,24 @@ impl ConfidentialEventLedger {
         let now = env.ledger().timestamp();
         let event_id = Self::derive_event_id(&env, &submitter, seq, now);
 
+        // Only the proof commitment is archived; verification happened above.
+        let zk_proof_hash: BytesN<32> = env.crypto().sha256(&zk_proof);
+
         let metadata_record = ConfidentialMetadata {
             submitter: submitter.clone(),
             event_type,
             encrypted_payload: encrypted_metadata,
             policy: access_policy,
-            zk_proof,
+            zk_proof_hash,
             key_id,
             created_at: now,
         };
 
-        env.storage().persistent().set(
-            &ConfidentialStorageKey::Event(event_id.clone()),
-            &metadata_record,
-        );
+        let event_key = ConfidentialStorageKey::Event(event_id.clone());
+        env.storage().persistent().set(&event_key, &metadata_record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&event_key, TTL_BUMP_THRESHOLD_LEDGERS, ARCHIVE_TTL_EXTEND_LEDGERS);
 
         let total: u32 = env
             .storage()
@@ -272,6 +323,25 @@ impl ConfidentialEventLedger {
         Self::emit_success(&env, &submitter, "log_confidential_event");
 
         Ok(event_id)
+    }
+
+    /// Permissionless TTL extension for an archived confidential event.
+    /// Bumps the event envelope's TTL so evidence-grade records are never
+    /// unexpectedly collected by archival rent. Safe to call by anyone.
+    pub fn extend_event_ttl(env: Env, event_id: BytesN<32>) {
+        let key = ConfidentialStorageKey::Event(event_id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_BUMP_THRESHOLD_LEDGERS, ARCHIVE_TTL_EXTEND_LEDGERS);
+    }
+
+    /// Permissionless TTL extension for a registered encryption key record.
+    /// Safe to call by anyone.
+    pub fn extend_encryption_key_ttl(env: Env, owner: Address) {
+        let key = ConfidentialStorageKey::KeyRecord(owner);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_BUMP_THRESHOLD_LEDGERS, DEFAULT_TTL_EXTEND_LEDGERS);
     }
 
     /// Check if a requester is authorized under the event's access policy.
@@ -322,6 +392,10 @@ impl ConfidentialEventLedger {
         env: Env,
         event_ids: Vec<BytesN<32>>,
     ) -> ConfidentialAggregate {
+        if event_ids.len() > MAX_AGGREGATE_BATCH {
+            panic_with_error!(&env, ConfidentialError::BatchTooLarge);
+        }
+
         let total = event_ids.len();
         let now = env.ledger().timestamp();
 

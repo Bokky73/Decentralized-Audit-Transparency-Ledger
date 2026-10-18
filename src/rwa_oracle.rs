@@ -20,8 +20,6 @@
 //! * **Price history** – Every accepted canonical price is pushed onto an
 //!   append-only per-asset list for audit and back-testing.
 
-#![no_std]
-
 use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, Symbol, Vec};
 
 // ---------------------------------------------------------------------------
@@ -53,6 +51,20 @@ pub const MAX_ORACLE_NAME_LEN: u32 = 64;
 
 /// Maximum history entries kept per asset to avoid unbounded state growth.
 pub const MAX_PRICE_HISTORY: u32 = 1_000;
+
+// ── Storage TTL bump policy (issue #811) ────────────────────────────────────
+
+/// Bump persistent keys when their remaining TTL falls below this many ledgers.
+pub const TTL_BUMP_THRESHOLD_LEDGERS: u32 = 10_000;
+
+/// TTL extension window (ledgers) for hot records: oracle registrations,
+/// asset registrations, and the latest canonical price. Refreshes on every
+/// write plus via the permissionless `extend_*_ttl` entry points.
+pub const RECORD_TTL_EXTEND_LEDGERS: u32 = 100_000;
+
+/// Archival TTL window (ledgers) for canonical price history entries:
+/// back-testing evidence-grade data must outlive hot records.
+pub const ARCHIVE_TTL_EXTEND_LEDGERS: u32 = 200_000;
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -369,8 +381,13 @@ pub enum OracleDataKey {
     PendingFeeds(Symbol),
     /// Most recent canonical price for an asset.  Key = asset Symbol.
     LatestPrice(Symbol),
-    /// Price history list for an asset.  Key = asset Symbol.
-    PriceHistory(Symbol),
+    /// Number of archived canonical prices for an asset (absolute, 0-based
+    /// next write index).  Key = asset Symbol.
+    PriceHistoryCount(Symbol),
+    /// One archived canonical price.  Key = (asset Symbol, absolute index).
+    /// Per-entry persistent keys let archival readers bump TTL for a single
+    /// price instead of paying rent on the whole history.
+    PriceHistoryEntry(Symbol, u64),
     /// Contract owner address.
     Owner,
     /// Global staleness window in seconds.
@@ -583,12 +600,18 @@ pub fn register_oracle(
         return Err(OracleError::InvalidReputationScore);
     }
     let key = OracleDataKey::Oracle(address.clone());
-    if env.storage().instance().has(&key) {
+    if env.storage().persistent().has(&key) {
         return Err(OracleError::AlreadyRegistered);
     }
 
     let record = OracleRecord::new(env, address, name, supported_classes, reputation_score);
-    env.storage().instance().set(&key, &record);
+    env.storage().persistent().set(&key, &record);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_BUMP_THRESHOLD_LEDGERS, RECORD_TTL_EXTEND_LEDGERS);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_BUMP_THRESHOLD_LEDGERS, RECORD_TTL_EXTEND_LEDGERS);
 
     let count: u32 = env
         .storage()
@@ -597,7 +620,7 @@ pub fn register_oracle(
         .unwrap_or(0);
     env.storage()
         .instance()
-        .set(&OracleDataKey::OracleCount, &(count + 1));
+        .set(&OracleDataKey::OracleCount, &(count.saturating_add(1)));
 
     Ok(record)
 }
@@ -605,7 +628,7 @@ pub fn register_oracle(
 /// Retrieves an oracle record.  Returns `Err(NotRegistered)` if absent.
 pub fn get_oracle(env: &Env, address: &Address) -> Result<OracleRecord, OracleError> {
     env.storage()
-        .instance()
+        .persistent()
         .get(&OracleDataKey::Oracle(address.clone()))
         .ok_or(OracleError::NotRegistered)
 }
@@ -619,11 +642,14 @@ pub fn set_oracle_status(
     let key = OracleDataKey::Oracle(address.clone());
     let mut record: OracleRecord = env
         .storage()
-        .instance()
+        .persistent()
         .get(&key)
         .ok_or(OracleError::NotRegistered)?;
     record.status = status as u8;
-    env.storage().instance().set(&key, &record);
+    env.storage().persistent().set(&key, &record);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_BUMP_THRESHOLD_LEDGERS, RECORD_TTL_EXTEND_LEDGERS);
     Ok(())
 }
 
@@ -638,7 +664,7 @@ pub fn register_asset(
     staleness_window_override: Option<u64>,
 ) -> Result<AssetRecord, OracleError> {
     let key = OracleDataKey::Asset(asset_id.clone());
-    if env.storage().instance().has(&key) {
+    if env.storage().persistent().has(&key) {
         return Err(OracleError::AssetAlreadyRegistered);
     }
 
@@ -654,7 +680,10 @@ pub fn register_asset(
         registered_at: env.ledger().timestamp(),
         total_updates: 0,
     };
-    env.storage().instance().set(&key, &record);
+    env.storage().persistent().set(&key, &record);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_BUMP_THRESHOLD_LEDGERS, RECORD_TTL_EXTEND_LEDGERS);
 
     let count: u32 = env
         .storage()
@@ -663,7 +692,7 @@ pub fn register_asset(
         .unwrap_or(0);
     env.storage()
         .instance()
-        .set(&OracleDataKey::AssetCount, &(count + 1));
+        .set(&OracleDataKey::AssetCount, &(count.saturating_add(1)));
 
     Ok(record)
 }
@@ -671,7 +700,7 @@ pub fn register_asset(
 /// Retrieves an asset record.
 pub fn get_asset(env: &Env, asset_id: &Symbol) -> Result<AssetRecord, OracleError> {
     env.storage()
-        .instance()
+        .persistent()
         .get(&OracleDataKey::Asset(asset_id.clone()))
         .ok_or(OracleError::AssetNotRegistered)
 }
@@ -716,7 +745,7 @@ pub fn submit_price_feed(
     } else {
         get_staleness_window(env)
     };
-    if observed_at > now + 60 {
+    if observed_at > now.saturating_add(60) {
         return Err(OracleError::FutureTimestamp);
     }
     if now.saturating_sub(observed_at) > window {
@@ -738,21 +767,27 @@ pub fn submit_price_feed(
 
     // Append to pending feeds buffer.
     let pkey = OracleDataKey::PendingFeeds(asset_id.clone());
-    let mut pending: Vec<PriceFeed> = env.storage().instance().get(&pkey).unwrap_or(Vec::new(env));
+    let mut pending: Vec<PriceFeed> = env.storage().persistent().get(&pkey).unwrap_or_else(|| Vec::new(env));
 
     // Auto-flush if buffer is full.
     if (pending.len() as u32) >= MAX_PENDING_FEEDS {
         pending = Vec::new(env); // clear stale buffer; consensus will be triggered externally
     }
     pending.push_back(feed.clone());
-    env.storage().instance().set(&pkey, &pending);
+    env.storage().persistent().set(&pkey, &pending);
+    env.storage()
+        .persistent()
+        .extend_ttl(&pkey, TTL_BUMP_THRESHOLD_LEDGERS, RECORD_TTL_EXTEND_LEDGERS);
 
     // Update oracle submission counter.
     let okey = OracleDataKey::Oracle(oracle.clone());
-    if let Some(mut orec) = env.storage().instance().get::<OracleDataKey, OracleRecord>(&okey) {
-        orec.total_submissions += 1;
+    if let Some(mut orec) = env.storage().persistent().get::<_, OracleRecord>(&okey) {
+        orec.total_submissions = orec.total_submissions.saturating_add(1);
         orec.last_submission_at = now;
-        env.storage().instance().set(&okey, &orec);
+        env.storage().persistent().set(&okey, &orec);
+        env.storage()
+            .persistent()
+            .extend_ttl(&okey, TTL_BUMP_THRESHOLD_LEDGERS, RECORD_TTL_EXTEND_LEDGERS);
     }
 
     Ok(feed)
@@ -767,7 +802,7 @@ pub fn process_consensus(
 ) -> Result<CanonicalPrice, OracleError> {
     let asset_record = get_asset(env, asset_id)?;
     let pkey = OracleDataKey::PendingFeeds(asset_id.clone());
-    let pending: Vec<PriceFeed> = env.storage().instance().get(&pkey).unwrap_or(Vec::new(env));
+    let pending: Vec<PriceFeed> = env.storage().persistent().get(&pkey).unwrap_or_else(|| Vec::new(env));
 
     if pending.is_empty() {
         return Err(OracleError::NoFeedsAvailable);
@@ -832,15 +867,17 @@ pub fn process_consensus(
         // Mark oracle rejections.
         for feed in feeds_vec.iter() {
             let okey = OracleDataKey::Oracle(feed.oracle.clone());
-            if let Some(mut orec) = env.storage().instance().get::<OracleDataKey, OracleRecord>(&okey) {
+            if let Some(mut orec) = env.storage().persistent().get::<_, OracleRecord>(&okey) {
                 orec.total_rejections = orec.total_rejections.saturating_add(1);
-                env.storage().instance().set(&okey, &orec);
+                env.storage().persistent().set(&okey, &orec);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&okey, TTL_BUMP_THRESHOLD_LEDGERS, RECORD_TTL_EXTEND_LEDGERS);
             }
         }
         // Clear pending feeds so the next round starts fresh.
-        env.storage()
-            .instance()
-            .set(&pkey, &Vec::<PriceFeed>::new(env));
+        let fresh = Vec::<PriceFeed>::new(env);
+        env.storage().persistent().set(&pkey, &fresh);
         return Err(match result {
             ConsensusResult::InsufficientQuorum => OracleError::InvalidPrice,
             ConsensusResult::DeviationExceeded => OracleError::InvalidPrice,
@@ -857,16 +894,26 @@ pub fn process_consensus(
         }
     }
 
-    // Build canonical price and chain it.
-    let hist_key = OracleDataKey::PriceHistory(asset_id.clone());
-    let mut history: Vec<CanonicalPrice> =
-        env.storage().instance().get(&hist_key).unwrap_or(Vec::new(env));
+    // Build canonical price and chain it against the previous archival entry.
+    let count_key = OracleDataKey::PriceHistoryCount(asset_id.clone());
+    let count: u32 = env
+        .storage()
+        .persistent()
+        .get(&count_key)
+        .unwrap_or(0);
 
-    let history_index = history.len() as u32;
-    let prev_hash: BytesN<32> = history
-        .last()
-        .map(|p| p.chain_hash.clone())
-        .unwrap_or(BytesN::from_array(env, &[0u8; 32]));
+    let history_index: u64 = count as u64;    let prev_hash: BytesN<32> = if count == 0 {
+        BytesN::from_array(env, &[0u8; 32])
+    } else {
+        env.storage()
+            .persistent()
+            .get::<_, CanonicalPrice>(&OracleDataKey::PriceHistoryEntry(
+                asset_id.clone(),
+                (count - 1) as u64,
+            ))
+            .map(|prev| prev.chain_hash)
+            .unwrap_or_else(|| BytesN::from_array(env, &[0u8; 32]))
+    };
     let chain_hash = compute_canonical_hash(env, asset_id, price, now, &prev_hash);
 
     let canonical = CanonicalPrice {
@@ -882,22 +929,41 @@ pub fn process_consensus(
         prev_hash,
     };
 
-    // Append to history, respecting the cap.
-    if (history.len() as u32) < MAX_PRICE_HISTORY {
-        history.push_back(canonical.clone());
-        env.storage().instance().set(&hist_key, &history);
+    // Append to per-entry persistent archival storage, respecting the rolling
+    // window cap: once the cap is reached the oldest entry's key is retired so
+    // per-asset rent stays bounded instead of growing forever.
+    if count >= MAX_PRICE_HISTORY {
+        env.storage().persistent().remove(&OracleDataKey::PriceHistoryEntry(
+            asset_id.clone(),
+            (count - MAX_PRICE_HISTORY) as u64,
+        ));
     }
 
-    // Update latest price.
+    let entry_key = OracleDataKey::PriceHistoryEntry(asset_id.clone(), history_index);
+    env.storage().persistent().set(&entry_key, &canonical);
     env.storage()
-        .instance()
-        .set(&OracleDataKey::LatestPrice(asset_id.clone()), &canonical);
+        .persistent()
+        .extend_ttl(&entry_key, TTL_BUMP_THRESHOLD_LEDGERS, ARCHIVE_TTL_EXTEND_LEDGERS);
+
+    env.storage()
+        .persistent()
+        .set(&count_key, &(count.saturating_add(1)));
+
+    // Update latest price (hot read key, archival window).
+    let latest_key = OracleDataKey::LatestPrice(asset_id.clone());
+    env.storage().persistent().set(&latest_key, &canonical);
+    env.storage()
+        .persistent()
+        .extend_ttl(&latest_key, TTL_BUMP_THRESHOLD_LEDGERS, RECORD_TTL_EXTEND_LEDGERS);
 
     // Update asset total_updates counter.
     let akey = OracleDataKey::Asset(asset_id.clone());
-    if let Some(mut arec) = env.storage().instance().get::<OracleDataKey, AssetRecord>(&akey) {
+    if let Some(mut arec) = env.storage().persistent().get::<_, AssetRecord>(&akey) {
         arec.total_updates = arec.total_updates.saturating_add(1);
-        env.storage().instance().set(&akey, &arec);
+        env.storage().persistent().set(&akey, &arec);
+        env.storage()
+            .persistent()
+            .extend_ttl(&akey, TTL_BUMP_THRESHOLD_LEDGERS, RECORD_TTL_EXTEND_LEDGERS);
     }
 
     // Increment global round counter.
@@ -908,12 +974,11 @@ pub fn process_consensus(
         .unwrap_or(0);
     env.storage()
         .instance()
-        .set(&OracleDataKey::TotalRounds, &(rounds + 1));
+        .set(&OracleDataKey::TotalRounds, &(rounds.saturating_add(1)));
 
-    // Clear pending feeds.
-    env.storage()
-        .instance()
-        .set(&pkey, &Vec::<PriceFeed>::new(env));
+    // Clear pending feeds so the next round starts fresh.
+    let fresh = Vec::<PriceFeed>::new(env);
+    env.storage().persistent().set(&pkey, &fresh);
 
     Ok(canonical)
 }
@@ -921,16 +986,80 @@ pub fn process_consensus(
 /// Returns the latest canonical price for an asset, if one has been published.
 pub fn get_latest_price(env: &Env, asset_id: &Symbol) -> Option<CanonicalPrice> {
     env.storage()
-        .instance()
+        .persistent()
         .get(&OracleDataKey::LatestPrice(asset_id.clone()))
 }
 
-/// Returns the full price history for an asset (up to MAX_PRICE_HISTORY).
-pub fn get_price_history(env: &Env, asset_id: &Symbol) -> Vec<CanonicalPrice> {
+/// Retrieves a single archived canonical price by absolute history index.
+pub fn get_canonical_price(env: &Env, asset_id: &Symbol, index: u64) -> Option<CanonicalPrice> {
     env.storage()
-        .instance()
-        .get(&OracleDataKey::PriceHistory(asset_id.clone()))
-        .unwrap_or(Vec::new(env))
+        .persistent()
+        .get(&OracleDataKey::PriceHistoryEntry(asset_id.clone(), index))
+}
+
+/// Returns the price history window for an asset (up to MAX_PRICE_HISTORY
+/// most recent canonical prices, oldest first).
+pub fn get_price_history(env: &Env, asset_id: &Symbol) -> Vec<CanonicalPrice> {
+    let count: u32 = env
+        .storage()
+        .persistent()
+        .get(&OracleDataKey::PriceHistoryCount(asset_id.clone()))
+        .unwrap_or(0);
+
+    let mut history = Vec::new(env);
+    let start = count.saturating_sub(MAX_PRICE_HISTORY);
+    for idx in (start as u64)..(count as u64) {
+        if let Some(entry) = env
+            .storage()
+            .persistent()
+            .get::<_, CanonicalPrice>(&OracleDataKey::PriceHistoryEntry(asset_id.clone(), idx))
+        {
+            history.push_back(entry);
+        }
+    }
+    history
+}
+
+/// Permissionless TTL extension for an oracle registration record. Keeps the
+/// record live for monitoring without paying for a full re-registration.
+pub fn extend_oracle_ttl(env: &Env, oracle: &Address) {
+    let key = OracleDataKey::Oracle(oracle.clone());
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_BUMP_THRESHOLD_LEDGERS, RECORD_TTL_EXTEND_LEDGERS);
+}
+
+/// Permissionless TTL extension for an asset registration record.
+pub fn extend_asset_ttl(env: &Env, asset_id: &Symbol) {
+    let key = OracleDataKey::Asset(asset_id.clone());
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_BUMP_THRESHOLD_LEDGERS, RECORD_TTL_EXTEND_LEDGERS);
+}
+
+/// Permissionless archival TTL extension for a canonical price history entry.
+/// `back_index` counts back from the newest entry (0 = newest) so archival
+/// readers can keep consensus evidence live without bumping the whole window.
+pub fn extend_canonical_price_ttl(env: &Env, asset_id: &Symbol, back_index: u32) {
+    let count: u32 = env
+        .storage()
+        .persistent()
+        .get(&OracleDataKey::PriceHistoryCount(asset_id.clone()))
+        .unwrap_or(0);
+    let absolute = count.saturating_sub(back_index.saturating_add(1)) as u64;
+    let key = OracleDataKey::PriceHistoryEntry(asset_id.clone(), absolute);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_BUMP_THRESHOLD_LEDGERS, ARCHIVE_TTL_EXTEND_LEDGERS);
+}
+
+/// Permissionless TTL extension for the latest canonical price of an asset
+/// (the hot read cached by integrators).
+pub fn extend_latest_price_ttl(env: &Env, asset_id: &Symbol) {
+    let key = OracleDataKey::LatestPrice(asset_id.clone());
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_BUMP_THRESHOLD_LEDGERS, RECORD_TTL_EXTEND_LEDGERS);
 }
 
 /// Hard cap on the number of price-history entries returned in a single page.
@@ -1196,7 +1325,7 @@ pub fn is_latest_price_stale(env: &Env, asset_id: &Symbol) -> bool {
 /// Returns pending feed count for an asset (useful for monitoring).
 pub fn pending_feed_count(env: &Env, asset_id: &Symbol) -> u32 {
     let pkey = OracleDataKey::PendingFeeds(asset_id.clone());
-    let pending: Vec<PriceFeed> = env.storage().instance().get(&pkey).unwrap_or(Vec::new(env));
+    let pending: Vec<PriceFeed> = env.storage().persistent().get(&pkey).unwrap_or_else(|| Vec::new(env));
     pending.len() as u32
 }
 

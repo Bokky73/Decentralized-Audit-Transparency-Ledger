@@ -48,6 +48,9 @@ use soroban_sdk::{
     Vec,
 };
 
+pub mod rbac;
+pub mod cross_chain_bridge;
+
 pub mod supply_chain;
 // Fine-grained RBAC role gating shared by mutating modules (supply chain,
 // cross-contract router) and susbmitter suspension controls (issue #865).
