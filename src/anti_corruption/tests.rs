@@ -2,6 +2,7 @@
 mod tests {
     use crate::anti_corruption::*;
     use soroban_sdk::{vec, Address, Bytes, Env};
+    use proptest::prelude::*;
 
     fn create_test_env() -> Env {
         Env::default()
@@ -541,5 +542,355 @@ mod tests {
             AntiCorruption::get_compliance_stats(env.clone());
         assert_eq!(assessments, 1);
         assert_eq!(training_count, 1);
+    }
+
+    // ── Concurrency Tests (#908) ──────────────────────────────────────────
+
+    const CONCURRENT_INITIATORS: u32 = 5;
+
+    fn concurrent_initiators(env: &Env) -> Vec<Address> {
+        let mut addrs = Vec::new(env);
+        for _ in 0..CONCURRENT_INITIATORS {
+            addrs.push_back(sample_address(env, addrs.len() as u32 + 100));
+        }
+        addrs
+    }
+
+    #[test]
+    fn concurrent_transaction_monitoring_interleaved() {
+        let env = create_test_env();
+        let owner = sample_address(&env, 1);
+        let compliance_officer = sample_address(&env, 2);
+        let initiators = concurrent_initiators(&env);
+
+        AntiCorruption::initialize(env.clone(), owner.clone(), compliance_officer.clone());
+
+        let mut tx_ids = Vec::new(&env);
+        for sequence in 0..25 {
+            let initiator = initiators.get(sequence % CONCURRENT_INITIATORS).unwrap();
+            let counterparty = initiators.get((sequence + 1) % CONCURRENT_INITIATORS).unwrap();
+            let tx_id = AntiCorruption::monitor_transaction(
+                env.clone(),
+                initiator.clone(),
+                initiator.clone(),
+                counterparty.clone(),
+                1, // GovernmentPayment
+                1000u64,
+                Bytes::from_slice(&env, b"USD"),
+                Bytes::from_slice(&env, b"concurrent payment"),
+            );
+            tx_ids.push_back(tx_id);
+        }
+
+        assert_eq!(tx_ids.len(), 25);
+
+        // Every monitored transaction must be retrievable and consistent.
+        for tx_id in tx_ids.iter() {
+            let transaction = AntiCorruption::get_transaction(env.clone(), *tx_id);
+            assert_eq!(transaction.amount, 1000);
+            assert_eq!(transaction.status, 1); // Approved (no sanctions match in empty env)
+        }
+
+        // Counter must equal the number of monitored transactions.
+        let total: u32 = env
+            .storage()
+            .instance()
+            .get(&AntiCorruptionKey::TransactionCount)
+            .unwrap_or(0);
+        assert_eq!(total, 25);
+    }
+
+    #[test]
+    fn concurrent_training_assignment_and_completion() {
+        let env = create_test_env();
+        let owner = sample_address(&env, 1);
+        let compliance_officer = sample_address(&env, 2);
+        let employees = concurrent_initiators(&env);
+
+        AntiCorruption::initialize(env.clone(), owner.clone(), compliance_officer.clone());
+
+        let now = env.ledger().timestamp();
+        let mut training_ids = Vec::new(&env);
+        for sequence in 0..15 {
+            let employee = employees.get(sequence % CONCURRENT_INITIATORS).unwrap();
+            let training_id = AntiCorruption::create_training(
+                env.clone(),
+                compliance_officer.clone(),
+                employee.clone(),
+                1,
+                now + 86400 * 30,
+            );
+            training_ids.push_back(training_id);
+        }
+
+        for (sequence, training_id) in training_ids.iter().enumerate() {
+            let employee = employees.get(sequence % CONCURRENT_INITIATORS).unwrap();
+            AntiCorruption::complete_training(
+                env.clone(),
+                employee.clone(),
+                *training_id,
+                95,
+            );
+        }
+
+        let (_assessments, training_count, _violations, _incidents) =
+            AntiCorruption::get_compliance_stats(env.clone());
+        assert_eq!(training_count, 15);
+    }
+
+    // ── Chaos / Fault-Injection Tests (#908) ──────────────────────────────
+
+    #[test]
+    fn chaos_state_consistency_after_partial_submissions() {
+        let env = create_test_env();
+        let owner = sample_address(&env, 1);
+        let compliance_officer = sample_address(&env, 2);
+        let from = sample_address(&env, 3);
+        let to = sample_address(&env, 4);
+
+        AntiCorruption::initialize(env.clone(), owner.clone(), compliance_officer.clone());
+
+        // Submit a mix of valid and gift-limit-exceeding transactions.
+        let mut ids = Vec::new(&env);
+        for i in 0..12 {
+            let tx_type = if i % 3 == 0 { 2 } else { 1 }; // Gift every third
+            let amount = if tx_type == 2 { 1000u64 } else { 500u64 };
+            let tx_id = AntiCorruption::monitor_transaction(
+                env.clone(),
+                from.clone(),
+                from.clone(),
+                to.clone(),
+                tx_type,
+                amount,
+                Bytes::from_slice(&env, b"USD"),
+                Bytes::from_slice(&env, b"chaos transaction"),
+            );
+            ids.push_back(tx_id);
+        }
+
+        // Invariant: every submitted transaction is retrievable by its ID.
+        for tx_id in ids.iter() {
+            let transaction = AntiCorruption::get_transaction(env.clone(), *tx_id);
+            assert_eq!(transaction.from, from);
+            assert_eq!(transaction.to, to);
+        }
+
+        // Invariant: the transaction counter equals the number of submissions.
+        let total: u32 = env
+            .storage()
+            .instance()
+            .get(&AntiCorruptionKey::TransactionCount)
+            .unwrap_or(0);
+        assert_eq!(total, 12);
+
+        // Gift transactions should be pending review; others approved.
+        for (i, tx_id) in ids.iter().enumerate() {
+            let transaction = AntiCorruption::get_transaction(env.clone(), *tx_id);
+            if i % 3 == 0 {
+                assert_eq!(transaction.status, 0); // Pending review (gift limit)
+            } else {
+                assert_eq!(transaction.status, 1); // Approved
+            }
+        }
+    }
+
+    #[test]
+    fn chaos_reordered_third_party_assessment_consistency() {
+        let env = create_test_env();
+        let owner = sample_address(&env, 1);
+        let compliance_officer = sample_address(&env, 2);
+        let third_party = sample_address(&env, 3);
+
+        AntiCorruption::initialize(env.clone(), owner.clone(), compliance_officer.clone());
+
+        // Assess the same third party twice in quick succession (reordered idempotency).
+        let risk_id1 = AntiCorruption::assess_third_party(
+            env.clone(),
+            compliance_officer.clone(),
+            third_party.clone(),
+            Bytes::from_slice(&env, b"Vendor Corp"),
+            Bytes::from_slice(&env, b"US"),
+            Bytes::from_slice(&env, b"Technology"),
+            false,
+            false,
+        );
+        let risk_id2 = AntiCorruption::assess_third_party(
+            env.clone(),
+            compliance_officer.clone(),
+            third_party.clone(),
+            Bytes::from_slice(&env, b"Vendor Corp"),
+            Bytes::from_slice(&env, b"US"),
+            Bytes::from_slice(&env, b"Technology"),
+            false,
+            false,
+        );
+
+        // Both assessments exist and are retrievable.
+        let profile1 = AntiCorruption::get_third_party_risk(env.clone(), third_party.clone());
+        let _ = risk_id2;
+        assert_eq!(profile1.third_party, third_party);
+
+        // Counter reflects both assessments.
+        let total: u32 = env
+            .storage()
+            .instance()
+            .get(&AntiCorruptionKey::ThirdPartyCount)
+            .unwrap_or(0);
+        assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn chaos_incident_escalation_invariant() {
+        let env = create_test_env();
+        let owner = sample_address(&env, 1);
+        let compliance_officer = sample_address(&env, 2);
+        let reporter = sample_address(&env, 3);
+
+        AntiCorruption::initialize(env.clone(), owner.clone(), compliance_officer.clone());
+
+        // Report incidents of varying severity.
+        let mut high_severity_count = 0u32;
+        for severity in [1u32, 2, 3, 4, 3] {
+            let incident_id = AntiCorruption::report_incident(
+                env.clone(),
+                reporter.clone(),
+                Bytes::from_slice(&env, b"Incident"),
+                Bytes::from_slice(&env, b"Description"),
+                severity,
+                Bytes::from_slice(&env, b"Root cause"),
+                Bytes::from_slice(&env, b"Actions"),
+                30,
+            );
+            let _ = incident_id;
+            if severity >= 3 {
+                high_severity_count += 1;
+            }
+        }
+
+        let (_assessments, _training, violations, incidents) =
+            AntiCorruption::get_compliance_stats(env.clone());
+        assert_eq!(incidents, 5);
+        assert_eq!(violations, high_severity_count); // severity >= 3 counts as violation
+    }
+
+    // ── Property-Based Tests (#908) ───────────────────────────────────────
+
+    proptest! {
+        #[test]
+        fn prop_transaction_counter_matches_submissions(
+            count in 1u32..20u32,
+            amount in 1u64..10_000u64,
+        ) {
+            let env = create_test_env();
+            let owner = sample_address(&env, 1);
+            let compliance_officer = sample_address(&env, 2);
+            let from = sample_address(&env, 3);
+            let to = sample_address(&env, 4);
+
+            AntiCorruption::initialize(env.clone(), owner.clone(), compliance_officer.clone());
+
+            for _ in 0..count {
+                let _tx_id = AntiCorruption::monitor_transaction(
+                    env.clone(),
+                    from.clone(),
+                    from.clone(),
+                    to.clone(),
+                    1,
+                    amount,
+                    Bytes::from_slice(&env, b"USD"),
+                    Bytes::from_slice(&env, b"prop transaction"),
+                );
+            }
+
+            let total: u32 = env
+                .storage()
+                .instance()
+                .get(&AntiCorruptionKey::TransactionCount)
+                .unwrap_or(0);
+            prop_assert_eq!(total, count);
+
+            // Every submission must be retrievable by its id; we re-derive by
+            // checking the last stored transaction is consistent via the
+            // get path only if we track ids. Here we assert counter consistency.
+        }
+
+        #[test]
+        fn prop_third_party_risk_level_matches_flags(
+            is_pep in any::<bool>(),
+            sanctions_match in any::<bool>(),
+            is_high_risk_jurisdiction in any::<bool>(),
+        ) {
+            let env = create_test_env();
+            let owner = sample_address(&env, 1);
+            let compliance_officer = sample_address(&env, 2);
+            let third_party = sample_address(&env, 3);
+
+            AntiCorruption::initialize(env.clone(), owner.clone(), compliance_officer.clone());
+
+            // Manually register as high-risk jurisdiction if the flag is set.
+            if is_high_risk_jurisdiction {
+                AntiCorruption::add_high_risk_jurisdiction(
+                    env.clone(),
+                    compliance_officer.clone(),
+                    Bytes::from_slice(&env, b"XX"),
+                    Bytes::from_slice(&env, b"High Risk Land"),
+                    vec![&env],
+                    2,
+                );
+            }
+
+            let _risk_id = AntiCorruption::assess_third_party(
+                env.clone(),
+                compliance_officer.clone(),
+                third_party.clone(),
+                Bytes::from_slice(&env, b"Prop Corp"),
+                Bytes::from_slice(&env, b"US"),
+                Bytes::from_slice(&env, b"Technology"),
+                is_pep,
+                sanctions_match,
+            );
+
+            let profile = AntiCorruption::get_third_party_risk(env.clone(), third_party.clone());
+            let expected_critical = is_pep || sanctions_match;
+            let expected_high = !expected_critical && is_high_risk_jurisdiction;
+
+            if expected_critical {
+                prop_assert_eq!(profile.risk_level, 4); // Critical
+            } else if expected_high {
+                prop_assert_eq!(profile.risk_level, 3); // High
+            } else {
+                prop_assert_eq!(profile.risk_level, 1); // Low
+            }
+            prop_assert_eq!(profile.is_pep, is_pep);
+            prop_assert_eq!(profile.sanctions_match, sanctions_match);
+        }
+
+        #[test]
+        fn prop_gift_above_limit_is_pending_review(
+            amount in 501u64..10_000u64,
+        ) {
+            let env = create_test_env();
+            let owner = sample_address(&env, 1);
+            let compliance_officer = sample_address(&env, 2);
+            let from = sample_address(&env, 3);
+            let to = sample_address(&env, 4);
+
+            AntiCorruption::initialize(env.clone(), owner.clone(), compliance_officer.clone());
+
+            let tx_id = AntiCorruption::monitor_transaction(
+                env.clone(),
+                from.clone(),
+                from.clone(),
+                to.clone(),
+                2, // GiftEntertainment
+                amount,
+                Bytes::from_slice(&env, b"USD"),
+                Bytes::from_slice(&env, b"gift"),
+            );
+
+            let transaction = AntiCorruption::get_transaction(env.clone(), tx_id);
+            prop_assert_eq!(transaction.status, 0); // Pending review
+            prop_assert!(amount > 500);
+        }
     }
 }

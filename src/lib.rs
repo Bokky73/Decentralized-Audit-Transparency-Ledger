@@ -21,6 +21,7 @@ pub mod tax;
 pub mod vat_engine;
 pub mod tax_engines;
 pub mod tax_audit_trail;
+pub mod dao_dispute_resolution;
 #[cfg(test)]
 pub mod test_data_factories;
 
@@ -39,6 +40,9 @@ mod regulator_tests;
 
 #[cfg(test)]
 mod regulatory_reporting_tests;
+
+#[cfg(test)]
+mod dao_dispute_resolution_tests;
 
 use soroban_sdk::{
     bytes, contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Bytes, BytesN, Env, String, Symbol,
