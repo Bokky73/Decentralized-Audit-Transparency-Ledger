@@ -65,6 +65,9 @@ pub mod rbac;
 // (issues #854, #855, #857).
 pub mod ml_feature_store;
 
+#[cfg(test)]
+mod digital_passport_tests;
+
 // Data retention, legal hold, GDPR erasure, and the immutable operational audit log.
 pub mod data_retention;
 
