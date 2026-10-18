@@ -18,6 +18,8 @@ pub enum RbacError {
     SubmitterSuspended = 423,
     /// The caller DID is not authorized to perform the requested mutation.
     UnauthorizedSubmitter = 424,
+    /// Legacy alias for a suspended DID, surfaced through `check_role`.
+    Suspended = 425,
 }
 
 #[contracttype]
@@ -280,4 +282,39 @@ pub fn check_role(env: &Env, address: &Address, min_role: Role) -> Result<(), Rb
     RbacManager::require_active_role_min(env, address, min_role)
 }
 
-pub type Rbac = RbacManager;
+/// Call-site friendly RBAC shim mirroring the concise API used by integration
+/// test suites: `init_admin`, `get_role`, `set_role`, `has_role_min`,
+/// `suspend` / `reinstate`. Thin delegates over [`RbacManager`].
+pub struct Rbac;
+
+impl Rbac {
+    /// Bootstraps the initial superadmin (`RbacManager::initialize_admin`).
+    pub fn init_admin(env: &Env, admin: &Address) {
+        RbacManager::initialize_admin(env, admin);
+    }
+
+    /// Current role of `address`, if assigned.
+    pub fn get_role(env: &Env, address: &Address) -> Option<Role> {
+        RbacManager::get_role(env, address)
+    }
+
+    /// Assigns/updates `target`'s role; caller must be an Admin.
+    pub fn set_role(env: &Env, caller: &Address, target: &Address, role: Role) -> Result<(), RbacError> {
+        RbacManager::set_role(env, caller, target, role)
+    }
+
+    /// Whether `address` holds at least `min_role`.
+    pub fn has_role_min(env: &Env, address: &Address, min_role: Role) -> bool {
+        RbacManager::has_role_min(env, address, min_role)
+    }
+
+    /// Suspends a submitter DID (Admin required).
+    pub fn suspend(env: &Env, caller: &Address, target: &Address) -> Result<(), RbacError> {
+        RbacManager::suspend_submitter(env, caller, target)
+    }
+
+    /// Clears a suspension flag (Admin required).
+    pub fn reinstate(env: &Env, caller: &Address, target: &Address) -> Result<(), RbacError> {
+        RbacManager::reinstate_submitter(env, caller, target)
+    }
+}
