@@ -50,6 +50,9 @@ pub mod digital_passport;
 pub mod carbon_credits;
 pub mod esg_reporting;
 
+#[cfg(test)]
+mod digital_passport_tests;
+
 // Data retention, legal hold, GDPR erasure, and the immutable operational audit log.
 pub mod data_retention;
 

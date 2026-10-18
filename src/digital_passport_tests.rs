@@ -914,3 +914,216 @@ mod tests {
         assert_eq!(status, ComplianceStatus::NonCompliant);
     }
 }
+
+/// #885/#886/#887 regression coverage: RBAC role gating, tamper-evident audit
+/// trail chaining, TTL helpers, and cursor-based pagination.
+#[cfg(test)]
+mod gating_audit_ttl_pagination_tests {
+    use crate::digital_passport::*;
+    use crate::rbac::{RbacManager, Role};
+    use soroban_sdk::{vec, Address, Bytes, BytesN, Env, Symbol};
+
+    fn test_material(env: &Env) -> Material {
+        Material {
+            material_name: soroban_sdk::bytes!(env, "Aluminum"),
+            material_code: Symbol::new(env, "AL"),
+            percentage_by_weight: 100,
+            source_type: Symbol::new(env, "virgin"),
+            hazardous: false,
+            hazard_classification: soroban_sdk::bytes!(env, ""),
+        }
+    }
+
+    fn make_passport(env: &Env, manufacturer: &Address, tag: u8) -> BytesN<32> {
+        let mut product_id = Bytes::from_slice(env, b"PRODUCT-");
+        product_id.append(&Bytes::from_slice(env, &[tag]));
+        let materials = vec![env, test_material(env)];
+        create_passport(
+            env,
+            product_id,
+            soroban_sdk::bytes!(env, "Widget"),
+            Symbol::new(env, "electronics"),
+            manufacturer.clone(),
+            soroban_sdk::bytes!(env, "V1.0"),
+            soroban_sdk::bytes!(env, "BATCH-001"),
+            materials,
+            Durability {
+                expected_lifetime_years: 5,
+                warranty_years: 2,
+                spare_parts_available: true,
+                spare_parts_years: 10,
+                repair_information: soroban_sdk::bytes!(env, "https://repair.example.com"),
+                repairability_score: 8,
+            },
+            Circularity {
+                recyclable_materials: vec![env, test_material(env)],
+                recycled_content_percent: 30,
+                reuse_potential: true,
+                refurbishment_potential: true,
+                disassembly_instructions: soroban_sdk::bytes!(env, "See manual"),
+                recycling_instructions: soroban_sdk::bytes!(env, "Recycle"),
+                end_of_life_score: 85,
+            },
+            CarbonFootprint {
+                manufacturing_emissions: 500,
+                distribution_emissions: 100,
+                use_phase_emissions: 50,
+                end_of_life_emissions: 25,
+                total_embodied_carbon: 675,
+                carbon_neutral: false,
+                carbon_offset_program: soroban_sdk::bytes!(env, ""),
+                measurement_standard: Symbol::new(env, "ISO_14040"),
+                measurement_date: 1692345600,
+            },
+        )
+    }
+
+    #[test]
+    fn test_legacy_mode_allows_unroled_callers() {
+        let env = Env::default();
+        env.mock_all_auths();
+        // No RBAC bootstrap -> legacy behavior, plain require_auth only.
+        let manufacturer = Address::random(&env);
+        let passport_id = make_passport(&env, &manufacturer, 1);
+        assert_eq!(get_total_passports(&env), 1);
+        assert_eq!(get_audit_trail(&env, passport_id).len(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "#2013")]
+    fn test_rbac_blocks_unroled_manufacturer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::random(&env);
+        RbacManager::initialize_admin(&env, &admin);
+        let manufacturer = Address::random(&env);
+        make_passport(&env, &manufacturer, 2);
+    }
+
+    #[test]
+    fn test_rbac_allows_roled_manufacturer_and_records_audit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::random(&env);
+        let manufacturer = Address::random(&env);
+        let verifier = Address::random(&env);
+        RbacManager::initialize_admin(&env, &admin);
+        RbacManager::set_role(&env, &admin, &manufacturer, Role::Submitter).unwrap();
+        RbacManager::set_role(&env, &admin, &verifier, Role::Auditor).unwrap();
+
+        let passport_id = make_passport(&env, &manufacturer, 3);
+
+        // Lifecycle transition gated to Submitter+ -> manufacturer qualifies.
+        transition_lifecycle_stage(
+            &env,
+            passport_id,
+            PassportLifecycleStage::InProduction,
+            manufacturer.clone(),
+            soroban_sdk::bytes!(&env, "production started"),
+        );
+
+        // Compliance verification gated to Auditor+ -> verifier qualifies.
+        let status = verify_espr_compliance(&env, passport_id, verifier.clone());
+        assert_eq!(status, ComplianceStatus::Compliant);
+
+        let trail = get_audit_trail(&env, passport_id);
+        assert_eq!(trail.len(), 3);
+        let a = trail.get(0).unwrap();
+        let b = trail.get(1).unwrap();
+        let c = trail.get(2).unwrap();
+        assert_eq!(a.seq, 0);
+        assert_eq!(a.kind, AuditEventKind::PassportCreated);
+        assert_eq!(b.kind, AuditEventKind::LifecycleStageChanged);
+        assert_eq!(c.kind, AuditEventKind::ComplianceVerified);
+        // Hash chain is tamper-evident: c commits to (c.payload_hash, b.event_hash).
+        let mut chain_input = Bytes::new(&env);
+        chain_input.append(&c.payload_hash.to_bytes());
+        chain_input.append(&b.event_hash.to_bytes());
+        assert_eq!(env.crypto().sha256(&chain_input).to_bytes(), c.event_hash);
+    }
+
+    #[test]
+    #[should_panic(expected = "#2014")]
+    fn test_rbac_blocks_suspended_submitter() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::random(&env);
+        let manufacturer = Address::random(&env);
+        RbacManager::initialize_admin(&env, &admin);
+        RbacManager::set_role(&env, &admin, &manufacturer, Role::Submitter).unwrap();
+        let passport_id = make_passport(&env, &manufacturer, 4);
+        RbacManager::suspend_submitter(&env, &admin, &manufacturer).unwrap();
+        update_passport(
+            &env,
+            passport_id,
+            None,
+            None,
+            None,
+            manufacturer.clone(),
+        );
+    }
+
+    #[test]
+    fn test_cursor_pagination_and_filters() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let manufacturer = Address::random(&env);
+        for tag in 5..8u8 {
+            let passport_id = make_passport(&env, &manufacturer, tag);
+            transition_lifecycle_stage(
+                &env,
+                passport_id,
+                PassportLifecycleStage::InProduction,
+                manufacturer.clone(),
+                soroban_sdk::bytes!(&env, "prod"),
+            );
+        }
+        assert_eq!(get_total_passports(&env), 3);
+
+        // Page 1: deterministic order and an explorable cursor.
+        let page1 = get_all_passports_paged(&env, None, 2, None);
+        assert_eq!(page1.items.len(), 2);
+        assert!(page1.has_more);
+        assert_eq!(page1.scanned, 2);
+        // Page 2 resumes past the cursor without duplication.
+        let page2 = get_all_passports_paged(&env, page1.next_cursor.clone(), 2, None);
+        assert_eq!(page2.items.len(), 1);
+        assert!(!page2.has_more);
+        assert_ne!(page1.items.get(0).unwrap(), page2.items.get(0).unwrap());
+
+        // Filters: only stage-matching passports are returned.
+        let mut filter = PassportFilter::new(&env);
+        filter.stage = Some(PassportLifecycleStage::Created);
+        let created_page = get_all_passports_paged(&env, None, 10, Some(filter.clone()));
+        assert_eq!(created_page.items.len(), 0);
+
+        let mut filter = PassportFilter::new(&env);
+        filter.stage = Some(PassportLifecycleStage::InProduction);
+        let prod_page = get_all_passports_paged(&env, None, 10, Some(filter.clone()));
+        assert_eq!(prod_page.items.len(), 3);
+        // get_passports_by_stage now runs the same deterministic scan.
+        assert_eq!(
+            get_passports_by_stage(&env, PassportLifecycleStage::InProduction).len(),
+            3
+        );
+    }
+
+    #[test]
+    fn test_ttl_and_archival_helpers() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let manufacturer = Address::random(&env);
+        let passport_id = make_passport(&env, &manufacturer, 9);
+
+        // Permissionless TTL hook and archival pinning must not panic.
+        extend_passport_ttl(&env, &passport_id);
+        let archived = archive_passport(&env, passport_id, Address::random(&env));
+        assert_eq!(archived.passport_id, passport_id);
+        // Audit trail records the archival action.
+        let trail = get_audit_trail(&env, passport_id);
+        assert_eq!(
+            trail.last().unwrap().kind,
+            AuditEventKind::PassportArchived
+        );
+    }
+}

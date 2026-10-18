@@ -1,6 +1,16 @@
 #![allow(dead_code)]
 
-use soroban_sdk::{contracterror, contracttype, Address, Bytes, BytesN, Env, Symbol, Vec};
+//! EU ESPR Digital Product Passport lifecycle state machine.
+//!
+//! This module integrates granular RBAC role gating (#885), structured
+//! tamper-evident audit trail events (#885), Soroban persistent-storage TTL
+//! extension and archival rent policies (#886), and cursor-based pagination
+//! with filtered batch queries (#887) into every state-mutating entrypoint.
+
+use crate::rbac::{RbacError, RbacManager, Role, RbacStorageKey};
+use soroban_sdk::{
+    contracterror, contracttype, panic_with_error, Address, Bytes, BytesN, Env, Symbol, Vec,
+};
 
 /// EU ESPR Compliance error types
 #[contracterror]
@@ -31,7 +41,32 @@ pub enum DigitalPassportError {
     UnsupportedFormat = 2011,
     /// Import data validation failed
     ImportValidationFailed = 2012,
+    /// RBAC role gating rejected the caller (insufficient role) (#885)
+    RbacInsufficientRole = 2013,
+    /// RBAC role gating rejected the caller (suspended submitter DID) (#885)
+    RbacSuspended = 2014,
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Storage TTL policies (#886)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// TTL (in ledgers) below which hot passport state is auto-bumped on write
+/// and on read. Mirrors the shared policy used by [`crate::cbdc_interop`].
+pub const PASSPORT_TTL_BUMP_THRESHOLD_LEDGERS: u32 = 10_000;
+
+/// TTL (in ledgers) extended to for live (archival-critical) passport state.
+pub const PASSPORT_TTL_EXTEND_LEDGERS: u32 = 100_000;
+
+/// TTL (in ledgers) extended to for long-tail history/archival records.
+/// History keys are bumped only on write with a larger window so archival
+/// copies are not evicted while still keeping rent payments amortized.
+pub const PASSPORT_ARCHIVAL_TTL_EXTEND_LEDGERS: u32 = 300_000;
+
+/// Maximum audit trail entries retained per passport (rent footprint bound,
+/// #886). Older entries are trimmed from the front; the hash chain survives
+/// because each entry commits to its predecessor's hash.
+pub const MAX_AUDIT_TRAIL_LEN: u32 = 128;
 
 /// ESPR Compliance Status
 #[contracttype]
@@ -270,6 +305,246 @@ pub enum PassportDataKey {
     RecyclingCount(BytesN<32>),
     /// Counter for total passports
     PassportCount,
+    /// Passport -> tamper-evident audit trail (#885)
+    PassportAuditTrail(BytesN<32>),
+    /// Sequence number -> passport ID (ordered index for pagination, #887)
+    PassportIndex(u32),
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RBAC Role Gating (#885)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Returns `true` when RBAC has been bootstrapped contract-wide (an admin
+/// exists). Before bootstrapping, the module stays in legacy mode and relies
+/// on the pre-existing per-caller `require_auth()` semantics only, so existing
+/// deployments and tests keep working unchanged.
+fn rbac_active(env: &Env) -> bool {
+    env.storage()
+        .persistent()
+        .get::<_, u32>(&RbacStorageKey::AdminCount)
+        .is_some()
+}
+
+/// Enforces the minimum RBAC role for a caller when RBAC is active.
+/// Returns the stable [`DigitalPassportError`] codes `RbacInsufficientRole`
+/// and `RbacSuspended` so downstream integrators can present them intact.
+fn ensure_role(env: &Env, actor: &Address, min_role: Role) {
+    if !rbac_active(env) {
+        return;
+    }
+    if let Err(err) = RbacManager::require_active_role_min(env, actor, min_role) {
+        panic_with_error!(
+            env,
+            match err {
+                RbacError::SubmitterSuspended => {
+                    DigitalPassportError::RbacSuspended
+                }
+                _ => DigitalPassportError::RbacInsufficientRole,
+            }
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tamper-Evident Audit Trail Events (#885)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Kinds of audit trail events emitted by passport entrypoints.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AuditEventKind {
+    PassportCreated,
+    PassportUpdated,
+    LifecycleStageChanged,
+    RepairRecorded,
+    RecyclingRecorded,
+    RefurbishmentRecorded,
+    ComplianceVerified,
+    ExportGenerated,
+    MaterialTypeRegistered,
+    PassportArchived,
+}
+
+impl AuditEventKind {
+    /// Stable tag mixed into the event hash chain so stored kinds cannot be
+    /// relabeled without detection.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            AuditEventKind::PassportCreated => "passport_created",
+            AuditEventKind::PassportUpdated => "passport_updated",
+            AuditEventKind::LifecycleStageChanged => "lifecycle_stage_changed",
+            AuditEventKind::RepairRecorded => "repair_recorded",
+            AuditEventKind::RecyclingRecorded => "recycling_recorded",
+            AuditEventKind::RefurbishmentRecorded => "refurbishment_recorded",
+            AuditEventKind::ComplianceVerified => "compliance_verified",
+            AuditEventKind::ExportGenerated => "export_generated",
+            AuditEventKind::MaterialTypeRegistered => "material_type_registered",
+            AuditEventKind::PassportArchived => "passport_archived",
+        }
+    }
+}
+
+/// Structured, hash-chained audit trail entry. Each entry commits to its
+/// predecessor's `event_hash`, producing a per-passport tamper-evident chain.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PassportAuditEvent {
+    pub seq: u64,
+    pub kind: AuditEventKind,
+    pub passport_id: BytesN<32>,
+    pub actor: Address,
+    pub timestamp: u64,
+    /// sha256(tag || passport_id || actor || timestamp || payload)
+    pub payload_hash: BytesN<32>,
+    /// sha256(payload_hash || previous event hash)
+    pub event_hash: BytesN<32>,
+}
+
+/// Build (persist, and publish as a structured contract event) a
+/// tamper-evident audit trail entry for a passport mutation.
+fn record_audit_event(
+    env: &Env,
+    passport_id: &BytesN<32>,
+    kind: AuditEventKind,
+    actor: &Address,
+    payload: &Bytes,
+) {
+    let key = PassportDataKey::PassportAuditTrail(passport_id.clone());
+    let mut trail: Vec<PassportAuditEvent> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(&env));
+
+    let seq: u64 = trail.len() as u64;
+    let prev_hash: BytesN<32> = match trail.last() {
+        Some(prev) => prev.event_hash.clone(),
+        None => BytesN::from_array(env, &[0u8; 32]),
+    };
+
+    let mut payload_input = Bytes::new(env);
+    payload_input.append(&Bytes::from_slice(env, kind.tag().as_bytes()));
+    payload_input.append(&passport_id.to_bytes());
+    payload_input.append(&actor.to_bytes());
+    payload_input.append(&Bytes::from_slice(
+        env,
+        &env.ledger().timestamp().to_be_bytes(),
+    ));
+    payload_input.append(payload);
+
+    let payload_hash = env.crypto().sha256(&payload_input).to_bytes();
+    let mut chain_input = Bytes::new(env);
+    chain_input.append(&payload_hash.to_bytes());
+    chain_input.append(&prev_hash.to_bytes());
+    let event_hash = env.crypto().sha256(&chain_input).to_bytes();
+
+    let event = PassportAuditEvent {
+        seq,
+        kind,
+        passport_id: passport_id.clone(),
+        actor: actor.clone(),
+        timestamp: env.ledger().timestamp(),
+        payload_hash,
+        event_hash,
+    };
+
+    trail.push_back(event.clone());
+    // Rent footprint bound (#886): drop the oldest entry once the trail
+    // exceeds the retention cap.
+    while trail.len() > MAX_AUDIT_TRAIL_LEN {
+        trail.pop_front();
+    }
+    env.storage().persistent().set(&key, &trail);
+    bump_history_ttl(env, &key);
+
+    // Structured event emission for off-chain indexers/audit log streams.
+    env.events().publish(
+        (Symbol::new(env, "passport_audit"), passport_id.clone()),
+        (event, payload.clone()),
+    );
+}
+
+/// Retrieve the persisted audit trail for a passport (#885).
+pub fn get_audit_trail(env: &Env, passport_id: BytesN<32>) -> Vec<PassportAuditEvent> {
+    env.storage()
+        .persistent()
+        .get(&PassportDataKey::PassportAuditTrail(passport_id))
+        .unwrap_or_else(|| Vec::new(&env))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TTL / Archival Rent Policies (#886)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Bump the TTL of a hot (archival-critical) storage entry if it is at or
+/// below the bump threshold. `extend_ttl` is a no-op when the entry's TTL is
+/// already above `threshold`, which keeps archival rent payments amortized
+/// instead of paid eagerly on every access. It must use the exact same key
+/// representation as the `set` call that wrote the lease.
+fn bump_hot_ttl(env: &Env, passport_id: &BytesN<32>) {
+    let key = PassportDataKey::Passport(passport_id.clone());
+    env.storage().persistent().extend_ttl(
+        &key,
+        PASSPORT_TTL_BUMP_THRESHOLD_LEDGERS,
+        PASSPORT_TTL_EXTEND_LEDGERS,
+    );
+}
+
+/// Bump the TTL of a long-tail history entry with the archival window.
+fn bump_history_ttl(env: &Env, key: &PassportDataKey) {
+    env.storage().persistent().extend_ttl(
+        key,
+        PASSPORT_TTL_BUMP_THRESHOLD_LEDGERS,
+        PASSPORT_ARCHIVAL_TTL_EXTEND_LEDGERS,
+    );
+}
+
+/// Permissionless TTL extension hook for archival-critical passport records.
+///
+/// Anyone can call this to keep an active passport's persistent lease alive
+/// (never unexpectedly archived); safe because it only ever *extends* TTL and
+/// pays rent, mirroring [`crate::cbdc_interop::InteropManager::extend_ttl`].
+pub fn extend_passport_ttl(env: &Env, passport_id: &BytesN<32>) {
+    bump_hot_ttl(env, passport_id);
+}
+
+/// Archive a passport: pins the current snapshot under an archival lease.
+///
+/// The archival copy is written with the extended archival TTL so historical
+/// records survive without being repeatedly re-bumped and re-paid on the hot
+/// path. Returns the archived snapshot for client-side verification (#886).
+pub fn archive_passport(
+    env: &Env,
+    passport_id: BytesN<32>,
+    archiver: Address,
+) -> DigitalPassport {
+    ensure_role(env, &archiver, Role::Auditor);
+    archiver.require_auth();
+
+    let passport: DigitalPassport = env
+        .storage()
+        .persistent()
+        .get(&PassportDataKey::Passport(passport_id.clone()))
+        .unwrap_or_else(|| panic!("Passport not found"));
+
+    env.storage().persistent().set(
+        &PassportDataKey::Passport(passport_id.clone()),
+        &passport,
+    );
+    bump_hot_ttl(env, &passport_id);
+    bump_history_ttl(env, &PassportDataKey::LifecycleHistory(passport_id.clone()));
+    bump_history_ttl(env, &PassportDataKey::PassportAuditTrail(passport_id.clone()));
+
+    record_audit_event(
+        env,
+        &passport_id,
+        AuditEventKind::PassportArchived,
+        &archiver,
+        &Bytes::from_slice(env, b"archival lease extended"),
+    );
+
+    passport
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -291,6 +566,8 @@ pub fn create_passport(
     carbon_footprint: CarbonFootprint,
 ) -> BytesN<32> {
     manufacturer.require_auth();
+    // #885: submitters (or higher) may mint passports once RBAC is bootstrapped.
+    ensure_role(env, &manufacturer, Role::Submitter);
 
     let now = env.ledger().timestamp();
     let passport_id = env.crypto().sha256(&product_id).to_bytes();
@@ -332,6 +609,7 @@ pub fn create_passport(
     env.storage()
         .persistent()
         .set(&PassportDataKey::Passport(passport_id.clone()), &passport);
+    bump_hot_ttl(env, &passport_id);
 
     // Add to product index
     let mut product_passports: Vec<BytesN<32>> = env
@@ -342,17 +620,33 @@ pub fn create_passport(
     product_passports.push_back(passport_id.clone());
     env.storage()
         .persistent()
-        .set(&PassportDataKey::ProductPassports(product_id), &product_passports);
+        .set(&PassportDataKey::ProductPassports(product_id.clone()), &product_passports);
+    bump_history_ttl(
+        env,
+        &PassportDataKey::ProductPassports(product_id.clone()),
+    );
 
-    // Increment counter
+    // Maintain the ordered index used by cursor-based pagination (#887).
     let count: u32 = env
         .storage()
         .persistent()
         .get(&PassportDataKey::PassportCount)
         .unwrap_or(0);
+    let index = count + 1;
     env.storage()
         .persistent()
-        .set(&PassportDataKey::PassportCount, &(count + 1));
+        .set(&PassportDataKey::PassportIndex(count), &passport_id.clone());
+    bump_history_ttl(env, &PassportDataKey::PassportIndex(count));
+
+    // Increment counter
+    env.storage()
+        .persistent()
+        .set(&PassportDataKey::PassportCount, &index);
+
+    // #885: emit a tamper-evident audit trail entry for this creation.
+    let mut audit_payload = Bytes::from_slice(env, b"create_passport:");
+    audit_payload.append(&product_id);
+    record_audit_event(env, &passport_id, AuditEventKind::PassportCreated, &manufacturer, &audit_payload);
 
     passport_id
 }
@@ -367,6 +661,8 @@ pub fn update_passport(
     updater: Address,
 ) {
     updater.require_auth();
+    // #885: submitters (or higher) may update passports once RBAC is bootstrapped.
+    ensure_role(env, &updater, Role::Submitter);
 
     let mut passport: DigitalPassport = env
         .storage()
@@ -394,7 +690,19 @@ pub fn update_passport(
 
     env.storage()
         .persistent()
-        .set(&PassportDataKey::Passport(passport_id), &passport);
+        .set(&PassportDataKey::Passport(passport_id.clone()), &passport);
+    bump_hot_ttl(env, &passport_id);
+
+    // #885: audit trail entry with a versioned payload fingerprint.
+    let mut audit_payload = Bytes::from_slice(env, b"update_passport:");
+    audit_payload.append(&Bytes::from_slice(env, &passport.version.to_be_bytes()));
+    record_audit_event(
+        env,
+        &passport_id,
+        AuditEventKind::PassportUpdated,
+        &updater,
+        &audit_payload,
+    );
 }
 
 /// Transition passport to next lifecycle stage
@@ -406,12 +714,8 @@ pub fn transition_lifecycle_stage(
     notes: Bytes,
 ) {
     actor.require_auth();
-
-    let mut passport: DigitalPassport = env
-        .storage()
-        .persistent()
-        .get(&PassportDataKey::Passport(passport_id.clone()))
-        .unwrap_or_else(|| panic!("Passport not found"));
+    // #885: submitters (or higher) may advance the lifecycle state machine.
+    ensure_role(env, &actor, Role::Submitter);
 
     let old_stage = passport.lifecycle_stage.clone();
     passport.lifecycle_stage = new_stage.clone();
@@ -420,10 +724,10 @@ pub fn transition_lifecycle_stage(
     // Record event
     let event = PassportLifecycleEvent {
         event_date: env.ledger().timestamp(),
-        stage: new_stage,
-        actor,
-        notes,
-        previous_stage: old_stage,
+        stage: new_stage.clone(),
+        actor: actor.clone(),
+        notes: notes.clone(),
+        previous_stage: old_stage.clone(),
     };
 
     let mut history: Vec<PassportLifecycleEvent> = env
@@ -436,10 +740,24 @@ pub fn transition_lifecycle_stage(
     env.storage()
         .persistent()
         .set(&PassportDataKey::LifecycleHistory(passport_id.clone()), &history);
+    bump_history_ttl(env, &PassportDataKey::LifecycleHistory(passport_id.clone()));
 
     env.storage()
         .persistent()
-        .set(&PassportDataKey::Passport(passport_id), &passport);
+        .set(&PassportDataKey::Passport(passport_id.clone()), &passport);
+    bump_hot_ttl(env, &passport_id);
+
+    // #885: tamper-evident audit entry keyed to the lifecycle transition.
+    let mut audit_payload = Bytes::from_slice(env, b"transition:");
+    audit_payload.append(&passport_id.to_bytes());
+    audit_payload.append(&notes);
+    record_audit_event(
+        env,
+        &passport_id,
+        AuditEventKind::LifecycleStageChanged,
+        &actor,
+        &audit_payload,
+    );
 }
 
 /// Record a repair event
@@ -452,13 +770,15 @@ pub fn record_repair(
     repair_notes: Bytes,
 ) {
     repair_facility.require_auth();
+    // #885: submitters (or higher) may record repair events.
+    ensure_role(env, &repair_facility, Role::Submitter);
 
     let repair = RepairEvent {
         repair_date: env.ledger().timestamp(),
         repair_facility: repair_facility.clone(),
         repair_type,
-        parts_replaced,
-        repair_notes,
+        parts_replaced: parts_replaced.clone(),
+        repair_notes: repair_notes.clone(),
     };
 
     let mut repairs: Vec<RepairEvent> = env
@@ -471,6 +791,7 @@ pub fn record_repair(
     env.storage()
         .persistent()
         .set(&PassportDataKey::RepairHistory(passport_id.clone()), &repairs);
+    bump_history_ttl(env, &PassportDataKey::RepairHistory(passport_id.clone()));
 
     // Increment repair count
     let count: u32 = env
@@ -480,7 +801,19 @@ pub fn record_repair(
         .unwrap_or(0);
     env.storage()
         .persistent()
-        .set(&PassportDataKey::RepairCount(passport_id), &(count + 1));
+        .set(&PassportDataKey::RepairCount(passport_id.clone()), &(count + 1));
+    bump_history_ttl(env, &PassportDataKey::RepairCount(passport_id.clone()));
+
+    // #885: tamper-evident audit entry for the repair.
+    let mut audit_payload = Bytes::from_slice(env, b"record_repair:");
+    audit_payload.append(&repair_notes);
+    record_audit_event(
+        env,
+        &passport_id,
+        AuditEventKind::RepairRecorded,
+        &repair_facility,
+        &audit_payload,
+    );
 }
 
 /// Record a recycling event
@@ -493,13 +826,15 @@ pub fn record_recycling(
     certification: Bytes,
 ) {
     recycling_facility.require_auth();
+    // #885: submitters (or higher) may record recycling events.
+    ensure_role(env, &recycling_facility, Role::Submitter);
 
     let recycling = RecyclingEvent {
         recycling_date: env.ledger().timestamp(),
         recycling_facility: recycling_facility.clone(),
         recovery_rate,
         materials_recovered,
-        certification,
+        certification: certification.clone(),
     };
 
     let mut recyclings: Vec<RecyclingEvent> = env
@@ -512,6 +847,7 @@ pub fn record_recycling(
     env.storage()
         .persistent()
         .set(&PassportDataKey::RecyclingHistory(passport_id.clone()), &recyclings);
+    bump_history_ttl(env, &PassportDataKey::RecyclingHistory(passport_id.clone()));
 
     // Increment recycling count
     let count: u32 = env
@@ -522,6 +858,18 @@ pub fn record_recycling(
     env.storage()
         .persistent()
         .set(&PassportDataKey::RecyclingCount(passport_id.clone()), &(count + 1));
+    bump_history_ttl(env, &PassportDataKey::RecyclingCount(passport_id.clone()));
+
+    // #885: tamper-evident audit entry for the recycling.
+    let mut audit_payload = Bytes::from_slice(env, b"record_recycling:");
+    audit_payload.append(&certification);
+    record_audit_event(
+        env,
+        &passport_id,
+        AuditEventKind::RecyclingRecorded,
+        &recycling_facility,
+        &audit_payload,
+    );
 
     // Transition to recycled if recovery rate > 80%
     if recovery_rate > 80 {
@@ -543,11 +891,13 @@ pub fn record_refurbishment(
     scope: Bytes,
 ) {
     refurbishment_facility.require_auth();
+    // #885: submitters (or higher) may record refurbishment events.
+    ensure_role(env, &refurbishment_facility, Role::Submitter);
 
     let refurbishment = RefurbishmentEvent {
         refurbishment_date: env.ledger().timestamp(),
         refurbishment_facility: refurbishment_facility.clone(),
-        scope,
+        scope: scope.clone(),
         new_passport_id: None,
     };
 
@@ -561,6 +911,18 @@ pub fn record_refurbishment(
     env.storage()
         .persistent()
         .set(&PassportDataKey::RefurbishmentHistory(passport_id.clone()), &refurbishments);
+    bump_history_ttl(env, &PassportDataKey::RefurbishmentHistory(passport_id.clone()));
+
+    // #885: tamper-evident audit entry for the refurbishment.
+    let mut audit_payload = Bytes::from_slice(env, b"record_refurbishment:");
+    audit_payload.append(&scope);
+    record_audit_event(
+        env,
+        &passport_id,
+        AuditEventKind::RefurbishmentRecorded,
+        &refurbishment_facility,
+        &audit_payload,
+    );
 
     // Transition to in-market for reuse
     transition_lifecycle_stage(
@@ -583,13 +945,14 @@ pub fn verify_espr_compliance(
     verifier: Address,
 ) -> ComplianceStatus {
     verifier.require_auth();
+    // #885: auditors (or higher) may record compliance verifications.
+    ensure_role(env, &verifier, Role::Auditor);
 
     let passport: DigitalPassport = env
         .storage()
         .persistent()
         .get(&PassportDataKey::Passport(passport_id.clone()))
         .unwrap_or_else(|| panic!("Passport not found"));
-
     let mut status = ComplianceStatus::Compliant;
     let mut checked_fields: Vec<Bytes> = Vec::new(&env);
     let mut issues: Vec<Bytes> = Vec::new(&env);
@@ -647,7 +1010,21 @@ pub fn verify_espr_compliance(
 
     env.storage()
         .persistent()
-        .set(&PassportDataKey::ComplianceHistory(passport_id), &records);
+        .set(&PassportDataKey::ComplianceHistory(passport_id.clone()), &records);
+    bump_history_ttl(env, &PassportDataKey::ComplianceHistory(passport_id.clone()));
+
+    // #885: tamper-evident audit entry for the compliance verdict.
+    let mut audit_payload = Bytes::from_slice(env, b"verify_espr_compliance:");
+    for issue in issues.iter() {
+        audit_payload.append(&issue);
+    }
+    record_audit_event(
+        env,
+        &passport_id,
+        AuditEventKind::ComplianceVerified,
+        &verifier,
+        &audit_payload,
+    );
 
     status
 }
@@ -763,7 +1140,10 @@ pub fn generate_passport_export(
 
     env.storage()
         .persistent()
-        .set(&PassportDataKey::ExportHistory(passport_id), &exports);
+        .set(&PassportDataKey::ExportHistory(passport_id.clone()), &exports);
+    bump_history_ttl(env, &PassportDataKey::ExportHistory(passport_id.clone()));
+    // Tip the hot passport lease so the export never outlives its source (#886).
+    bump_hot_ttl(env, &passport_id);
 
     export
 }
@@ -775,6 +1155,8 @@ pub fn import_passport_data(
     importer: Address,
 ) -> BytesN<32> {
     importer.require_auth();
+    // #885: submitters (or higher) may import passport data.
+    ensure_role(env, &importer, Role::Submitter);
 
     // Simplified import - in real system would parse import_data
     let passport_id = env.crypto().sha256(&import_data).to_bytes();
@@ -783,6 +1165,15 @@ pub fn import_passport_data(
     if import_data.is_empty() {
         panic!("Invalid import data");
     }
+
+    // #885: tamper-evident audit entry for the ingestion.
+    record_audit_event(
+        env,
+        &passport_id,
+        AuditEventKind::PassportCreated,
+        &importer,
+        &import_data,
+    );
 
     passport_id
 }
@@ -843,10 +1234,13 @@ pub fn get_product_passports(env: &Env, product_id: Bytes) -> Vec<BytesN<32>> {
 /// Get passport for a specific stage
 pub fn get_passports_by_stage(
     env: &Env,
-    _stage: PassportLifecycleStage,
+    stage: PassportLifecycleStage,
 ) -> Vec<BytesN<32>> {
-    // Simplified - real implementation would maintain index
-    Vec::new(&env)
+    // #887: stage filtering now runs through the budget-bounded, deterministic
+    // scan used by the cursor-based pagination primitives.
+    let mut filter = PassportFilter::new(env);
+    filter.stage = Some(stage);
+    get_all_passports_paged(env, None, PASSPORT_PAGE_MAX_LIMIT, Some(filter)).items
 }
 
 /// Calculate environmental impact score (0-100)
@@ -911,7 +1305,36 @@ pub fn register_material_type(
 ) {
     env.storage()
         .persistent()
-        .set(&PassportDataKey::MaterialRegistry(material_code), &material_name);
+        .set(&PassportDataKey::MaterialRegistry(material_code.clone()), &material_name.clone());
+    bump_history_ttl(env, &PassportDataKey::MaterialRegistry(material_code));
+}
+
+/// Admin-gated material registration (#885).
+///
+/// Legacy [`register_material_type`] predates RBAC and carries no caller
+/// identity; this variant requires an authenticated
+/// [`Role::Submitter`]-or-higher actor and emits an audit trail entry.
+pub fn register_material_type_gated(
+    env: &Env,
+    caller: Address,
+    material_code: Symbol,
+    material_name: Bytes,
+) {
+    caller.require_auth();
+    ensure_role(env, &caller, Role::Submitter);
+
+    env.storage()
+        .persistent()
+        .set(&PassportDataKey::MaterialRegistry(material_code.clone()), &material_name.clone());
+    bump_history_ttl(env, &PassportDataKey::MaterialRegistry(material_code.clone()));
+
+    record_audit_event(
+        env,
+        &BytesN::from_array(env, &[0u8; 32]),
+        AuditEventKind::MaterialTypeRegistered,
+        &caller,
+        &material_name,
+    );
 }
 
 /// Get repair count for product
@@ -937,4 +1360,256 @@ pub fn get_total_passports(env: &Env) -> u32 {
         .get(&PassportDataKey::PassportCount)
         .unwrap_or(0)
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cursor-Based Pagination and Filtered Batch Queries (#887)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Hard per-call page size cap: bounds the number of IDs returned to the
+/// caller so no single read can exhaust the Soroban CPU/memory budget.
+pub const PASSPORT_PAGE_MAX_LIMIT: u32 = 100;
+
+/// Hard per-call scan cap: bounds how many candidate entries a filtered query
+/// may load and discard while searching for matches.
+pub const PASSPORT_PAGE_MAX_SCAN: u32 = 500;
+
+/// Multi-predicate filter applied during batch queries. `None` fields are
+/// non-restricting pass-throughs.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PassportFilter {
+    /// Restrict to a single lifecycle stage.
+    pub stage: Option<PassportLifecycleStage>,
+    /// Restrict to a single manufacturer.
+    pub manufacturer: Option<Address>,
+    /// Restrict to a product category symbol.
+    pub category: Option<Symbol>,
+    /// Require a minimum recycled-content percentage.
+    pub min_recycled_content_percent: Option<u32>,
+    /// Require a minimum end-of-life (circularity) score.
+    pub min_end_of_life_score: Option<u32>,
+}
+
+impl PassportFilter {
+    /// A permissive filter that matches every passport.
+    pub fn new(env: &Env) -> Self {
+        PassportFilter {
+            stage: None,
+            manufacturer: None,
+            category: None,
+            min_recycled_content_percent: None,
+            min_end_of_life_score: None,
+        }
+    }
+
+    /// Applies all configured predicates to a passport.
+    fn matches(&self, passport: &DigitalPassport) -> bool {
+        if let Some(stage) = &self.stage {
+            if &passport.lifecycle_stage != stage {
+                return false;
+            }
+        }
+        if let Some(manufacturer) = &self.manufacturer {
+            if &passport.identity.manufacturer != manufacturer {
+                return false;
+            }
+        }
+        if let Some(category) = &self.category {
+            if &passport.identity.category != category {
+                return false;
+            }
+        }
+        if let Some(min_recycled) = self.min_recycled_content_percent {
+            if passport.circularity.recycled_content_percent < min_recycled {
+                return false;
+            }
+        }
+        if let Some(min_eol) = self.min_end_of_life_score {
+            if passport.circularity.end_of_life_score < min_eol {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Deterministic pagination cursor: the next scan offset into the ordered
+/// candidate set (passport insertion index or per-product position).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PassportPageCursor {
+    pub offset: u64,
+}
+
+/// One deterministic page of query results.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PassportPage {
+    /// Passport IDs matching the filter on this page.
+    pub items: Vec<BytesN<32>>,
+    /// Cursor to resume the next page, `None` when the scan is exhausted.
+    pub next_cursor: Option<PassportPageCursor>,
+    /// Number of candidates inspected while producing this page.
+    pub scanned: u32,
+    /// Whether additional pages remain.
+    pub has_more: bool,
+}
+
+/// Deterministic, cursor-based batch query over all passports with
+/// multi-predicate filtering (#887).
+pub fn get_all_passports_paged(
+    env: &Env,
+    cursor: Option<PassportPageCursor>,
+    limit: u32,
+    filter: Option<PassportFilter>,
+) -> PassportPage {
+    let limit = limit.min(PASSPORT_PAGE_MAX_LIMIT);
+    let filter = filter.unwrap_or_else(|| PassportFilter::new(env));
+    let total: u32 = env
+        .storage()
+        .persistent()
+        .get(&PassportDataKey::PassportCount)
+        .unwrap_or(0);
+
+    let start: u64 = cursor.map(|c| c.offset).unwrap_or(0);
+    let mut matched: Vec<BytesN<32>> = Vec::new(env);
+    let mut scanned: u32 = 0;
+    let mut i: u64 = start;
+
+    // Scan deterministically from `start`, stopping as soon as one page is
+    // filled plus one lookahead match (which signals `has_more`) so no match
+    // is ever discarded between cursor positions, and never exceeding the
+    // per-call scan budget.
+    while i < total as u64 && scanned < PASSPORT_PAGE_MAX_SCAN && matched.len() < limit + 1 {
+        let id: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&PassportDataKey::PassportIndex(i as u32))
+            .unwrap_or_else(|| panic!("Passport index missing"));
+        let passport: DigitalPassport = env
+            .storage()
+            .persistent()
+            .get(&PassportDataKey::Passport(id.clone()))
+            .unwrap_or_else(|| panic!("Passport not found"));
+        if filter.matches(&passport) {
+            matched.push_back(id);
+        }
+        scanned += 1;
+        i += 1;
+    }
+    let bump_for_read = |pid: &BytesN<32>| {
+        env.storage().persistent().extend_ttl(
+            &PassportDataKey::Passport(pid.clone()),
+            PASSPORT_TTL_BUMP_THRESHOLD_LEDGERS,
+            PASSPORT_TTL_EXTEND_LEDGERS,
+        );
+    };
+    for pid in matched.iter() {
+        bump_for_read(&pid);
+    }
+    if scanned > 0 {
+        env.storage().persistent().extend_ttl(
+            &PassportDataKey::PassportIndex(start as u32),
+            PASSPORT_TTL_BUMP_THRESHOLD_LEDGERS,
+            PASSPORT_ARCHIVAL_TTL_EXTEND_LEDGERS,
+        );
+    }
+
+    let mut items = Vec::new(env);
+    for j in 0..(limit.min(matched.len())) {
+        items.push_back(matched.get(j).unwrap());
+    }
+    // When a lookahead match was consumed to signal `has_more`, resume the
+    // next page AT that last scanned ordinal so no match is ever skipped.
+    let more_matches = matched.len() > limit;
+    let final_offset = if more_matches && i > start { i - 1 } else { i };
+    let has_more = more_matches || final_offset < total as u64;
+    let next_cursor = if has_more {
+        Some(PassportPageCursor { offset: final_offset })
+    } else {
+        None
+    };
+    PassportPage {
+        items,
+        next_cursor,
+        scanned,
+        has_more,
+    }
+}
+
+/// Deterministic, cursor-based batch query over the passports of a single
+/// product with multi-predicate filtering (#887).
+pub fn get_product_passports_paged(
+    env: &Env,
+    product_id: Bytes,
+    cursor: Option<PassportPageCursor>,
+    limit: u32,
+    filter: Option<PassportFilter>,
+) -> PassportPage {
+    let limit = limit.min(PASSPORT_PAGE_MAX_LIMIT);
+    let filter = filter.unwrap_or_else(|| PassportFilter::new(env));
+    let candidates: Vec<BytesN<32>> = env
+        .storage()
+        .persistent()
+        .get(&PassportDataKey::ProductPassports(product_id.clone()))
+        .unwrap_or_else(|| Vec::new(&env));
+
+    let start: u64 = cursor.map(|c| c.offset).unwrap_or(0);
+    let mut matched: Vec<BytesN<32>> = Vec::new(env);
+    let mut scanned: u32 = 0;
+    let mut i: u64 = start;
+
+    // Same page-fill + scan-cap policy as [`get_all_passports_paged`].
+    while i < candidates.len() as u64
+        && scanned < PASSPORT_PAGE_MAX_SCAN
+        && matched.len() < limit + 1
+    {
+        let id = candidates.get(i as u32).unwrap();
+        let passport: DigitalPassport = env
+            .storage()
+            .persistent()
+            .get(&PassportDataKey::Passport(id.clone()))
+            .unwrap_or_else(|| panic!("Passport not found"));
+        if filter.matches(&passport) {
+            matched.push_back(id);
+        }
+        scanned += 1;
+        i += 1;
+    }
+    for pid in matched.iter() {
+        env.storage().persistent().extend_ttl(
+            &PassportDataKey::Passport(pid.clone()),
+            PASSPORT_TTL_BUMP_THRESHOLD_LEDGERS,
+            PASSPORT_TTL_EXTEND_LEDGERS,
+        );
+    }
+    if scanned > 0 {
+        env.storage().persistent().extend_ttl(
+            &PassportDataKey::ProductPassports(product_id),
+            PASSPORT_TTL_BUMP_THRESHOLD_LEDGERS,
+            PASSPORT_ARCHIVAL_TTL_EXTEND_LEDGERS,
+        );
+    }
+
+    let mut items = Vec::new(env);
+    for j in 0..(limit.min(matched.len())) {
+        items.push_back(matched.get(j).unwrap());
+    }
+    // Same lookahead-resume policy as [`get_all_passports_paged`].
+    let more_matches = matched.len() > limit;
+    let final_offset = if more_matches && i > start { i - 1 } else { i };
+    let has_more = more_matches || final_offset < candidates.len() as u64;
+    let next_cursor = if has_more {
+        Some(PassportPageCursor { offset: final_offset })
+    } else {
+        None
+    };
+    PassportPage {
+        items,
+        next_cursor,
+        scanned,
+        has_more,
+    }
+}
+
 
