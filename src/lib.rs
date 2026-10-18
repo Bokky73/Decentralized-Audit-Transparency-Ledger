@@ -19,6 +19,8 @@ pub mod tamper_evidence;
 pub mod compliance_validators;
 pub mod tax;
 pub mod vat_engine;
+pub mod rwa_custody;
+pub mod rwa_oracle;
 pub mod tax_engines;
 pub mod tax_audit_trail;
 #[cfg(test)]
