@@ -411,6 +411,52 @@ pub enum AntiCorruptionKey {
     ViolationCount,
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Storage TTL & rent optimization
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Number of ledgers before a persistent record is eligible for expiry.
+pub const TTL_BUMP_THRESHOLD_LEDGERS: u32 = 10_000;
+/// Number of ledgers to extend a record's TTL when refreshed.
+pub const TTL_EXTEND_LEDGERS: u32 = 100_000;
+
+/// Bump the TTL of a persistent record key so active compliance data is not
+/// archived due to rent expiry.
+fn touch_persistent(env: &Env, key: &AntiCorruptionKey) {
+    env.storage()
+        .persistent()
+        .extend_ttl(key, TTL_BUMP_THRESHOLD_LEDGERS, TTL_EXTEND_LEDGERS);
+}
+
+/// Bump the TTL of the contract instance (small hot configuration keys).
+fn touch_instance(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(TTL_BUMP_THRESHOLD_LEDGERS, TTL_EXTEND_LEDGERS);
+}
+
+/// Read a persistent record and refresh its TTL when present.
+fn pg<T>(env: &Env, key: &AntiCorruptionKey) -> Option<T>
+where
+    T: TryFromVal<Env, Error = soroban_sdk::ConversionError>,
+{
+    if let Some(value) = env.storage().persistent().get::<T>(key) {
+        touch_persistent(env, key);
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// Write a persistent record and refresh its TTL.
+fn ps<T>(env: &Env, key: &AntiCorruptionKey, value: &T)
+where
+    T: IntoVal<Env, Error = soroban_sdk::ConversionError> + Clone,
+{
+    env.storage().persistent().set(key, value);
+    touch_persistent(env, key);
+}
+
 // ── Contract Implementation ──────────────────────────────────────────────
 
 #[contract]
@@ -451,6 +497,7 @@ impl AntiCorruption {
         env.storage()
             .instance()
             .set(&AntiCorruptionKey::ViolationCount, &0u32);
+        touch_instance(&env);
     }
 
     // ── Policy Management ────────────────────────────────────────────────
@@ -483,9 +530,7 @@ impl AntiCorruption {
             content_hash,
         };
 
-        env.storage()
-            .instance()
-            .set(&AntiCorruptionKey::Policy(policy_id.clone()), &policy);
+        ps(&env, &AntiCorruptionKey::Policy(policy_id.clone()), &policy);
 
         let count: u32 = env
             .storage()
@@ -506,9 +551,7 @@ impl AntiCorruption {
 
     /// Get a compliance policy
     pub fn get_policy(env: Env, policy_id: BytesN<32>) -> CompliancePolicy {
-        env.storage()
-            .instance()
-            .get(&AntiCorruptionKey::Policy(policy_id.clone()))
+        pg(&env, &AntiCorruptionKey::Policy(policy_id.clone()))
             .unwrap_or_else(|| panic_with_error!(&env, AntiCorruptionError::PolicyNotFound))
     }
 
@@ -527,9 +570,7 @@ impl AntiCorruption {
         policy.last_updated = env.ledger().timestamp();
         policy.content_hash = env.crypto().sha256(&new_content).into();
 
-        env.storage()
-            .instance()
-            .set(&AntiCorruptionKey::Policy(policy_id.clone()), &policy);
+        ps(&env, &AntiCorruptionKey::Policy(policy_id.clone()), &policy);
 
         env.events().publish(
             (Symbol::new(&env, "policy_updated"),),
@@ -575,11 +616,14 @@ impl AntiCorruption {
                 .into(),
         };
 
-        env.storage()
-            .instance()
-            .set(&AntiCorruptionKey::RiskAssessment(assessment_id.clone()), &assessment);
+        ps(
+            &env,
+            &AntiCorruptionKey::RiskAssessment(assessment_id.clone()),
+            &assessment,
+        );
 
-        env.storage().instance().set(
+        ps(
+            &env,
             &AntiCorruptionKey::RiskAssessmentsBySubject(subject.clone()),
             &assessment_id,
         );
@@ -603,14 +647,10 @@ impl AntiCorruption {
 
     /// Get risk assessment for subject
     pub fn get_risk_assessment(env: Env, subject: Address) -> RiskAssessment {
-        if let Some(assessment_id) = env
-            .storage()
-            .instance()
-            .get::<_, BytesN<32>>(&AntiCorruptionKey::RiskAssessmentsBySubject(subject.clone()))
+        if let Some(assessment_id) =
+            pg::<BytesN<32>>(&env, &AntiCorruptionKey::RiskAssessmentsBySubject(subject.clone()))
         {
-            env.storage()
-                .instance()
-                .get(&AntiCorruptionKey::RiskAssessment(assessment_id))
+            pg(&env, &AntiCorruptionKey::RiskAssessment(assessment_id))
                 .unwrap_or_else(|| panic_with_error!(&env, AntiCorruptionError::HighCorruptionRisk))
         } else {
             panic_with_error!(&env, AntiCorruptionError::HighCorruptionRisk)
@@ -648,11 +688,14 @@ impl AntiCorruption {
                 .into(),
         };
 
-        env.storage()
-            .instance()
-            .set(&AntiCorruptionKey::TrainingRecord(training_id.clone()), &training);
+        ps(
+            &env,
+            &AntiCorruptionKey::TrainingRecord(training_id.clone()),
+            &training,
+        );
 
-        env.storage().instance().set(
+        ps(
+            &env,
             &AntiCorruptionKey::TrainingRecordsByEmployee(employee.clone()),
             &training_id,
         );
@@ -693,9 +736,11 @@ impl AntiCorruption {
         training.completed_at = env.ledger().timestamp();
         training.score = score;
 
-        env.storage()
-            .instance()
-            .set(&AntiCorruptionKey::TrainingRecord(training_id.clone()), &training);
+        ps(
+            &env,
+            &AntiCorruptionKey::TrainingRecord(training_id.clone()),
+            &training,
+        );
 
         env.events().publish(
             (Symbol::new(&env, "training_completed"),),
@@ -705,9 +750,7 @@ impl AntiCorruption {
 
     /// Get training record
     pub fn get_training_record(env: Env, training_id: BytesN<32>) -> TrainingRecord {
-        env.storage()
-            .instance()
-            .get(&AntiCorruptionKey::TrainingRecord(training_id))
+        pg(&env, &AntiCorruptionKey::TrainingRecord(training_id))
             .unwrap_or_else(|| panic_with_error!(&env, AntiCorruptionError::TrainingNotCompleted))
     }
 
@@ -762,25 +805,24 @@ impl AntiCorruption {
                 .into(),
         };
 
-        env.storage()
-            .instance()
-            .set(&AntiCorruptionKey::ThirdPartyRisk(risk_id.clone()), &profile);
+        ps(
+            &env,
+            &AntiCorruptionKey::ThirdPartyRisk(risk_id.clone()),
+            &profile,
+        );
 
-        env.storage().instance().set(
+        ps(
+            &env,
             &AntiCorruptionKey::ThirdPartyByAddress(third_party.clone()),
             &risk_id,
         );
 
         if is_pep {
-            env.storage()
-                .instance()
-                .set(&AntiCorruptionKey::PEPRegistry(third_party.clone()), &true);
+            ps(&env, &AntiCorruptionKey::PEPRegistry(third_party.clone()), &true);
         }
 
         if sanctions_match {
-            env.storage()
-                .instance()
-                .set(&AntiCorruptionKey::SanctionsMatch(third_party.clone()), &true);
+            ps(&env, &AntiCorruptionKey::SanctionsMatch(third_party.clone()), &true);
         }
 
         let count: u32 = env
@@ -822,9 +864,11 @@ impl AntiCorruption {
         profile.due_diligence_date = env.ledger().timestamp();
         profile.beneficial_owners_disclosed = beneficial_owners_disclosed;
 
-        env.storage()
-            .instance()
-            .set(&AntiCorruptionKey::ThirdPartyRisk(third_party_id.clone()), &profile);
+        ps(
+            &env,
+            &AntiCorruptionKey::ThirdPartyRisk(third_party_id.clone()),
+            &profile,
+        );
 
         env.events().publish(
             (Symbol::new(&env, "due_diligence_completed"),),
@@ -834,14 +878,10 @@ impl AntiCorruption {
 
     /// Get third-party risk profile
     pub fn get_third_party_risk(env: Env, third_party: Address) -> ThirdPartyRisk {
-        if let Some(risk_id) = env
-            .storage()
-            .instance()
-            .get::<_, BytesN<32>>(&AntiCorruptionKey::ThirdPartyByAddress(third_party.clone()))
+        if let Some(risk_id) =
+            pg::<BytesN<32>>(&env, &AntiCorruptionKey::ThirdPartyByAddress(third_party.clone()))
         {
-            env.storage()
-                .instance()
-                .get(&AntiCorruptionKey::ThirdPartyRisk(risk_id))
+            pg(&env, &AntiCorruptionKey::ThirdPartyRisk(risk_id))
                 .unwrap_or_else(|| {
                     panic_with_error!(&env, AntiCorruptionError::ThirdPartyRiskNotAssessed)
                 })
@@ -911,11 +951,14 @@ impl AntiCorruption {
                 .into(),
         };
 
-        env.storage()
-            .instance()
-            .set(&AntiCorruptionKey::MonitoredTransaction(tx_id.clone()), &transaction);
+        ps(
+            &env,
+            &AntiCorruptionKey::MonitoredTransaction(tx_id.clone()),
+            &transaction,
+        );
 
-        env.storage().instance().set(
+        ps(
+            &env,
             &AntiCorruptionKey::TransactionsByInitiator(from.clone()),
             &tx_id,
         );
@@ -952,9 +995,11 @@ impl AntiCorruption {
         transaction.approval_date = env.ledger().timestamp();
         transaction.approved_by = caller.clone();
 
-        env.storage()
-            .instance()
-            .set(&AntiCorruptionKey::MonitoredTransaction(tx_id.clone()), &transaction);
+        ps(
+            &env,
+            &AntiCorruptionKey::MonitoredTransaction(tx_id.clone()),
+            &transaction,
+        );
 
         env.events().publish(
             (Symbol::new(&env, "transaction_approved"),),
@@ -964,9 +1009,7 @@ impl AntiCorruption {
 
     /// Get monitored transaction
     pub fn get_transaction(env: Env, tx_id: BytesN<32>) -> MonitoredTransaction {
-        env.storage()
-            .instance()
-            .get(&AntiCorruptionKey::MonitoredTransaction(tx_id))
+        pg(&env, &AntiCorruptionKey::MonitoredTransaction(tx_id))
             .unwrap_or_else(|| panic_with_error!(&env, AntiCorruptionError::ProhibitedTransaction))
     }
 
@@ -1004,11 +1047,14 @@ impl AntiCorruption {
                 .into(),
         };
 
-        env.storage()
-            .instance()
-            .set(&AntiCorruptionKey::WhistleblowerReport(report_id.clone()), &report);
+        ps(
+            &env,
+            &AntiCorruptionKey::WhistleblowerReport(report_id.clone()),
+            &report,
+        );
 
-        env.storage().instance().set(
+        ps(
+            &env,
             &AntiCorruptionKey::WhistleblowerByReporter(reporter.clone()),
             &report_id,
         );
@@ -1051,9 +1097,11 @@ impl AntiCorruption {
         report.status = 3; // InProgress
         report.investigator = investigator.clone();
 
-        env.storage()
-            .instance()
-            .set(&AntiCorruptionKey::WhistleblowerReport(report_id.clone()), &report);
+        ps(
+            &env,
+            &AntiCorruptionKey::WhistleblowerReport(report_id.clone()),
+            &report,
+        );
 
         env.events().publish(
             (Symbol::new(&env, "investigator_assigned"),),
@@ -1084,9 +1132,11 @@ impl AntiCorruption {
         report.findings_encrypted = findings_encrypted;
         report.corrective_actions = corrective_actions;
 
-        env.storage()
-            .instance()
-            .set(&AntiCorruptionKey::WhistleblowerReport(report_id.clone()), &report);
+        ps(
+            &env,
+            &AntiCorruptionKey::WhistleblowerReport(report_id.clone()),
+            &report,
+        );
 
         env.events().publish(
             (Symbol::new(&env, "investigation_concluded"),),
@@ -1103,9 +1153,7 @@ impl AntiCorruption {
         caller.require_auth();
         Self::require_compliance_officer(&env, &caller);
 
-        env.storage()
-            .instance()
-            .get(&AntiCorruptionKey::WhistleblowerReport(report_id))
+        pg(&env, &AntiCorruptionKey::WhistleblowerReport(report_id))
             .unwrap_or_else(|| {
                 panic_with_error!(&env, AntiCorruptionError::WhistleblowerReportSealed)
             })
@@ -1146,9 +1194,11 @@ impl AntiCorruption {
                 .into(),
         };
 
-        env.storage()
-            .instance()
-            .set(&AntiCorruptionKey::ComplianceIncident(incident_id.clone()), &incident);
+        ps(
+            &env,
+            &AntiCorruptionKey::ComplianceIncident(incident_id.clone()),
+            &incident,
+        );
 
         let count: u32 = env
             .storage()
@@ -1181,9 +1231,7 @@ impl AntiCorruption {
 
     /// Get compliance incident
     pub fn get_incident(env: Env, incident_id: BytesN<32>) -> ComplianceIncident {
-        env.storage()
-            .instance()
-            .get(&AntiCorruptionKey::ComplianceIncident(incident_id))
+        pg(&env, &AntiCorruptionKey::ComplianceIncident(incident_id))
             .unwrap_or_else(|| panic_with_error!(&env, AntiCorruptionError::ComplianceViolation))
     }
 
@@ -1209,9 +1257,11 @@ impl AntiCorruption {
             updated_at: env.ledger().timestamp(),
         };
 
-        env.storage()
-            .instance()
-            .set(&AntiCorruptionKey::HighRiskJurisdiction(country_code.clone()), &jurisdiction);
+        ps(
+            &env,
+            &AntiCorruptionKey::HighRiskJurisdiction(country_code.clone()),
+            &jurisdiction,
+        );
 
         env.events().publish(
             (Symbol::new(&env, "high_risk_jurisdiction_added"),),
@@ -1221,9 +1271,8 @@ impl AntiCorruption {
 
     /// Check if jurisdiction is high-risk
     pub fn is_high_risk_jurisdiction_check(env: Env, country_code: Bytes) -> bool {
-        env.storage()
-            .instance()
-            .has(&AntiCorruptionKey::HighRiskJurisdiction(country_code))
+        pg::<HighRiskJurisdiction>(&env, &AntiCorruptionKey::HighRiskJurisdiction(country_code))
+            .is_some()
     }
 
     // ── Compliance Statistics ────────────────────────────────────────────
@@ -1254,6 +1303,18 @@ impl AntiCorruption {
         (total_assessments, total_training, total_violations, total_incidents)
     }
 
+    // ── TTL maintenance ──────────────────────────────────────────────────
+
+    /// Permissionlessly refresh the TTL of the contract instance (owner, officer, counters).
+    pub fn refresh_instance_ttl(env: Env) {
+        touch_instance(&env);
+    }
+
+    /// Permissionlessly refresh the TTL of any persistent compliance record key.
+    pub fn refresh_record_ttl(env: Env, key: AntiCorruptionKey) {
+        touch_persistent(&env, &key);
+    }
+
     // ── Private Helper Functions ─────────────────────────────────────────
 
     fn require_compliance_officer(env: &Env, caller: &Address) {
@@ -1280,22 +1341,17 @@ impl AntiCorruption {
     }
 
     fn is_high_risk_jurisdiction(env: &Env, country_code: &Bytes) -> bool {
-        env.storage()
-            .instance()
-            .has(&AntiCorruptionKey::HighRiskJurisdiction(country_code.clone()))
+        pg::<HighRiskJurisdiction>(env, &AntiCorruptionKey::HighRiskJurisdiction(country_code.clone()))
+            .is_some()
     }
 
     fn is_sanctions_match(env: &Env, party: &Address) -> bool {
-        env.storage()
-            .instance()
-            .get::<_, bool>(&AntiCorruptionKey::SanctionsMatch(party.clone()))
+        pg::<bool>(env, &AntiCorruptionKey::SanctionsMatch(party.clone()))
             .unwrap_or(false)
     }
 
     fn is_pep(env: &Env, party: &Address) -> bool {
-        env.storage()
-            .instance()
-            .get::<_, bool>(&AntiCorruptionKey::PEPRegistry(party.clone()))
+        pg::<bool>(env, &AntiCorruptionKey::PEPRegistry(party.clone()))
             .unwrap_or(false)
     }
 
