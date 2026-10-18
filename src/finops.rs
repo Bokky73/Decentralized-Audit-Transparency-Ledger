@@ -203,6 +203,16 @@ pub enum DataKey {
     AnomalyCount,
     BudgetCount,
     AlertCount,
+    /// Registry of stored allocation IDs in insertion order: index → id.
+    /// Aggregation paths must enumerate records through this registry,
+    /// since record bodies live behind content-derived `BytesN<32>` ids.
+    AllocationIndex(u32),
+    /// Registry of stored anomaly IDs in insertion order.
+    AnomalyIndex(u32),
+    /// Registry of stored rightsizing recommendation IDs in insertion order.
+    RightsizingIndex(u32),
+    /// Registry of stored budget IDs in insertion order.
+    BudgetIndex(u32),
 }
 
 // ── Helper Functions ────────────────────────────────────────────────────
@@ -216,7 +226,7 @@ fn compute_id(env: &Env, prefix: &[u8], data: &Bytes) -> BytesN<32> {
 }
 
 /// Widen a 4-byte little-endian value into a 32-byte `BytesN` key.
-fn u32_key(bytes: [u8; 4]) -> [u8; 32] {
+const fn u32_key(bytes: [u8; 4]) -> [u8; 32] {
     let mut key = [0u8; 32];
     key[..4].copy_from_slice(&bytes);
     key
@@ -256,6 +266,17 @@ fn validate_amount(env: &Env, amount: u64) {
     if amount == 0 {
         panic_with_error!(env, FinOpsError::InvalidAmount);
     }
+}
+
+/// Registry write: pin a record's ordinal slot to its content-derived id so
+/// aggregation paths can enumerate records deterministically.
+fn index_map(env: &Env, variant: fn(u32) -> DataKey, index: u32, id: &BytesN<32>) {
+    env.storage().persistent().set(&variant(index), id);
+}
+
+/// Registry read: resolve a record ordinal slot to its content-derived id.
+fn index_get(env: &Env, variant: fn(u32) -> DataKey, index: u32) -> Option<BytesN<32>> {
+    env.storage().persistent().get(&variant(index))
 }
 
 // ── Cost Center Management ──────────────────────────────────────────────
@@ -415,6 +436,7 @@ pub fn allocate_cost(
         .persistent()
         .get(&DataKey::AllocationCount)
         .unwrap_or(0u32);
+    index_map(&env, DataKey::AllocationIndex, count, &id.clone());
     env.storage()
         .persistent()
         .set(&DataKey::AllocationCount, &(count + 1));
@@ -671,6 +693,7 @@ pub fn generate_rightsizing(env: Env, caller: Address, resource_id: BytesN<32>) 
         .persistent()
         .get(&DataKey::RightsizingCount)
         .unwrap_or(0u32);
+    index_map(&env, DataKey::RightsizingIndex, count, &rec_id.clone());
     env.storage()
         .persistent()
         .set(&DataKey::RightsizingCount, &(count + 1));
@@ -744,6 +767,7 @@ pub fn record_anomaly(
         .persistent()
         .get(&DataKey::AnomalyCount)
         .unwrap_or(0u32);
+    index_map(&env, DataKey::AnomalyIndex, count, &id.clone());
     env.storage()
         .persistent()
         .set(&DataKey::AnomalyCount, &(count + 1));
@@ -769,8 +793,10 @@ pub fn detect_anomalies(env: Env, caller: Address, resource_id: BytesN<32>) -> V
         .unwrap_or(0u32);
 
     for i in 0..count {
-        let key = DataKey::CostAnomaly(BytesN::from_array(&env, &u32_key(i.to_le_bytes())));
-        if let Some(anomaly) = env.storage().persistent().get::<_, CostAnomaly>(&key) {
+        let Some(id) = index_get(&env, DataKey::AnomalyIndex, i) else {
+            continue;
+        };
+        if let Some(anomaly) = env.storage().persistent().get::<_, CostAnomaly>(&DataKey::CostAnomaly(id)) {
             if anomaly.resource_id == resource_id && !anomaly.resolved && anomaly.severity >= 2 {
                 anomalies.push_back(anomaly.id);
             }
@@ -843,6 +869,7 @@ pub fn create_budget(
         .persistent()
         .get(&DataKey::BudgetCount)
         .unwrap_or(0u32);
+    index_map(&env, DataKey::BudgetIndex, count, &id.clone());
     env.storage()
         .persistent()
         .set(&DataKey::BudgetCount, &(count + 1));
@@ -949,9 +976,10 @@ pub fn generate_dashboard(env: Env) -> CostDashboard {
         .unwrap_or(0u32);
 
     for i in 0..allocation_count {
-        let key = DataKey::CostAllocation(BytesN::from_array(&env, &u32_key(i.to_le_bytes())));
-        if let Some(alloc) = env.storage().persistent().get::<_, CostAllocation>(&key) {
-            total_cost += alloc.amount;
+        if let Some(id) = index_get(&env, DataKey::AllocationIndex, i) {
+            if let Some(alloc) = env.storage().persistent().get::<_, CostAllocation>(&DataKey::CostAllocation(id)) {
+                total_cost += alloc.amount;
+            }
         }
     }
 
@@ -962,10 +990,11 @@ pub fn generate_dashboard(env: Env) -> CostDashboard {
         .unwrap_or(0u32);
 
     for i in 0..anomaly_count {
-        let key = DataKey::CostAnomaly(BytesN::from_array(&env, &u32_key(i.to_le_bytes())));
-        if let Some(anomaly) = env.storage().persistent().get::<_, CostAnomaly>(&key) {
-            if !anomaly.resolved {
-                active_anomalies += 1;
+        if let Some(id) = index_get(&env, DataKey::AnomalyIndex, i) {
+            if let Some(anomaly) = env.storage().persistent().get::<_, CostAnomaly>(&DataKey::CostAnomaly(id)) {
+                if !anomaly.resolved {
+                    active_anomalies += 1;
+                }
             }
         }
     }
@@ -977,9 +1006,10 @@ pub fn generate_dashboard(env: Env) -> CostDashboard {
         .unwrap_or(0u32);
 
     for i in 0..rightsizing_count {
-        let key = DataKey::RightsizingRec(BytesN::from_array(&env, &u32_key(i.to_le_bytes())));
-        if let Some(rec) = env.storage().persistent().get::<_, RightsizingRecommendation>(&key) {
-            total_savings += rec.monthly_savings;
+        if let Some(id) = index_get(&env, DataKey::RightsizingIndex, i) {
+            if let Some(rec) = env.storage().persistent().get::<_, RightsizingRecommendation>(&DataKey::RightsizingRec(id)) {
+                total_savings += rec.monthly_savings;
+            }
         }
     }
 
@@ -991,13 +1021,14 @@ pub fn generate_dashboard(env: Env) -> CostDashboard {
 
     let mut budget_util = 0u32;
     for i in 0..budget_count {
-        let key = DataKey::Budget(BytesN::from_array(&env, &u32_key(i.to_le_bytes())));
-        if let Some(budget) = env.storage().persistent().get::<_, Budget>(&key) {
-            if budget.active {
-                let center_allocs = get_center_allocations(env.clone(), budget.cost_center_id.clone());
-                for alloc_id in center_allocs.iter() {
-                    if let Some(alloc) = env.storage().persistent().get::<_, CostAllocation>(&DataKey::CostAllocation(alloc_id.clone())) {
-                        budget_util += (alloc.amount * 100 / budget.amount) as u32;
+        if let Some(budget_id) = index_get(&env, DataKey::BudgetIndex, i) {
+            if let Some(budget) = env.storage().persistent().get::<_, Budget>(&DataKey::Budget(budget_id)) {
+                if budget.active {
+                    let center_allocs = get_center_allocations(env.clone(), budget.cost_center_id.clone());
+                    for alloc_id in center_allocs.iter() {
+                        if let Some(alloc) = env.storage().persistent().get::<_, CostAllocation>(&DataKey::CostAllocation(alloc_id.clone())) {
+                            budget_util += (alloc.amount * 100 / budget.amount) as u32;
+                        }
                     }
                 }
             }
@@ -1033,10 +1064,11 @@ pub fn get_cost_summary(env: Env, period: Bytes) -> CostSummary {
         .unwrap_or(0u32);
 
     for i in 0..allocation_count {
-        let key = DataKey::CostAllocation(BytesN::from_array(&env, &u32_key(i.to_le_bytes())));
-        if let Some(alloc) = env.storage().persistent().get::<_, CostAllocation>(&key) {
-            if alloc.period == period {
-                total_cost += alloc.amount;
+        if let Some(id) = index_get(&env, DataKey::AllocationIndex, i) {
+            if let Some(alloc) = env.storage().persistent().get::<_, CostAllocation>(&DataKey::CostAllocation(id)) {
+                if alloc.period == period {
+                    total_cost += alloc.amount;
+                }
             }
         }
     }
@@ -1083,10 +1115,11 @@ pub fn get_active_anomaly_count(env: Env) -> u32 {
 
     let mut active = 0u32;
     for i in 0..count {
-        let key = DataKey::CostAnomaly(BytesN::from_array(&env, &u32_key(i.to_le_bytes())));
-        if let Some(anomaly) = env.storage().persistent().get::<_, CostAnomaly>(&key) {
-            if !anomaly.resolved {
-                active += 1;
+        if let Some(id) = index_get(&env, DataKey::AnomalyIndex, i) {
+            if let Some(anomaly) = env.storage().persistent().get::<_, CostAnomaly>(&DataKey::CostAnomaly(id)) {
+                if !anomaly.resolved {
+                    active += 1;
+                }
             }
         }
     }

@@ -46,6 +46,9 @@ use soroban_sdk::{
 };
 
 pub mod supply_chain;
+// Fine-grained RBAC role gating shared by mutating modules (supply chain,
+// cross-contract router) and susbmitter suspension controls (issue #865).
+pub mod rbac;
 pub mod digital_passport;
 pub mod carbon_credits;
 pub mod esg_reporting;
@@ -600,6 +603,18 @@ pub enum DataKey {
     DisputeCount,
     /// Individual dispute record.
     DisputeData(u32),
+
+    // Cross-contract automated TTL & rent optimization (issue #866)
+
+    /// Automated TTL bump policy for cross-contract state keys
+    /// (instance tier: tiny config blob, read on every interaction).
+    XctTtlPolicy,
+    /// Monotonic count + ledger of the last automated TTL bump performed on
+    /// cross-contract keys (instance tier).
+    XctBumpStats,
+    /// Tamper-evident SHA-256 digest for each cross-contract composition.
+    /// Persistent tier so integrity evidence outlives the hot path.
+    XctCompositionHash(u32),
 }
 
 #[contracterror]
@@ -953,6 +968,17 @@ pub enum ContractError {
 
     /// **Code 84**: The dispute does not exist.
     DisputeNotFound = 84,
+
+    /// **Code 85**: Workflow step index exceeds the definition's step count.
+    /// **Common cause**: `record_workflow_step` called with an out-of-range index.
+    /// **Resolution**: Use a `step_index` in `0..wf.steps.len()`.
+    WorkflowStepOutOfRange = 85,
+
+    /// **Code 86**: The cross-contract TTL policy parameters are invalid.
+    /// **Common cause**: `set_xct_ttl_policy` with a zero bump threshold or a
+    /// bump target smaller than the threshold.
+    /// **Resolution**: `bump_target >= bump_threshold > 0`.
+    InvalidTtlPolicy = 86,
 }
 
 #[contracttype]
@@ -7196,6 +7222,9 @@ pub mod storage_layout;
 mod finops_tests;
 
 #[cfg(test)]
+mod finops_invariant_tests;
+
+#[cfg(test)]
 mod supply_chain_tests;
 
 #[cfg(test)]
@@ -7222,6 +7251,9 @@ pub mod cross_contract;
 
 #[cfg(test)]
 mod workflow_tests;
+
+#[cfg(test)]
+mod cross_contract_invariant_tests;
 
 pub mod marketplace;
 
