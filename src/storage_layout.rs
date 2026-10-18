@@ -16,7 +16,7 @@ pub const LAYOUT_SCHEMA_VERSION: u32 = 1;
 /// Bumped to account for the reordered/packed CBDC interop storage keys
 /// (persistent/temporary/instance tier classification and packed composite
 /// struct fields) introduced for the archival-rent optimization.
-pub const DATAKEY_VARIANT_COUNT: u32 = 87; // update when variants are added
+pub const DATAKEY_VARIANT_COUNT: u32 = 145; // update when variants are added
 
 #[cfg(test)]
 mod tests {

@@ -474,6 +474,10 @@ pub enum ReportingError {
     PipelinePaused = 213,
     /// Entity is not authorized to manage this report.
     UnauthorizedEntity = 214,
+    /// Supplied nonce does not match the stored nonce (replay / idempotency failure).
+    NonceTooLow = 215,
+    /// Nonce has reached the exhaustion threshold for this submitter.
+    NonceExhausted = 216,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

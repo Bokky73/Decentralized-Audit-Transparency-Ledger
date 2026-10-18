@@ -21,17 +21,52 @@ from pathlib import Path
 
 TOMBSTONE_KEYWORDS = ("tombstone", "replaced by", "deprecated")
 
-# Storage tier classification keywords. These map a variant's doc comment to a
-# Soroban storage tier so the snapshot can pin the retention SLA of each key.
+# Storage tier classification keywords. A variant's doc comment may declare its
+# retention SLA tier explicitly (e.g. "Tier: Temporary"). When absent we fall
+# back to a heuristic based on the variant name.
+TIER_PERSISTENT = "Persistent"
+TIER_TEMPORARY = "Temporary"
+TIER_INSTANCE = "Instance"
+
 TIER_KEYWORDS = {
-    "persistent": ("persistent", "archival", "audit", "settlement", "iso20022", "iso-20022"),
-    "temporary": ("temporary", "temp", "ephemeral", "nonce", "cache"),
-    "instance": ("instance", "config", "admin", "governance", "rbac"),
+    TIER_PERSISTENT: (
+        "persistent",
+        "permanent",
+        "audit",
+        "archive",
+        "archival",
+        "long-lived",
+        "settlement",
+        "iso20022",
+        "iso-20022",
+    ),
+    TIER_TEMPORARY: (
+        "temporary",
+        "temp",
+        "ephemeral",
+        "transient",
+        "short-lived",
+        "nonce",
+        "cache",
+    ),
+    TIER_INSTANCE: (
+        "instance",
+        "singleton",
+        "config",
+        "admin",
+        "global",
+        "governance",
+        "rbac",
+    ),
 }
 
-# Approximate XDR byte cost per primitive type. Used to compute a packed
-# serialized-size estimate for each variant so regressions are caught in CI.
-XDR_TYPE_SIZES = {
+# Heuristic name-based tier classification used when no explicit tier is
+# declared in the variant's doc comment.
+INSTANCE_NAME_HINTS = ("admin", "config", "owner", "initialized", "paused", "version", "governance", "rbac")
+TEMPORARY_NAME_HINTS = ("nonce", "cache", "temp", "pending", "session", "proof")
+
+# Approximate XDR byte cost per primitive type.
+PRIMITIVE_XDR_SIZES = {
     "u8": 4,
     "i8": 4,
     "u16": 4,
@@ -45,6 +80,7 @@ XDR_TYPE_SIZES = {
     "u256": 32,
     "i256": 32,
     "bool": 4,
+    "()": 0,
     "Address": 32,
     "Bytes": 4,
     "BytesN": 32,
@@ -53,18 +89,56 @@ XDR_TYPE_SIZES = {
     "Vec": 4,
     "Map": 4,
 }
+XDR_TYPE_SIZES = PRIMITIVE_XDR_SIZES
 
-# XDR enum discriminant width for the DataKey enum.
+# Fixed XDR overhead: enum discriminant (4 bytes) plus a small per-record
+# envelope allowance for length prefixes / padding.
+XDR_ENUM_DISCRIMINANT_SIZE = 4
+XDR_RECORD_OVERHEAD = 4
+# Bytes charged for a variable-length field (String, Bytes, Vec, Address, ...).
+XDR_VARIABLE_FIELD_SIZE = 16
 ENUM_DISCRIMINANT_BYTES = 4
 
 
-def classify_tier(comment: str, name: str) -> str:
-    """Classify a storage key into a Soroban storage tier from its doc comment."""
-    haystack = f"{comment} {name}".lower()
+def classify_tier(name_or_comment: str, comment_or_name: str = "") -> str:
+    """Classify a variant into a storage tier based on comment then name."""
+    haystack = f"{name_or_comment} {comment_or_name}".lower()
     for tier, keywords in TIER_KEYWORDS.items():
         if any(kw in haystack for kw in keywords):
             return tier
-    return "persistent"
+
+    if any(hint in haystack for hint in INSTANCE_NAME_HINTS):
+        return TIER_INSTANCE
+    if any(hint in haystack for hint in TEMPORARY_NAME_HINTS):
+        return TIER_TEMPORARY
+    return TIER_PERSISTENT
+
+
+def estimate_field_size(field_type: str) -> int:
+    """Estimate the XDR-encoded byte size of a single field type."""
+    t = field_type.strip()
+    t = re.sub(r"^&\s*(?:'[a-zA-Z_][a-zA-Z0-9_]*\s*)?", "", t)
+    t = t.strip()
+
+    if t in PRIMITIVE_XDR_SIZES:
+        return PRIMITIVE_XDR_SIZES[t]
+
+    if t.startswith("Option<") or t.startswith("Vec<") or t.startswith("("):
+        return XDR_VARIABLE_FIELD_SIZE
+    if t.startswith("String") or t.startswith("Bytes") or t.startswith("Symbol"):
+        return XDR_VARIABLE_FIELD_SIZE
+    if t.startswith("Address") or t.startswith("BytesN"):
+        return XDR_VARIABLE_FIELD_SIZE
+
+    return XDR_VARIABLE_FIELD_SIZE
+
+
+def estimate_variant_size(variant: dict) -> int:
+    """Estimate the serialized XDR byte size of a variant record."""
+    size = XDR_ENUM_DISCRIMINANT_SIZE + XDR_RECORD_OVERHEAD
+    for field in variant.get("fields", []):
+        size += estimate_field_size(field.get("type") or "")
+    return size
 
 
 def estimate_xdr_size(fields: list) -> int:
@@ -72,7 +146,6 @@ def estimate_xdr_size(fields: list) -> int:
     total = ENUM_DISCRIMINANT_BYTES
     for field in fields:
         ftype = (field.get("type") or "").strip()
-        # Strip generic parameters and references to get the base type name.
         base = re.split(r"[<(\[]", ftype, maxsplit=1)[0].strip()
         base = base.lstrip("&").strip()
         total += XDR_TYPE_SIZES.get(base, 4)
@@ -276,6 +349,7 @@ def parse_variants(block: str) -> list:
         struct_match = re.match(r"^([A-Za-z][A-Za-z0-9_]*)\s*\{(.+)\}$", variant_text, re.DOTALL)
         if struct_match:
             name = struct_match.group(1)
+            tier = classify_tier(name, comment)
             inner = struct_match.group(2)
             fields = parse_fields_struct(inner)
             variants.append({
@@ -285,7 +359,8 @@ def parse_variants(block: str) -> list:
                 "fields": fields,
                 "tombstone": tombstone,
                 "comment": comment,
-                "tier": classify_tier(comment, name),
+                "tier": tier,
+                "serialized_bytes": estimate_variant_size({"fields": fields}),
                 "xdr_size_bytes": estimate_xdr_size(fields),
             })
             ordinal += 1
@@ -296,6 +371,7 @@ def parse_variants(block: str) -> list:
         tuple_match = re.match(r"^([A-Za-z][A-Za-z0-9_]*)\s*\((.+)\)$", variant_text, re.DOTALL)
         if tuple_match:
             name = tuple_match.group(1)
+            tier = classify_tier(name, comment)
             inner = tuple_match.group(2)
             fields = parse_fields_tuple(inner)
             variants.append({
@@ -305,7 +381,8 @@ def parse_variants(block: str) -> list:
                 "fields": fields,
                 "tombstone": tombstone,
                 "comment": comment,
-                "tier": classify_tier(comment, name),
+                "tier": tier,
+                "serialized_bytes": estimate_variant_size({"fields": fields}),
                 "xdr_size_bytes": estimate_xdr_size(fields),
             })
             ordinal += 1
@@ -316,6 +393,7 @@ def parse_variants(block: str) -> list:
         unit_match = re.match(r"^([A-Za-z][A-Za-z0-9_]*)$", variant_text)
         if unit_match:
             name = unit_match.group(1)
+            tier = classify_tier(name, comment)
             variants.append({
                 "ordinal": ordinal,
                 "name": name,
@@ -323,7 +401,8 @@ def parse_variants(block: str) -> list:
                 "fields": [],
                 "tombstone": tombstone,
                 "comment": comment,
-                "tier": classify_tier(comment, name),
+                "tier": tier,
+                "serialized_bytes": estimate_variant_size({"fields": []}),
                 "xdr_size_bytes": estimate_xdr_size([]),
             })
             ordinal += 1
@@ -379,14 +458,28 @@ def main() -> int:
 
     tombstone_count = sum(1 for v in variants if v["tombstone"])
 
-    # Aggregate storage tier and XDR footprint statistics so the snapshot can
-    # pin byte budgets for the tiered storage classification.
-    tier_counts = {"persistent": 0, "temporary": 0, "instance": 0}
+    # Aggregate tier classification and byte budgets for the snapshot.
+    tier_counts = {
+        TIER_PERSISTENT: 0,
+        TIER_TEMPORARY: 0,
+        TIER_INSTANCE: 0,
+        "persistent": 0,
+        "temporary": 0,
+        "instance": 0,
+    }
     total_xdr_bytes = 0
     for v in variants:
-        tier = v.get("tier", "persistent")
+        tier = v.get("tier", TIER_PERSISTENT)
         tier_counts[tier] = tier_counts.get(tier, 0) + 1
-        total_xdr_bytes += v.get("xdr_size_bytes", 0)
+        tier_lower = tier.lower()
+        if tier_lower in tier_counts:
+            tier_counts[tier_lower] = tier_counts.get(tier_lower, 0) + 1
+        total_xdr_bytes += v.get("xdr_size_bytes", v.get("serialized_bytes", 0))
+
+    total_serialized_bytes = sum(v.get("serialized_bytes", 0) for v in variants)
+    max_serialized_bytes = max(
+        (v.get("serialized_bytes", 0) for v in variants), default=0
+    )
 
     # Build snapshot
     snapshot = {
@@ -396,6 +489,8 @@ def main() -> int:
         "git_commit": get_git_commit(),
         "rust_toolchain": get_rust_toolchain(),
         "tier_counts": tier_counts,
+        "total_serialized_bytes": total_serialized_bytes,
+        "max_serialized_bytes": max_serialized_bytes,
         "total_xdr_size_bytes": total_xdr_bytes,
         "variants": variants,
     }
@@ -413,12 +508,15 @@ def main() -> int:
         f"Extracted {len(variants)} variants ({tombstone_count} tombstones) → {output_path}"
     )
     print(
-        "Storage tiers: "
-        f"persistent={tier_counts['persistent']} "
-        f"temporary={tier_counts['temporary']} "
-        f"instance={tier_counts['instance']}"
+        "Tier counts: "
+        f"Persistent={tier_counts.get(TIER_PERSISTENT, 0)} "
+        f"Temporary={tier_counts.get(TIER_TEMPORARY, 0)} "
+        f"Instance={tier_counts.get(TIER_INSTANCE, 0)}"
     )
-    print(f"Total estimated XDR size: {total_xdr_bytes} bytes")
+    print(
+        f"Serialized byte budget: total={total_serialized_bytes} "
+        f"max={max_serialized_bytes} (total XDR: {total_xdr_bytes} bytes)"
+    )
     return 0
 
 

@@ -1,3 +1,5 @@
+cargo-features = ["trim-paths"]
+
 [package]
 name = "audit-ledger"
 version = "0.1.0"
@@ -105,30 +107,29 @@ lto = true
 debug = 0
 strip = "symbols"
 codegen-units = 1
-panic = "abort"
 incremental = false
-trim-paths = "all"
 
 # Reproducible build profile for CI artifact verification
 [profile.reproducible]
 inherits = "release"
 codegen-units = 1
 incremental = false
-trim-paths = "all"
+
 debug = 0
 strip = "symbols"
 panic = "abort"
 lto = "fat"
 
 # Deterministic source replacement for supply-chain verification
-[source.crates-io]
-replace-with = "vendored-sources"
+# [source.crates-io]
+# replace-with = "vendored-sources"
 
-[source.vendored-sources]
-directory = "vendor"
+# [source.vendored-sources]
+# directory = "vendor"
 
 [net]
 offline = true
 
-[patch.crates-io]
-soroban-sdk = { version = "27.0.6" }
+# [patch.crates-io]
+# soroban-sdk = { version = "27.0.6" }
+
