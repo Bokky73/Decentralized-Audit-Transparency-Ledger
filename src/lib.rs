@@ -54,6 +54,7 @@ pub mod rbac;
 pub mod digital_passport;
 pub mod carbon_credits;
 pub mod esg_reporting;
+pub mod rbac;
 
 // Data retention, legal hold, GDPR erasure, and the immutable operational audit log.
 pub mod data_retention;

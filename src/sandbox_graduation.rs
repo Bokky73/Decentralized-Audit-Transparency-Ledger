@@ -572,7 +572,7 @@ impl GraduationManager {
             && financial_ok;
 
         assessment.is_eligible = eligible;
-        eligible
+        Ok(eligible)
     }
 
     /// Get graduation readiness percentage
@@ -839,5 +839,19 @@ impl Default for AssessmentFilter {
             decision: None,
             is_eligible: None,
         }
+    }
+
+    #[test]
+    fn test_notes_length_rejected_when_too_long() {
+        let env = soroban_sdk::Env::default();
+        let mut assessment = GraduationManager::create_assessment(&env, BytesN::zero());
+        assessment.is_eligible = true;
+
+        let mut long_notes = soroban_sdk::Bytes::new(&env);
+        for _ in 0..2048u32 {
+            long_notes.push_back(b'a');
+        }
+        let result = GraduationManager::approve_graduation(&mut assessment, long_notes);
+        assert_eq!(result, Err("notes exceed maximum permitted length"));
     }
 }
