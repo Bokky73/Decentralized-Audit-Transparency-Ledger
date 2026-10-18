@@ -15,6 +15,25 @@ use crate::rbac::{RbacManager, RbacError};
 use crate::rbac::Role as RbacRole;
 
 // ============================================================================
+// Deterministic bounds and overflow-safety limits
+// ============================================================================
+
+/// Maximum length (in bytes) for a dispute description.
+pub const MAX_DESCRIPTION_LEN: usize = 4 * 1024; // 4 KiB
+
+/// Maximum length (in bytes) for an evidence URI.
+pub const MAX_EVIDENCE_URI_LEN: usize = 2 * 1024; // 2 KiB
+
+/// Maximum length (in bytes) for an appeal reason.
+pub const MAX_APPEAL_REASON_LEN: usize = 2 * 1024; // 2 KiB
+
+/// Maximum number of jurors assignable to a single dispute.
+pub const MAX_JURORS_PER_DISPUTE: usize = 128;
+
+/// Basis-points denominator used for slashing/reward calculations.
+pub const BASIS_POINTS: u128 = 10_000u128;
+
+// ============================================================================
 // Data Structures
 // ============================================================================
 
@@ -234,6 +253,16 @@ impl DAODisputeResolution {
             panic_with_error!(&env, DisputeError::Unauthorized);
         }
 
+        if jurors_per_dispute == 0 || jurors_per_dispute as usize > MAX_JURORS_PER_DISPUTE {
+            panic_with_error!(&env, DisputeError::InvalidStatus);
+        }
+        if evidence_period == 0 || voting_period == 0 {
+            panic_with_error!(&env, DisputeError::InvalidStatus);
+        }
+        if juror_reward_bps > BASIS_POINTS as u32 || slashing_bps > BASIS_POINTS as u32 {
+            panic_with_error!(&env, DisputeError::InvalidStatus);
+        }
+
         let config = DisputeConfig {
             jurors_per_dispute,
             evidence_period,
@@ -291,9 +320,21 @@ impl DAODisputeResolution {
             panic_with_error!(&env, DisputeError::InvalidParties);
         }
 
+        // Malformed-input bounds on payloads
+        if description.len() > MAX_DESCRIPTION_LEN {
+            panic_with_error!(&env, DisputeError::InvalidOutcome);
+        }
+        if evidence_uri.len() > MAX_EVIDENCE_URI_LEN {
+            panic_with_error!(&env, DisputeError::InvalidOutcome);
+        }
+
         let config = Self::get_config(&env);
         let dispute_id = Self::get_next_dispute_id(&env);
         let current_ledger = env.ledger().sequence();
+
+        let evidence_deadline = current_ledger
+            .checked_add(config.evidence_period)
+            .unwrap_or(u32::MAX);
 
         let dispute = Dispute {
             dispute_id,
@@ -309,7 +350,7 @@ impl DAODisputeResolution {
             outcome: None,
             stake_amount,
             filed_ledger: current_ledger,
-            evidence_deadline: current_ledger + config.evidence_period,
+            evidence_deadline,
             voting_deadline: 0, // Set after evidence period
             votes_cast: 0,
         };
@@ -371,12 +412,19 @@ impl DAODisputeResolution {
             panic_with_error!(&env, DisputeError::Unauthorized);
         }
 
+        // Bound evidence URI length (malformed-input guard)
+        if evidence_uri.len() > MAX_EVIDENCE_URI_LEN {
+            panic_with_error!(&env, DisputeError::InvalidOutcome);
+        }
+
         // Update evidence (append to URI or create new reference)
         dispute.evidence_uri = evidence_uri;
-        
+
         // If both parties have submitted, close evidence period
         dispute.status = DisputeStatus::EvidenceSubmitted;
-        dispute.voting_deadline = current_ledger + config.voting_period;
+        dispute.voting_deadline = current_ledger
+            .checked_add(config.voting_period)
+            .unwrap_or(u32::MAX);
 
         env.storage()
             .instance()
@@ -419,7 +467,11 @@ impl DAODisputeResolution {
         let config = Self::get_config(&env);
         let mut dispute = Self::get_dispute_or_panic(&env, dispute_id);
 
-        if jurors.len() as u32 != config.jurors_per_dispute {
+        let juror_count = jurors.len();
+        if juror_count == 0
+            || juror_count as u32 != config.jurors_per_dispute
+            || juror_count > MAX_JURORS_PER_DISPUTE
+        {
             panic_with_error!(&env, DisputeError::InvalidStatus);
         }
 
@@ -508,13 +560,20 @@ impl DAODisputeResolution {
             .instance()
             .set(&DisputeKey::JurorVote(dispute_id, juror.clone()), &outcome);
 
-        // Update dispute vote tallies
+        // Update dispute vote tallies (checked to avoid overflow)
         match outcome {
-            DisputeOutcome::PlaintiffWins => dispute.votes_for += 1,
-            DisputeOutcome::DefendantWins => dispute.votes_against += 1,
-            _ => dispute.votes_abstain += 1,
+            DisputeOutcome::PlaintiffWins => {
+                dispute.votes_for = dispute.votes_for.checked_add(1).unwrap_or(u32::MAX);
+            }
+            DisputeOutcome::DefendantWins => {
+                dispute.votes_against =
+                    dispute.votes_against.checked_add(1).unwrap_or(u32::MAX);
+            }
+            _ => {
+                dispute.votes_abstain = dispute.votes_abstain.checked_add(1).unwrap_or(u32::MAX);
+            }
         }
-        dispute.votes_cast += 1;
+        dispute.votes_cast = dispute.votes_cast.checked_add(1).unwrap_or(u32::MAX);
 
         env.storage()
             .instance()
@@ -576,17 +635,23 @@ impl DAODisputeResolution {
 
         let mut slashed_amount: u128 = 0;
 
-        // Apply slashing if defendant loses
+        // Apply slashing if defendant loses (overflow-safe arithmetic)
         if outcome == DisputeOutcome::PlaintiffWins {
-            slashed_amount = (dispute.stake_amount * config.slashing_bps as u128) / 10_000u128;
+            // slashed = (stake_amount * slashing_bps) / BASIS_POINTS, with overflow guard
+            slashed_amount = dispute
+                .stake_amount
+                .checked_mul(config.slashing_bps as u128)
+                .and_then(|p| p.checked_div(BASIS_POINTS))
+                .unwrap_or(u128::MAX);
             let current_total = env
                 .storage()
                 .instance()
                 .get::<_, u128>(&DisputeKey::TotalSlashed(dispute.defendant.clone()))
                 .unwrap_or(0);
+            let new_total = current_total.checked_add(slashed_amount).unwrap_or(u128::MAX);
             env.storage()
                 .instance()
-                .set(&DisputeKey::TotalSlashed(dispute.defendant.clone()), &(current_total + slashed_amount));
+                .set(&DisputeKey::TotalSlashed(dispute.defendant.clone()), &new_total);
         }
 
         // Distribute rewards to majority-voting jurors
@@ -736,9 +801,8 @@ impl DAODisputeResolution {
             .get::<_, u32>(&DisputeKey::DisputeCounter)
             .unwrap_or(1);
 
-        env.storage()
-            .instance()
-            .set(&DisputeKey::DisputeCounter, &(current + 1));
+        let next = current.checked_add(1).unwrap_or(u32::MAX);
+        env.storage().instance().set(&DisputeKey::DisputeCounter, &next);
 
         current
     }
@@ -750,9 +814,10 @@ impl DAODisputeResolution {
             .get::<_, u32>(&DisputeKey::AppealCounter)
             .unwrap_or(1);
 
+        let next = current.checked_add(1).unwrap_or(u32::MAX);
         env.storage()
             .instance()
-            .set(&DisputeKey::AppealCounter, &(current + 1));
+            .set(&DisputeKey::AppealCounter, &next);
 
         current
     }

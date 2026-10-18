@@ -875,23 +875,255 @@ impl CrossChainBridge {
 mod tests {
     use super::*;
 
+    fn owner(env: &Env) -> Address {
+        Address::generate(env)
+    }
+
+    fn relay(env: &Env) -> Address {
+        Address::generate(env)
+    }
+
+    fn pubkey_65(env: &Env) -> Bytes {
+        Bytes::from_slice(env, &[0x04u8; 65])
+    }
+
+    fn eth_addr(env: &Env) -> Bytes {
+        // 0x + 40 hex chars = 42 bytes
+        Bytes::from_slice(env, b"0x1234567890123456789012345678901234567890")
+    }
+
+    fn sample_attestation(env: &Env, relay: &Address) -> BalanceAttestation {
+        BalanceAttestation {
+            relay: relay.clone(),
+            user_address: eth_addr(env),
+            token_address: eth_addr(env),
+            token_id: 0,
+            balance: 1_000_000,
+            block_height: 100,
+            timestamp: 1_700_000_000,
+            signature: Bytes::from_slice(env, &[1u8; 65]),
+            accepted: false,
+        }
+    }
+
     #[test]
     fn test_bridge_initialization() {
-        // Tests for bridge setup
+        let env = Env::default();
+        env.mock_all_auths();
+        let o = owner(&env);
+
+        CrossChainBridge::initialize_bridge(
+            env.clone(),
+            o.clone(),
+            2,
+            100,
+            1,
+        );
+
+        let config = CrossChainBridge::get_bridge_config_info(env.clone());
+        assert_eq!(config.signature_threshold, 2);
+        assert_eq!(config.cache_ttl_ledgers, 100);
+        assert_eq!(config.max_block_age, 256);
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidThreshold")]
+    fn test_bridge_initialization_zero_threshold_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let o = owner(&env);
+
+        CrossChainBridge::initialize_bridge(env.clone(), o.clone(), 0, 100, 1);
     }
 
     #[test]
     fn test_relay_registration() {
-        // Tests for relay management
+        let env = Env::default();
+        env.mock_all_auths();
+        let o = owner(&env);
+        let r = relay(&env);
+
+        CrossChainBridge::initialize_bridge(env.clone(), o.clone(), 2, 100, 1);
+        CrossChainBridge::register_relay(env.clone(), r.clone(), pubkey_65(&env));
+
+        let stored: Option<BridgeRelay> = env
+            .storage()
+            .instance()
+            .get(&BridgeKey::BridgeRelay(r.clone()));
+        assert!(stored.is_some());
+        assert!(stored.unwrap().active);
+        assert_eq!(stored.unwrap().reputation, 100);
     }
 
     #[test]
-    fn test_attestation_submission() {
-        // Tests for attestation acceptance and signature verification
+    #[should_panic(expected = "InvalidSignatureFormat")]
+    fn test_relay_registration_bad_pubkey_len_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let o = owner(&env);
+        let r = relay(&env);
+
+        CrossChainBridge::initialize_bridge(env.clone(), o.clone(), 2, 100, 1);
+        CrossChainBridge::register_relay(env.clone(), r.clone(), Bytes::from_slice(&env, &[1u8; 33]));
     }
 
     #[test]
-    fn test_balance_verification_cache() {
-        // Tests for cache management and expiry
+    #[should_panic(expected = "RelayAlreadyExists")]
+    fn test_relay_registration_duplicate_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let o = owner(&env);
+        let r = relay(&env);
+
+        CrossChainBridge::initialize_bridge(env.clone(), o.clone(), 2, 100, 1);
+        CrossChainBridge::register_relay(env.clone(), r.clone(), pubkey_65(&env));
+        CrossChainBridge::register_relay(env.clone(), r.clone(), pubkey_65(&env));
+    }
+
+    #[test]
+    fn test_attestation_submission_and_acceptance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let o = owner(&env);
+        let r = relay(&env);
+
+        CrossChainBridge::initialize_bridge(env.clone(), o.clone(), 2, 100, 1);
+        CrossChainBridge::register_relay(env.clone(), r.clone(), pubkey_65(&env));
+
+        let att = sample_attestation(&env, &r);
+        CrossChainBridge::submit_attestation(env.clone(), att.clone());
+
+        let key = BridgeKey::PendingAttestation(
+            r.clone(),
+            att.user_address.clone(),
+            att.token_address.clone(),
+        );
+        let stored: Option<BalanceAttestation> = env.storage().instance().get(&key);
+        assert!(stored.is_some());
+
+        CrossChainBridge::accept_attestation(
+            env.clone(),
+            r.clone(),
+            att.user_address,
+            att.token_address,
+            att.token_id,
+        );
+
+        let cache_key = BridgeKey::VerificationCache(
+            att.user_address,
+            att.token_address,
+            att.token_id,
+        );
+        let record: Option<BridgeVerificationRecord> =
+            env.storage().instance().get(&cache_key);
+        assert!(record.is_some());
+        assert_eq!(record.unwrap().balance, att.balance);
+    }
+
+    #[test]
+    #[should_panic(expected = "AttestationTooOld")]
+    fn test_attestation_too_old_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let o = owner(&env);
+        let r = relay(&env);
+
+        CrossChainBridge::initialize_bridge(env.clone(), o.clone(), 2, 100, 1);
+        CrossChainBridge::register_relay(env.clone(), r.clone(), pubkey_65(&env));
+
+        let mut att = sample_attestation(&env, &r);
+        // Set block_height so block_height + max_block_age overflows u64
+        att.block_height = u64::MAX;
+        CrossChainBridge::submit_attestation(env.clone(), att);
+    }
+
+    #[test]
+    fn test_balance_verification_cache_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let o = owner(&env);
+        let r = relay(&env);
+
+        CrossChainBridge::initialize_bridge(env.clone(), o.clone(), 1, 1, 1);
+        CrossChainBridge::register_relay(env.clone(), r.clone(), pubkey_65(&env));
+
+        let att = sample_attestation(&env, &r);
+        CrossChainBridge::submit_attestation(env.clone(), att.clone());
+        CrossChainBridge::accept_attestation(
+            env.clone(),
+            r.clone(),
+            att.user_address,
+            att.token_address,
+            att.token_id,
+        );
+
+        // Fresh cache returns balance
+        let bal = CrossChainBridge::get_verified_balance(
+            env.clone(),
+            att.user_address,
+            att.token_address,
+            att.token_id,
+        );
+        assert_eq!(bal, att.balance);
+    }
+
+    #[test]
+    fn test_update_bridge_config() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let o = owner(&env);
+
+        CrossChainBridge::initialize_bridge(env.clone(), o.clone(), 2, 100, 1);
+        CrossChainBridge::update_bridge_config(env.clone(), 5, 200);
+
+        let config = CrossChainBridge::get_bridge_config_info(env.clone());
+        assert_eq!(config.signature_threshold, 5);
+        assert_eq!(config.cache_ttl_ledgers, 200);
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidThreshold")]
+    fn test_update_bridge_config_zero_threshold_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let o = owner(&env);
+
+        CrossChainBridge::initialize_bridge(env.clone(), o.clone(), 2, 100, 1);
+        CrossChainBridge::update_bridge_config(env.clone(), 0, 100);
+    }
+
+    #[test]
+    fn test_get_verified_balance_missing_returns_zero() {
+        let env = Env::default();
+        let bal = CrossChainBridge::get_verified_balance(
+            env.clone(),
+            eth_addr(&env),
+            eth_addr(&env),
+            0,
+        );
+        assert_eq!(bal, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidEthAddress")]
+    fn test_validate_eth_address_wrong_len() {
+        let env = Env::default();
+        validate_eth_address(&Bytes::from_slice(&env, b"0xshort"));
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidSignatureFormat")]
+    fn test_verify_signature_bad_len() {
+        let env = Env::default();
+        let r = relay(&env);
+        let relay_rec = BridgeRelay {
+            relay_address: r.clone(),
+            pubkey: pubkey_65(&env),
+            active: true,
+            reputation: 100,
+        };
+        let mut att = sample_attestation(&env, &r);
+        att.signature = Bytes::from_slice(&env, &[1u8; 33]);
+        assert!(!verify_signature(&env, &relay_rec, &att));
     }
 }

@@ -25,12 +25,35 @@
 //! Retry delay respects `retry_delay_seconds` and optionally doubles it on each
 //! attempt when `exponential_backoff` is `true`.
 
-use soroban_sdk::{Bytes, BytesN, Env, Vec, Address, contracttype, panic_with_error};
+use soroban_sdk::{contracttype, panic_with_error, Address, Bytes, BytesN, Env, Symbol, Vec};
 
+use crate::rbac::require_active_submitter;
 use crate::regulatory_reporting::{
     AuthorityConfig, RegulatoryAuthority, RegulatoryReport, RegulatorySubmission,
     ReportAction, ReportStatus, ReportingError, SubmissionAcknowledgment,
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Deterministic bounds and overflow-safety limits
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Maximum number of automatic retry attempts permitted (u32 domain guard).
+pub const MAX_RETRY_ATTEMPTS: u32 = 1_000;
+
+/// Maximum acknowledgment payload length in bytes (malformed-input guard).
+pub const MAX_ACK_PAYLOAD_LEN: usize = 64 * 1024; // 64 KiB
+
+/// Maximum number of machine-readable error codes per acknowledgment.
+pub const MAX_ERROR_CODES: usize = 64;
+
+/// Maximum rejection-reason length in bytes.
+pub const MAX_REJECTION_REASON_LEN: usize = 4 * 1024; // 4 KiB
+
+/// Maximum source event IDs tracked on a single report.
+pub const MAX_SOURCE_EVENT_IDS: usize = 1_024;
+
+/// Cap on exponential back-off factor to prevent u64 overflow in retry_after.
+pub const MAX_BACKOFF_FACTOR: u64 = 1u64 << 30; // ~34 years of seconds at base=1
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Transition guard
@@ -74,11 +97,15 @@ pub fn compute_submission_id(env: &Env, report_id: &BytesN<32>, attempt: u32) ->
 /// Build a new `RegulatorySubmission` for the given report and attempt number.
 pub fn create_submission(
     env: &Env,
+    caller: &Address,
     report: &RegulatoryReport,
     attempt: u32,
     config: &AuthorityConfig,
     now: u64,
 ) -> Result<RegulatorySubmission, ReportingError> {
+    // RBAC: only an authenticated, non-suspended submitter (or higher) may create submissions.
+    require_active_submitter(env, caller)?;
+
     // Validate state
     if report.status == ReportStatus::Draft {
         return Err(ReportingError::InvalidStatusTransition);
@@ -89,19 +116,29 @@ pub fn create_submission(
     if now > report.deadline {
         return Err(ReportingError::DeadlineExceeded);
     }
+    // Deterministic upper bound on attempts to keep the attempt domain bounded.
+    if attempt > MAX_RETRY_ATTEMPTS {
+        return Err(ReportingError::MaxRetriesExceeded);
+    }
     if attempt > config.max_retries {
         return Err(ReportingError::MaxRetriesExceeded);
     }
 
-    // Compute retry-after for back-off
+    // Compute retry-after for back-off using saturating/checked arithmetic only.
     let retry_after = if attempt > 1 {
         let base = config.retry_delay_seconds as u64;
         if config.exponential_backoff {
-            // 2^(attempt-1) * base, capped at 24 h
-            let factor: u64 = 1u64.checked_shl((attempt - 1) as u32).unwrap_or(0);
-            now + (base.saturating_mul(factor)).min(86_400)
+            // 2^(attempt-1) * base, capped to avoid u64 overflow.
+            let shift = (attempt - 1) as u32;
+            let factor: u64 = if shift >= 63 {
+                MAX_BACKOFF_FACTOR
+            } else {
+                1u64.checked_shl(shift).unwrap_or(MAX_BACKOFF_FACTOR)
+            };
+            let delayed = base.saturating_mul(factor).min(MAX_BACKOFF_FACTOR as u64);
+            now.saturating_add(delayed.min(86_400))
         } else {
-            now + base
+            now.saturating_add(base as u64)
         }
     } else {
         0 // submit immediately on first attempt
@@ -109,7 +146,7 @@ pub fn create_submission(
 
     let id = compute_submission_id(env, &report.id, attempt);
 
-    Ok(RegulatorySubmission {
+    let submission = RegulatorySubmission {
         id,
         report_id: report.id.clone(),
         attempt,
@@ -121,7 +158,35 @@ pub fn create_submission(
         status: ReportStatus::Submitted,
         retry_eligible: attempt < config.max_retries,
         retry_after,
-    })
+    };
+
+    // Audit trail event: submission dispatched (tamper-evident, persisted off-chain).
+    emit_audit_event(
+        env,
+        caller,
+        "submission_created",
+        &submission.id,
+        &Bytes::from_slice(env, b"ok"),
+        now,
+    );
+
+    Ok(submission)
+}
+
+/// Emit a tamper-evident audit event for a state-mutating submission-tracker action.
+fn emit_audit_event(
+    env: &Env,
+    actor: &Address,
+    operation: &str,
+    target_id: &BytesN<32>,
+    outcome: &Bytes,
+    timestamp: u64,
+) {
+    let topic = (Symbol::new(env, "submission_tracker"), Symbol::new(env, operation));
+    env.events().publish(
+        topic,
+        (actor.clone(), env.ledger().timestamp(), target_id.clone(), outcome.clone()),
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -150,6 +215,7 @@ pub fn compute_ack_hash(env: &Env, payload: &Bytes) -> BytesN<32> {
 /// `error_codes`      — machine-readable error codes (empty on accept)
 pub fn ingest_acknowledgment(
     env: &Env,
+    caller: &Address,
     submission: &RegulatorySubmission,
     payload: Bytes,
     reference_number: Bytes,
@@ -158,6 +224,9 @@ pub fn ingest_acknowledgment(
     error_codes: Vec<Bytes>,
     received_at: u64,
 ) -> Result<SubmissionAcknowledgment, ReportingError> {
+    // RBAC: only an authenticated, non-suspended submitter (or higher) may ingest acknowledgments.
+    require_active_submitter(env, caller)?;
+
     // The submission must be in Submitted state to receive an ack
     if submission.status != ReportStatus::Submitted
         && submission.status != ReportStatus::Acknowledged
@@ -168,10 +237,21 @@ pub fn ingest_acknowledgment(
         return Err(ReportingError::AcknowledgmentOrphan);
     }
 
+    // Malformed-input bounds: reject oversized payloads and error-code lists.
+    if payload.len() > MAX_ACK_PAYLOAD_LEN {
+        return Err(ReportingError::InvalidFieldValue);
+    }
+    if rejection_reason.len() > MAX_REJECTION_REASON_LEN {
+        return Err(ReportingError::InvalidFieldValue);
+    }
+    if error_codes.len() > MAX_ERROR_CODES {
+        return Err(ReportingError::InvalidFieldValue);
+    }
+
     let ack_hash = compute_ack_hash(env, &payload);
     let id = compute_ack_id(env, &submission.id, received_at);
 
-    Ok(SubmissionAcknowledgment {
+    let ack = SubmissionAcknowledgment {
         id,
         submission_id: submission.id.clone(),
         report_id: submission.report_id.clone(),
@@ -181,7 +261,21 @@ pub fn ingest_acknowledgment(
         error_codes,
         received_at,
         ack_hash,
-    })
+    };
+
+    // Audit trail event: acknowledgment received.
+    let mut ctx = Bytes::new(env);
+    ctx.extend_from_slice(if accepted { b"accepted=1" } else { b"accepted=0" });
+    emit_audit_event(
+        env,
+        caller,
+        "acknowledgment_ingested",
+        &submission.id,
+        &ctx,
+        received_at,
+    );
+
+    Ok(ack)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -193,10 +287,14 @@ pub fn ingest_acknowledgment(
 /// Returns the `ReportAction` that was performed so callers can record
 /// it in the audit trail.
 pub fn apply_acknowledgment(
+    env: &Env,
+    caller: &Address,
     report: &mut RegulatoryReport,
     ack: &SubmissionAcknowledgment,
     now: u64,
 ) -> Result<ReportAction, ReportingError> {
+    require_active_submitter(env, caller)?;
+
     // First, transition to Acknowledged
     check_transition(report.status, ReportStatus::Acknowledged)?;
     report.status = ReportStatus::Acknowledged;
@@ -213,38 +311,106 @@ pub fn apply_acknowledgment(
     report.status = next_status;
     report.updated_at = now;
 
+    // Audit trail event: final resolution.
+    let outcome = if ack.accepted {
+        Bytes::from_slice(env, b"accepted=1")
+    } else {
+        Bytes::from_slice(env, b"accepted=0")
+    };
+    emit_audit_event(env, caller, "acknowledgment_applied", &report.id, &outcome, now);
+
     Ok(action)
 }
 
 /// Mark a report as overdue (deadline has passed without acceptance).
-pub fn mark_overdue(report: &mut RegulatoryReport, now: u64) -> Result<(), ReportingError> {
+pub fn mark_overdue(
+    env: &Env,
+    caller: &Address,
+    report: &mut RegulatoryReport,
+    now: u64,
+) -> Result<(), ReportingError> {
+    require_active_submitter(env, caller)?;
     check_transition(report.status, ReportStatus::Overdue)?;
     report.status = ReportStatus::Overdue;
     report.updated_at = now;
+
+    emit_audit_event(
+        env,
+        caller,
+        "report_marked_overdue",
+        &report.id,
+        &Bytes::from_slice(env, b"overdue=1"),
+        now,
+    );
     Ok(())
 }
 
 /// Cancel a report manually.
-pub fn cancel_report(report: &mut RegulatoryReport, now: u64) -> Result<(), ReportingError> {
+pub fn cancel_report(
+    env: &Env,
+    caller: &Address,
+    report: &mut RegulatoryReport,
+    now: u64,
+) -> Result<(), ReportingError> {
+    require_active_submitter(env, caller)?;
     check_transition(report.status, ReportStatus::Cancelled)?;
     report.status = ReportStatus::Cancelled;
     report.updated_at = now;
+
+    emit_audit_event(
+        env,
+        caller,
+        "report_cancelled",
+        &report.id,
+        &Bytes::from_slice(env, b"cancelled=1"),
+        now,
+    );
     Ok(())
 }
 
 /// Transition a validated report to Submitted status.
-pub fn mark_submitted(report: &mut RegulatoryReport, now: u64) -> Result<(), ReportingError> {
+pub fn mark_submitted(
+    env: &Env,
+    caller: &Address,
+    report: &mut RegulatoryReport,
+    now: u64,
+) -> Result<(), ReportingError> {
+    require_active_submitter(env, caller)?;
     check_transition(report.status, ReportStatus::Submitted)?;
     report.status = ReportStatus::Submitted;
     report.updated_at = now;
+
+    emit_audit_event(
+        env,
+        caller,
+        "report_marked_submitted",
+        &report.id,
+        &Bytes::from_slice(env, b"submitted=1"),
+        now,
+    );
     Ok(())
 }
 
 /// Transition a draft report to Validated status.
-pub fn mark_validated(report: &mut RegulatoryReport, now: u64) -> Result<(), ReportingError> {
+pub fn mark_validated(
+    env: &Env,
+    caller: &Address,
+    report: &mut RegulatoryReport,
+    now: u64,
+) -> Result<(), ReportingError> {
+    require_active_submitter(env, caller)?;
     check_transition(report.status, ReportStatus::Validated)?;
     report.status = ReportStatus::Validated;
     report.updated_at = now;
+
+    emit_audit_event(
+        env,
+        caller,
+        "report_marked_validated",
+        &report.id,
+        &Bytes::from_slice(env, b"validated=1"),
+        now,
+    );
     Ok(())
 }
 
@@ -270,8 +436,8 @@ pub fn next_attempt(
     current_attempt: u32,
     config: &AuthorityConfig,
 ) -> Result<u32, ReportingError> {
-    let next = current_attempt + 1;
-    if next > config.max_retries {
+    let next = current_attempt.checked_add(1).ok_or(ReportingError::MaxRetriesExceeded)?;
+    if next > MAX_RETRY_ATTEMPTS || next > config.max_retries {
         Err(ReportingError::MaxRetriesExceeded)
     } else {
         Ok(next)
@@ -604,9 +770,11 @@ mod tests {
     #[test]
     fn test_create_first_submission_ok() {
         let env = Env::default();
+        env.mock_all_auths();
+        let caller = Address::generate(&env);
         let report = validated_report(&env);
         let config = dummy_config(&env);
-        let sub = create_submission(&env, &report, 1, &config, 1_700_000_100).unwrap();
+        let sub = create_submission(&env, &caller, &report, 1, &config, 1_700_000_100).unwrap();
         assert_eq!(sub.attempt, 1);
         assert_eq!(sub.status, ReportStatus::Submitted);
         assert_eq!(sub.retry_after, 0); // first attempt has no delay
@@ -615,38 +783,46 @@ mod tests {
     #[test]
     fn test_create_submission_after_deadline_fails() {
         let env = Env::default();
+        env.mock_all_auths();
+        let caller = Address::generate(&env);
         let report = validated_report(&env);
         let config = dummy_config(&env);
-        let result = create_submission(&env, &report, 1, &config, 2_000_000_000); // past deadline
+        let result = create_submission(&env, &caller, &report, 1, &config, 2_000_000_000); // past deadline
         assert!(matches!(result, Err(ReportingError::DeadlineExceeded)));
     }
 
     #[test]
     fn test_create_submission_max_retries_exceeded_fails() {
         let env = Env::default();
+        env.mock_all_auths();
+        let caller = Address::generate(&env);
         let report = validated_report(&env);
         let config = dummy_config(&env);
-        let result = create_submission(&env, &report, 4, &config, 1_700_000_100); // attempt 4 > max 3
+        let result = create_submission(&env, &caller, &report, 4, &config, 1_700_000_100); // attempt 4 > max 3
         assert!(matches!(result, Err(ReportingError::MaxRetriesExceeded)));
     }
 
     #[test]
     fn test_create_submission_disabled_authority_fails() {
         let env = Env::default();
+        env.mock_all_auths();
+        let caller = Address::generate(&env);
         let report = validated_report(&env);
         let mut config = dummy_config(&env);
         config.enabled = false;
-        let result = create_submission(&env, &report, 1, &config, 1_700_000_100);
+        let result = create_submission(&env, &caller, &report, 1, &config, 1_700_000_100);
         assert!(matches!(result, Err(ReportingError::AuthorityDisabled)));
     }
 
     #[test]
     fn test_exponential_backoff_second_attempt() {
         let env = Env::default();
+        env.mock_all_auths();
+        let caller = Address::generate(&env);
         let report = validated_report(&env);
         let config = dummy_config(&env); // backoff=true, delay=60s
         let now = 1_700_000_100u64;
-        let sub = create_submission(&env, &report, 2, &config, now).unwrap();
+        let sub = create_submission(&env, &caller, &report, 2, &config, now).unwrap();
         // 2^(2-1) * 60 = 120 seconds
         assert_eq!(sub.retry_after, now + 120);
     }
@@ -672,9 +848,12 @@ mod tests {
     #[test]
     fn test_ingest_acceptance_ok() {
         let env = Env::default();
+        env.mock_all_auths();
+        let caller = Address::generate(&env);
         let sub = dummy_submission(&env);
         let ack = ingest_acknowledgment(
             &env,
+            &caller,
             &sub,
             Bytes::from_slice(&env, b"{}"),
             Bytes::from_slice(&env, b"REF-001"),
@@ -691,11 +870,14 @@ mod tests {
     #[test]
     fn test_ingest_rejection_ok() {
         let env = Env::default();
+        env.mock_all_auths();
+        let caller = Address::generate(&env);
         let sub = dummy_submission(&env);
         let mut error_codes = Vec::new(&env);
         error_codes.push_back(Bytes::from_slice(&env, b"ERR001"));
         let ack = ingest_acknowledgment(
             &env,
+            &caller,
             &sub,
             Bytes::from_slice(&env, b"{\"status\":\"rejected\"}"),
             Bytes::from_slice(&env, b"REF-002"),
@@ -712,9 +894,12 @@ mod tests {
     #[test]
     fn test_ingest_missing_reference_fails() {
         let env = Env::default();
+        env.mock_all_auths();
+        let caller = Address::generate(&env);
         let sub = dummy_submission(&env);
         let result = ingest_acknowledgment(
             &env,
+            &caller,
             &sub,
             Bytes::from_slice(&env, b"{}"),
             Bytes::new(&env), // empty reference
@@ -731,6 +916,8 @@ mod tests {
     #[test]
     fn test_apply_acceptance_sets_accepted() {
         let env = Env::default();
+        env.mock_all_auths();
+        let caller = Address::generate(&env);
         let mut report = validated_report(&env);
         report.status = ReportStatus::Submitted;
 
@@ -746,7 +933,7 @@ mod tests {
             ack_hash: BytesN::from_array(&env, &[3u8; 32]),
         };
 
-        let action = apply_acknowledgment(&mut report, &ack, 1_700_001_000).unwrap();
+        let action = apply_acknowledgment(&env, &caller, &mut report, &ack, 1_700_001_000).unwrap();
         assert_eq!(report.status, ReportStatus::Accepted);
         assert_eq!(action, ReportAction::Accepted);
     }
@@ -754,6 +941,8 @@ mod tests {
     #[test]
     fn test_apply_rejection_sets_rejected() {
         let env = Env::default();
+        env.mock_all_auths();
+        let caller = Address::generate(&env);
         let mut report = validated_report(&env);
         report.status = ReportStatus::Submitted;
 
@@ -769,7 +958,7 @@ mod tests {
             ack_hash: BytesN::from_array(&env, &[3u8; 32]),
         };
 
-        let action = apply_acknowledgment(&mut report, &ack, 1_700_001_000).unwrap();
+        let action = apply_acknowledgment(&env, &caller, &mut report, &ack, 1_700_001_000).unwrap();
         assert_eq!(report.status, ReportStatus::Rejected);
         assert_eq!(action, ReportAction::Rejected);
     }
@@ -801,17 +990,21 @@ mod tests {
     #[test]
     fn test_mark_overdue_transitions() {
         let env = Env::default();
+        env.mock_all_auths();
+        let caller = Address::generate(&env);
         let mut report = validated_report(&env);
         report.status = ReportStatus::Submitted;
-        mark_overdue(&mut report, 1_700_200_000).unwrap();
+        mark_overdue(&env, &caller, &mut report, 1_700_200_000).unwrap();
         assert_eq!(report.status, ReportStatus::Overdue);
     }
 
     #[test]
     fn test_cancel_from_validated() {
         let env = Env::default();
+        env.mock_all_auths();
+        let caller = Address::generate(&env);
         let mut report = validated_report(&env);
-        cancel_report(&mut report, 1_700_000_200).unwrap();
+        cancel_report(&env, &caller, &mut report, 1_700_000_200).unwrap();
         assert_eq!(report.status, ReportStatus::Cancelled);
     }
 
