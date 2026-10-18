@@ -19,6 +19,8 @@ pub mod tamper_evidence;
 pub mod compliance_validators;
 pub mod tax;
 pub mod vat_engine;
+pub mod rwa_custody;
+pub mod rwa_oracle;
 pub mod tax_engines;
 pub mod tax_audit_trail;
 #[cfg(test)]
@@ -46,6 +48,9 @@ use soroban_sdk::{
 };
 
 pub mod supply_chain;
+// Fine-grained RBAC role gating shared by mutating modules (supply chain,
+// cross-contract router) and susbmitter suspension controls (issue #865).
+pub mod rbac;
 pub mod digital_passport;
 pub mod carbon_credits;
 pub mod esg_reporting;
@@ -58,6 +63,12 @@ pub mod multi_region;
 
 // Predictive capacity planning, ML forecasting, and auto-scaling.
 pub mod capacity_planning;
+
+#[cfg(test)]
+mod digital_passport_invariant_tests;
+
+#[cfg(test)]
+mod capacity_planning_tests;
 
 // Operational runbook automation, validation, and execution auditing.
 pub mod runbook_automation;
@@ -600,6 +611,18 @@ pub enum DataKey {
     DisputeCount,
     /// Individual dispute record.
     DisputeData(u32),
+
+    // Cross-contract automated TTL & rent optimization (issue #866)
+
+    /// Automated TTL bump policy for cross-contract state keys
+    /// (instance tier: tiny config blob, read on every interaction).
+    XctTtlPolicy,
+    /// Monotonic count + ledger of the last automated TTL bump performed on
+    /// cross-contract keys (instance tier).
+    XctBumpStats,
+    /// Tamper-evident SHA-256 digest for each cross-contract composition.
+    /// Persistent tier so integrity evidence outlives the hot path.
+    XctCompositionHash(u32),
 }
 
 #[contracterror]
@@ -953,6 +976,17 @@ pub enum ContractError {
 
     /// **Code 84**: The dispute does not exist.
     DisputeNotFound = 84,
+
+    /// **Code 85**: Workflow step index exceeds the definition's step count.
+    /// **Common cause**: `record_workflow_step` called with an out-of-range index.
+    /// **Resolution**: Use a `step_index` in `0..wf.steps.len()`.
+    WorkflowStepOutOfRange = 85,
+
+    /// **Code 86**: The cross-contract TTL policy parameters are invalid.
+    /// **Common cause**: `set_xct_ttl_policy` with a zero bump threshold or a
+    /// bump target smaller than the threshold.
+    /// **Resolution**: `bump_target >= bump_threshold > 0`.
+    InvalidTtlPolicy = 86,
 }
 
 #[contracttype]
@@ -7159,11 +7193,21 @@ pub mod cbdc_interop;
 pub mod cbdc_offline;
 pub mod cbdc_privacy;
 
+// Cursor-based pagination & filtered batch queries for the CBDC privacy guard
+// (issue #852). Re-exported so SDK bindings and tests can reach the pagination
+// types and query entrypoints without a fully-qualified module path.
+pub use cbdc_privacy::{
+    PageCursor, PageLimit, QueryFilter, PaginatedQueryResult, CbdcPrivacyQuery, CbdcPrivacyQueryClient,
+};
+
 // Governance dashboard types & audit trail (issue #365 governance UI).
 pub mod governance_dashboard;
 
 #[cfg(test)]
 mod cbdc_tests;
+
+#[cfg(test)]
+mod cbdc_privacy_pagination_tests;
 
 
 // SupTech Integration Modules
@@ -7186,6 +7230,9 @@ pub mod sandbox_supervision;
 pub mod sandbox_innovation;
 pub mod sandbox_graduation;
 
+// On-chain ML feature vector lineage and hash anchoring (issue #856, #858).
+pub mod ml_feature_store;
+
 // FinOps Module
 pub mod finops;
 
@@ -7197,6 +7244,9 @@ pub mod storage_layout;
 
 #[cfg(test)]
 mod finops_tests;
+
+#[cfg(test)]
+mod finops_invariant_tests;
 
 #[cfg(test)]
 mod supply_chain_tests;
@@ -7216,6 +7266,18 @@ mod issue365_368_tests;
 #[cfg(test)]
 mod rbac_regression_coverage_tests;
 
+// RBAC gating integration tests for state-mutating entrypoints (issue #875).
+#[cfg(test)]
+mod rbac_gating_tests;
+
+// Property-based invariant tests for the ML feature store (issue #858).
+#[cfg(test)]
+mod proptest;
+
+// Multi-actor concurrency and fault-injection tests for the ML feature store (issue #858).
+#[cfg(test)]
+mod concurrent_tests;
+
 pub mod notifications;
 
 #[cfg(test)]
@@ -7225,6 +7287,9 @@ pub mod cross_contract;
 
 #[cfg(test)]
 mod workflow_tests;
+
+#[cfg(test)]
+mod cross_contract_invariant_tests;
 
 pub mod marketplace;
 

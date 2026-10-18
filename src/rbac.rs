@@ -18,6 +18,8 @@ pub enum RbacError {
     SubmitterSuspended = 423,
     /// The caller DID is not authorized to perform the requested mutation.
     UnauthorizedSubmitter = 424,
+    /// Legacy alias for a suspended DID, surfaced through `check_role`.
+    Suspended = 425,
 }
 
 #[contracttype]
@@ -38,7 +40,7 @@ pub enum Role {
 pub enum RbacStorageKey {
     Role(Address),
     AdminCount,
-    /// Marks a submitter DID as suspended, blocking all state mutations.
+    /// Marks a submitter DID as suspended, blocking further mutations.
     Suspended(Address),
 }
 
@@ -135,8 +137,15 @@ impl RbacManager {
             .set(&RbacStorageKey::AdminCount, &1u32);
     }
 
-    /// Marks a submitter DID as suspended. Caller must have Admin role.
+    /// Alias for initialize_admin
+    pub fn init_admin(env: &Env, admin: &Address) {
+        Self::initialize_admin(env, admin);
+    }
+
+    /// Marks a submitter DID as suspended, revoking its ability to mutate state.
     ///
+    /// Caller must have Admin role. Suspension is persistent and takes
+    /// precedence over any previously assigned role.
     /// Suspended submitters are rejected by [`Self::require_active_submitter`]
     /// with the stable [`RbacError::SubmitterSuspended`] code.
     pub fn suspend_submitter(
@@ -154,6 +163,15 @@ impl RbacManager {
         env.storage().persistent().set(&key, &true);
 
         Ok(())
+    }
+
+    /// Alias for suspend_submitter
+    pub fn suspend(
+        env: &Env,
+        caller: &Address,
+        target: &Address,
+    ) -> Result<(), RbacError> {
+        Self::suspend_submitter(env, caller, target)
     }
 
     /// Clears the suspension flag for a submitter DID. Caller must have Admin role.
@@ -174,10 +192,65 @@ impl RbacManager {
         Ok(())
     }
 
+    /// Alias for reinstate_submitter
+    pub fn unsuspend(
+        env: &Env,
+        caller: &Address,
+        target: &Address,
+    ) -> Result<(), RbacError> {
+        Self::reinstate_submitter(env, caller, target)
+    }
+
     /// Returns `true` if the given submitter DID is currently suspended.
     pub fn is_suspended(env: &Env, address: &Address) -> bool {
         let key = RbacStorageKey::Suspended(address.clone());
         env.storage().persistent().get(&key).unwrap_or(false)
+    }
+
+    /// Enforces role hierarchy precedence and revocation for a caller.
+    ///
+    /// This is the canonical gate used by state-mutating entrypoints. It
+    /// validates the caller's authentication, rejects suspended addresses,
+    /// and verifies the caller holds at least `min_role` in the hierarchy
+    /// (`Viewer < Submitter < Auditor < Admin`). Revoked roles (no stored
+    /// role) fail with [`RbacError::InsufficientRole`], while suspended
+    /// submitters fail with [`RbacError::SubmitterSuspended`].
+    pub fn require_role_precedence(
+        env: &Env,
+        caller: &Address,
+        min_role: Role,
+    ) -> Result<(), RbacError> {
+        caller.require_auth();
+
+        if Self::is_suspended(env, caller) {
+            return Err(RbacError::SubmitterSuspended);
+        }
+
+        match Self::get_role(env, caller) {
+            Some(role) if role >= min_role => Ok(()),
+            Some(_) => Err(RbacError::InsufficientRole),
+            None => Err(RbacError::InsufficientRole),
+        }
+    }
+
+    /// Builds a deterministic state-diff digest for audit event emission.
+    ///
+    /// The digest binds the caller, the operation label, and the pre/post
+    /// state values into a single 32-byte value so that audit events are
+    /// tamper-evident and reproducible off-chain.
+    pub fn state_diff_digest(
+        env: &Env,
+        caller: &Address,
+        operation: &soroban_sdk::Symbol,
+        previous: i128,
+        current: i128,
+    ) -> soroban_sdk::BytesN<32> {
+        let mut buf = soroban_sdk::Bytes::new(env);
+        buf.append(&caller.clone().to_string().into_bytes());
+        buf.append(&operation.clone().to_string().into_bytes());
+        buf.extend_from_array(&previous.to_be_bytes());
+        buf.extend_from_array(&current.to_be_bytes());
+        env.crypto().sha256(&buf).into()
     }
 
     /// Enforces that the caller is authenticated, holds at least `min_role`,
@@ -215,5 +288,46 @@ impl RbacManager {
         }
 
         Self::require_role_min(env, address, Role::Submitter)
+    }
+}
+
+pub fn check_role(env: &Env, address: &Address, min_role: Role) -> Result<(), RbacError> {
+    RbacManager::require_active_role_min(env, address, min_role)
+}
+
+/// Call-site friendly RBAC shim mirroring the concise API used by integration
+/// test suites: `init_admin`, `get_role`, `set_role`, `has_role_min`,
+/// `suspend` / `reinstate`. Thin delegates over [`RbacManager`].
+pub struct Rbac;
+
+impl Rbac {
+    /// Bootstraps the initial superadmin (`RbacManager::initialize_admin`).
+    pub fn init_admin(env: &Env, admin: &Address) {
+        RbacManager::initialize_admin(env, admin);
+    }
+
+    /// Current role of `address`, if assigned.
+    pub fn get_role(env: &Env, address: &Address) -> Option<Role> {
+        RbacManager::get_role(env, address)
+    }
+
+    /// Assigns/updates `target`'s role; caller must be an Admin.
+    pub fn set_role(env: &Env, caller: &Address, target: &Address, role: Role) -> Result<(), RbacError> {
+        RbacManager::set_role(env, caller, target, role)
+    }
+
+    /// Whether `address` holds at least `min_role`.
+    pub fn has_role_min(env: &Env, address: &Address, min_role: Role) -> bool {
+        RbacManager::has_role_min(env, address, min_role)
+    }
+
+    /// Suspends a submitter DID (Admin required).
+    pub fn suspend(env: &Env, caller: &Address, target: &Address) -> Result<(), RbacError> {
+        RbacManager::suspend_submitter(env, caller, target)
+    }
+
+    /// Clears a suspension flag (Admin required).
+    pub fn reinstate(env: &Env, caller: &Address, target: &Address) -> Result<(), RbacError> {
+        RbacManager::reinstate_submitter(env, caller, target)
     }
 }

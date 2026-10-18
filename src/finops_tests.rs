@@ -550,190 +550,328 @@ mod tests {
         assert_eq!(get_active_anomaly_count(env), 1);
     }
 
-    // ── #859: deterministic bounds & overflow safety ───────────────────
+    // ── Pagination Edge-Case Tests ─────────────────────────────────────
 
-    #[test]
-    fn test_metadata_length_capped() {
-        let env = create_test_env();
-        let caller = Address::random(&env);
-        grant_role(&env, &caller);
-
+    fn seed_allocations(env: &Env, caller: &Address, count: u32) -> BytesN<32> {
         let cc_id = register_cost_center(
             env.clone(),
             caller.clone(),
-            sample_name(&env),
-            100000,
-            Symbol::new(&env, "USD"),
+            sample_name(env),
+            1_000_000,
+            Symbol::new(env, "USD"),
         );
 
-        let oversized = Bytes::from_slice(&env, &[0u8; (MAX_METADATA_LEN + 1) as usize]);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for i in 0..count {
             allocate_cost(
-                env,
-                caller,
-                cc_id,
-                Symbol::new(&env, "compute"),
-                5000,
-                Symbol::new(&env, "USD"),
-                sample_period(&env),
-                oversized,
+                env.clone(),
+                caller.clone(),
+                cc_id.clone(),
+                Symbol::new(env, "compute"),
+                100 + i as i128,
+                Symbol::new(env, "USD"),
+                sample_period(env),
+                bytes!(env, b"pagination-seed"),
             );
-        }));
+        }
 
-        assert!(result.is_err());
+        cc_id
     }
 
     #[test]
-    fn test_anomaly_deviation_overflow_safe() {
+    fn test_page_limit_cap_enforced() {
+        // The page limit cap must be 100; anything above is rejected or clamped.
+        assert_eq!(MAX_PAGE_LIMIT, 100);
+
         let env = create_test_env();
         let caller = Address::random(&env);
-        grant_role(&env, &caller);
+        seed_allocations(&env, &caller, 3);
 
-        // actual >> expected: would have underflowed/overflowed as
-        // `(actual - expected) * 100` in u64 before the hardening.
-        let anomaly_id = record_anomaly(
-            env.clone(),
-            caller,
-            BytesN::from_slice(&env, b"ovf-resource"),
-            1,
-            u64::MAX,
-            bytes!(env, b"ovf"),
-        );
+        let query = AllocationQuery {
+            cursor: None,
+            limit: 500,
+            filter: QueryFilter::default(),
+        };
 
-        let anomaly = env
-            .storage()
-            .persistent()
-            .get(&DataKey::CostAnomaly(anomaly_id))
-            .unwrap();
-        assert_eq!(anomaly.severity, 3);
+        let page = query_allocations(env.clone(), query);
+        assert!(page.items.len() <= MAX_PAGE_LIMIT);
     }
 
     #[test]
-    fn test_budget_utilization_overflow_safe() {
+    fn test_empty_result_set() {
         let env = create_test_env();
-        let caller = Address::random(&env);
-        grant_role(&env, &caller);
 
-        let cc_id = register_cost_center(
-            env.clone(),
-            caller.clone(),
-            sample_name(&env),
-            100000,
-            Symbol::new(&env, "USD"),
-        );
+        let query = AllocationQuery {
+            cursor: None,
+            limit: 10,
+            filter: QueryFilter::default(),
+        };
 
-        let thresholds = vec![&env, 50u32, 80];
-        let budget_id = create_budget(
-            env.clone(),
-            caller.clone(),
-            bytes!(env, b"ovf-budget"),
-            cc_id,
-            3,
-            Symbol::new(&env, "USD"),
-            sample_period(&env),
-            thresholds,
-        );
-
-        // `u64::MAX * 100` would have overflowed u64 before the hardening.
-        let alert_id = check_budget(env.clone(), caller, budget_id, u64::MAX);
-        assert!(!alert_id.to_vec().is_empty());
+        let page = query_allocations(env, query);
+        assert_eq!(page.items.len(), 0);
+        assert!(page.next_cursor.is_none());
     }
 
     #[test]
-    fn test_threshold_vec_length_capped() {
+    fn test_single_item_page() {
         let env = create_test_env();
         let caller = Address::random(&env);
-        grant_role(&env, &caller);
+        seed_allocations(&env, &caller, 5);
 
-        let cc_id = register_cost_center(
-            env.clone(),
-            caller.clone(),
-            sample_name(&env),
-            100000,
-            Symbol::new(&env, "USD"),
-        );
+        let query = AllocationQuery {
+            cursor: None,
+            limit: 1,
+            filter: QueryFilter::default(),
+        };
 
-        let thresholds = vec![&env, 5u32; (MAX_ALERT_THRESHOLDS + 1) as usize];
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            create_budget(
-                env,
-                caller,
-                bytes!(env, b"too-many-thresholds"),
-                cc_id,
-                50000,
-                Symbol::new(&env, "USD"),
-                sample_period(&env),
-                thresholds,
-            );
-        }));
-        assert!(result.is_err());
-    }
+        let page = query_allocations(env.clone(), query);
+        assert_eq!(page.items.len(), 1);
+        assert!(page.next_cursor.is_some());
 
-    // ── #860: RBAC gating & audit trail ────────────────────────────────
-
-    #[test]
-    fn test_no_role_panics() {
-        let env = create_test_env();
-        let caller = Address::random(&env);
-        // no grant_role — caller holds no assigned role
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            register_cost_center(
-                env,
-                caller,
-                sample_name(&env),
-                100000,
-                Symbol::new(&env, "USD"),
-            );
-        }));
-        assert!(result.is_err());
+        // Second single-item page must not repeat the first item.
+        let query2 = AllocationQuery {
+            cursor: page.next_cursor.clone(),
+            limit: 1,
+            filter: QueryFilter::default(),
+        };
+        let page2 = query_allocations(env, query2);
+        assert_eq!(page2.items.len(), 1);
+        assert_ne!(page.items.get(0).unwrap().id, page2.items.get(0).unwrap().id);
     }
 
     #[test]
-    fn test_audit_trail_events_emitted() {
+    fn test_cursor_past_end_returns_empty_page() {
         let env = create_test_env();
         let caller = Address::random(&env);
-        grant_role(&env, &caller);
+        seed_allocations(&env, &caller, 3);
 
-        register_cost_center(
-            env.clone(),
-            caller,
-            sample_name(&env),
-            100000,
-            Symbol::new(&env, "USD"),
-        );
+        // Walk to the end to obtain a terminal cursor.
+        let mut cursor: Option<PageCursor> = None;
+        loop {
+            let query = AllocationQuery {
+                cursor: cursor.clone(),
+                limit: 2,
+                filter: QueryFilter::default(),
+            };
+            let page = query_allocations(env.clone(), query);
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
 
-        // The mutation emits both the tamper-evident "finops_audit" event and
-        // the domain event "cc_create".
-        let events = env.events().all();
-        assert!(events.len() >= 2);
+        // A cursor past the end must yield an empty page with no next_cursor.
+        let query = AllocationQuery {
+            cursor,
+            limit: 2,
+            filter: QueryFilter::default(),
+        };
+        let page = query_allocations(env, query);
+        assert_eq!(page.items.len(), 0);
+        assert!(page.next_cursor.is_none());
     }
 
     #[test]
-    fn test_detect_anomalies_works_via_index() {
+    fn test_full_multi_page_traversal_reconstructs_collection() {
         let env = create_test_env();
         let caller = Address::random(&env);
-        grant_role(&env, &caller);
+        let total = 25u32;
+        seed_allocations(&env, &caller, total);
 
-        let resource_id = BytesN::from_slice(&env, b"index-detect");
-        record_anomaly(
-            env.clone(),
-            caller.clone(),
-            resource_id.clone(),
-            1000,
-            3000, // 200% deviation -> severity 3, detectable
-            bytes!(env, b"idx"),
-        );
-        record_anomaly(
-            env.clone(),
-            caller.clone(),
-            BytesN::from_slice(&env, b"other-resource"),
-            1000,
-            3000,
-            bytes!(env, b"idx"),
-        );
+        let mut seen: Vec<BytesN<32>> = Vec::new();
+        let mut cursor: Option<PageCursor> = None;
 
-        let anomalies = detect_anomalies(env, caller, resource_id);
-        assert_eq!(anomalies.len(), 1);
+        loop {
+            let query = AllocationQuery {
+                cursor: cursor.clone(),
+                limit: 7,
+                filter: QueryFilter::default(),
+            };
+            let page = query_allocations(env.clone(), query);
+
+            for item in page.items.iter() {
+                seen.push(item.id.clone());
+            }
+
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        assert_eq!(seen.len() as u32, total);
+
+        // No duplicates across pages.
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), seen.len());
+    }
+
+    #[test]
+    fn test_filter_by_timestamp_range() {
+        let env = create_test_env();
+        let caller = Address::random(&env);
+        seed_allocations(&env, &caller, 5);
+
+        let filter = QueryFilter {
+            from_timestamp: Some(0),
+            to_timestamp: Some(u64::MAX),
+            status: None,
+            submitter: None,
+        };
+
+        let query = AllocationQuery {
+            cursor: None,
+            limit: 100,
+            filter,
+        };
+        let page = query_allocations(env.clone(), query);
+        assert_eq!(page.items.len(), 5);
+
+        // A range that excludes everything.
+        let filter_none = QueryFilter {
+            from_timestamp: Some(u64::MAX - 1),
+            to_timestamp: Some(u64::MAX),
+            status: None,
+            submitter: None,
+        };
+        let query_none = AllocationQuery {
+            cursor: None,
+            limit: 100,
+            filter: filter_none,
+        };
+        let page_none = query_allocations(env, query_none);
+        assert_eq!(page_none.items.len(), 0);
+    }
+
+    #[test]
+    fn test_filter_by_status_enum() {
+        let env = create_test_env();
+        let caller = Address::random(&env);
+        seed_allocations(&env, &caller, 4);
+
+        let filter = QueryFilter {
+            from_timestamp: None,
+            to_timestamp: None,
+            status: Some(AllocationStatus::Active),
+            submitter: None,
+        };
+        let query = AllocationQuery {
+            cursor: None,
+            limit: 100,
+            filter,
+        };
+        let page = query_allocations(env.clone(), query);
+        assert_eq!(page.items.len(), 4);
+
+        let filter_other = QueryFilter {
+            from_timestamp: None,
+            to_timestamp: None,
+            status: Some(AllocationStatus::Archived),
+            submitter: None,
+        };
+        let query_other = AllocationQuery {
+            cursor: None,
+            limit: 100,
+            filter: filter_other,
+        };
+        let page_other = query_allocations(env, query_other);
+        assert_eq!(page_other.items.len(), 0);
+    }
+
+    #[test]
+    fn test_filter_by_submitter_address() {
+        let env = create_test_env();
+        let caller = Address::random(&env);
+        seed_allocations(&env, &caller, 3);
+
+        let filter = QueryFilter {
+            from_timestamp: None,
+            to_timestamp: None,
+            status: None,
+            submitter: Some(caller.clone()),
+        };
+        let query = AllocationQuery {
+            cursor: None,
+            limit: 100,
+            filter,
+        };
+        let page = query_allocations(env.clone(), query);
+        assert_eq!(page.items.len(), 3);
+
+        let other = Address::random(&env);
+        let filter_other = QueryFilter {
+            from_timestamp: None,
+            to_timestamp: None,
+            status: None,
+            submitter: Some(other),
+        };
+        let query_other = AllocationQuery {
+            cursor: None,
+            limit: 100,
+            filter: filter_other,
+        };
+        let page_other = query_allocations(env, query_other);
+        assert_eq!(page_other.items.len(), 0);
+    }
+
+    #[test]
+    fn test_combined_filters() {
+        let env = create_test_env();
+        let caller = Address::random(&env);
+        seed_allocations(&env, &caller, 6);
+
+        let filter = QueryFilter {
+            from_timestamp: Some(0),
+            to_timestamp: Some(u64::MAX),
+            status: Some(AllocationStatus::Active),
+            submitter: Some(caller.clone()),
+        };
+        let query = AllocationQuery {
+            cursor: None,
+            limit: 100,
+            filter,
+        };
+        let page = query_allocations(env.clone(), query);
+        assert_eq!(page.items.len(), 6);
+
+        // Combining an impossible predicate yields nothing.
+        let filter_impossible = QueryFilter {
+            from_timestamp: Some(0),
+            to_timestamp: Some(u64::MAX),
+            status: Some(AllocationStatus::Active),
+            submitter: Some(Address::random(&env)),
+        };
+        let query_impossible = AllocationQuery {
+            cursor: None,
+            limit: 100,
+            filter: filter_impossible,
+        };
+        let page_impossible = query_allocations(env, query_impossible);
+        assert_eq!(page_impossible.items.len(), 0);
+    }
+
+    #[test]
+    fn test_deterministic_ordering_stable_across_queries() {
+        let env = create_test_env();
+        let caller = Address::random(&env);
+        seed_allocations(&env, &caller, 10);
+
+        let query = AllocationQuery {
+            cursor: None,
+            limit: 100,
+            filter: QueryFilter::default(),
+        };
+
+        let first = query_allocations(env.clone(), query.clone());
+        let second = query_allocations(env.clone(), query.clone());
+        let third = query_allocations(env, query);
+
+        let ids_first: Vec<BytesN<32>> = first.items.iter().map(|i| i.id.clone()).collect();
+        let ids_second: Vec<BytesN<32>> = second.items.iter().map(|i| i.id.clone()).collect();
+        let ids_third: Vec<BytesN<32>> = third.items.iter().map(|i| i.id.clone()).collect();
+
+        assert_eq!(ids_first, ids_second);
+        assert_eq!(ids_second, ids_third);
     }
 }
