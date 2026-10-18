@@ -1,7 +1,10 @@
 #![no_std]
 
 use crate::cbdc_types::{CBDCTransaction, PrivacyTier};
-use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env};
+use crate::rbac::{RbacError, RbacManager, Role};
+use soroban_sdk::{
+    contracterror, contracttype, Address, Bytes, BytesN, Env, Symbol, Vec,
+};
 use soroban_sdk::xdr::ToXdr;
 
 /// Privacy-masked transaction for confidential operations.
@@ -81,17 +84,23 @@ impl PrivacyACL {
     }
 }
 
-/// Privacy enforcement manager.
+/// Privacy enforcement manager with RBAC gating and tamper-evident audit events.
 pub struct PrivacyManager;
 
 impl PrivacyManager {
-    /// Apply privacy masking to transaction
+    /// Apply privacy masking to transaction.
+    ///
+    /// Requires caller to hold at least `Role::Submitter`. Emits a
+    /// `privacy_masked` audit event on success.
     pub fn mask_transaction(
         env: &Env,
+        caller: &Address,
         transaction: &CBDCTransaction,
         privacy_tier: PrivacyTier,
         authorized_decrypters: soroban_sdk::Vec<Address>,
-    ) -> Result<MaskedTransaction, &'static str> {
+    ) -> Result<MaskedTransaction, RbacError> {
+        RbacManager::require_active_role_min(env, caller, Role::Submitter)?;
+
         let content_hash = Self::compute_transaction_content_hash(env, transaction);
         let now = env.ledger().timestamp();
 
@@ -101,45 +110,52 @@ impl PrivacyManager {
             None
         };
 
-        Ok(MaskedTransaction {
+        let masked = MaskedTransaction {
             content_hash,
             privacy_tier: privacy_tier as u32,
             encrypted_data,
             authorized_decrypters,
             masked_at: now,
             encryption_metadata: Self::encryption_metadata(env, privacy_tier),
-        })
+        };
+
+        // Emit tamper-evident audit event for the state mutation.
+        env.events().publish(
+            (
+                Symbol::new(env, "cbdc_privacy"),
+                Symbol::new(env, "masked"),
+            ),
+            (caller.clone(), transaction.tx_id.clone(), content_hash, privacy_tier as u32, now),
+        );
+
+        Ok(masked)
     }
 
-    /// Compute content hash without exposing transaction details
+    /// Compute content hash without exposing transaction details.
     pub fn compute_transaction_content_hash(
         env: &Env,
         transaction: &CBDCTransaction,
     ) -> BytesN<32> {
-        
         let mut input = Bytes::new(env);
         input.append(&transaction.tx_id.to_bytes());
         input.append(&Bytes::from_slice(env, &transaction.timestamp.to_le_bytes()));
-
         env.crypto().sha256(&input).to_bytes()
     }
 
-    /// Encrypt transaction data based on privacy tier
+    /// Encrypt transaction data based on privacy tier.
     fn encrypt_transaction_data(
         env: &Env,
         transaction: &CBDCTransaction,
         privacy_tier: PrivacyTier,
-    ) -> Result<Bytes, &'static str> {
+    ) -> Result<Bytes, RbacError> {
         let mut encrypted = Bytes::new(env);
 
         match privacy_tier {
             PrivacyTier::Pseudonymous => {
-                // Hash amount and exchange rate, keep pilot info
                 encrypted.append(&Bytes::from_slice(env, &transaction.source_pilot.to_le_bytes()));
                 encrypted.append(&Bytes::from_slice(env, &transaction.dest_pilot.to_le_bytes()));
 
-                // Hash sensitive amounts
-                                let mut amount_input = Bytes::new(env);
+                let mut amount_input = Bytes::new(env);
                 amount_input.append(&Bytes::from_slice(env, &transaction.amount_source.to_le_bytes()));
                 amount_input.append(&Bytes::from_slice(env, &transaction.exchange_rate.to_le_bytes()));
                 let amount_hash = env.crypto().sha256(&amount_input).to_bytes();
@@ -148,9 +164,7 @@ impl PrivacyManager {
                 Ok(encrypted)
             }
             PrivacyTier::Private => {
-                // Encrypt everything except ID and timestamp
-                                let mut sensitive_input = Bytes::new(env);
-
+                let mut sensitive_input = Bytes::new(env);
                 sensitive_input.append(&Bytes::from_slice(env, &transaction.source_pilot.to_le_bytes()));
                 sensitive_input.append(&Bytes::from_slice(env, &transaction.dest_pilot.to_le_bytes()));
                 sensitive_input.append(&transaction.from.clone().to_xdr(env));
@@ -162,9 +176,7 @@ impl PrivacyManager {
                 Ok(encrypted_hash.to_bytes())
             }
             PrivacyTier::RegulatoryConfidential => {
-                // Minimal exposure, full encryption
-                                let mut full_input = Bytes::new(env);
-
+                let mut full_input = Bytes::new(env);
                 full_input.append(&transaction.tx_id.to_bytes());
                 full_input.append(&Bytes::from_slice(env, &transaction.timestamp.to_le_bytes()));
                 full_input.append(&transaction.metadata);
@@ -172,13 +184,11 @@ impl PrivacyManager {
                 let encrypted_hash = env.crypto().sha256(&full_input).to_bytes();
                 Ok(encrypted_hash.to_bytes())
             }
-            PrivacyTier::Public => {
-                Err("Public transactions should not be encrypted")
-            }
+            PrivacyTier::Public => Err(RbacError::InvalidRoleAssignment),
         }
     }
 
-    /// Get encryption metadata for privacy tier
+    /// Get encryption metadata for privacy tier.
     fn encryption_metadata(env: &Env, tier: PrivacyTier) -> Bytes {
         let label = match tier {
             PrivacyTier::Pseudonymous => "PSEUDONYMOUS_V1",
@@ -189,15 +199,21 @@ impl PrivacyManager {
         Bytes::from_slice(env, label.as_bytes())
     }
 
-    /// Create privacy ACL for transaction
+    /// Create privacy ACL for transaction.
+    ///
+    /// Requires caller to hold `Role::Admin`. Emits a `privacy_acl_created`
+    /// tamper-evident audit event on success.
     pub fn create_privacy_acl(
         env: &Env,
+        caller: &Address,
         transaction_hash: BytesN<32>,
         read_access: soroban_sdk::Vec<Address>,
         audit_access: soroban_sdk::Vec<Address>,
         regulatory_access: soroban_sdk::Vec<Address>,
         expiration_secs: u64,
-    ) -> Result<PrivacyACL, &'static str> {
+    ) -> Result<PrivacyACL, RbacError> {
+        RbacManager::require_active_role_min(env, caller, Role::Admin)?;
+
         let acl_id = Self::compute_acl_id(env, &transaction_hash);
         let expires_at = if expiration_secs > 0 {
             env.ledger().timestamp() + expiration_secs
@@ -205,45 +221,54 @@ impl PrivacyManager {
             0
         };
 
-        Ok(PrivacyACL {
+        let acl = PrivacyACL {
             acl_id,
             transaction_hash,
             read_access,
             audit_access,
             regulatory_access,
             expires_at,
-        })
+        };
+
+        // Emit tamper-evident audit event for the state mutation.
+        env.events().publish(
+            (
+                Symbol::new(env, "cbdc_privacy"),
+                Symbol::new(env, "acl_created"),
+            ),
+            (caller.clone(), transaction_hash, acl_id, expires_at),
+        );
+
+        Ok(acl)
     }
 
-    /// Compute unique ACL ID
+    /// Compute unique ACL ID.
     pub fn compute_acl_id(env: &Env, transaction_hash: &BytesN<32>) -> BytesN<32> {
-        
         let mut input = Bytes::new(env);
         input.append(&transaction_hash.to_bytes());
         input.append(&Bytes::from_slice(env, b"ACL_V1"));
-
         env.crypto().sha256(&input).to_bytes()
     }
 
-    /// Validate privacy configuration
+    /// Validate privacy configuration.
     pub fn validate_privacy_configuration(
         tier: PrivacyTier,
         has_authorized_decrypters: bool,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), RbacError> {
         if tier.requires_encryption() && !has_authorized_decrypters {
-            return Err("Encrypted transactions must have authorized decrypters");
+            return Err(RbacError::InvalidRoleAssignment);
         }
         Ok(())
     }
 
-    /// Check access permission for transaction
+    /// Check access permission for transaction.
     pub fn check_access_permission(
         acl: &PrivacyACL,
         accessor: &Address,
         current_time: u64,
-    ) -> Result<AccessLevel, &'static str> {
+    ) -> Result<AccessLevel, RbacError> {
         if acl.is_expired(current_time) {
-            return Err("Access control list has expired");
+            return Err(RbacError::UnauthorizedCaller);
         }
 
         if acl.has_regulatory_access(accessor) {
@@ -256,7 +281,7 @@ impl PrivacyManager {
             return Ok(AccessLevel::AuditOnly);
         }
 
-        Err("No access permission")
+        Err(RbacError::UnauthorizedCaller)
     }
 }
 
