@@ -1,12 +1,21 @@
 #[cfg(test)]
 mod tests {
     use crate::finops::*;
-    use soroban_sdk::{bytes, vec, Address, BytesN, Env, Symbol};
+    use crate::rbac::{RbacStorageKey, Role};
+    use soroban_sdk::{bytes, vec, Address, Bytes, BytesN, Env, Symbol};
 
     fn create_test_env() -> Env {
         let env = Env::default();
         env.mock_all_auths();
         env
+    }
+
+    /// Grant an Admin role directly (mocked auth covers signature checks;
+    /// the RBAC role check reads storage).
+    fn grant_role(env: &Env, caller: &Address) {
+        env.storage()
+            .persistent()
+            .set(&RbacStorageKey::Role(caller.clone()), &Role::Admin);
     }
 
     fn sample_name(env: &Env) -> Bytes {
@@ -31,6 +40,7 @@ mod tests {
     fn test_register_cost_center() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let id = register_cost_center(
             env.clone(),
@@ -52,6 +62,7 @@ mod tests {
     fn test_duplicate_cost_center_fails() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         register_cost_center(
             env.clone(),
@@ -77,6 +88,7 @@ mod tests {
     fn test_update_cost_center_budget() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let id = register_cost_center(
             env.clone(),
@@ -96,6 +108,7 @@ mod tests {
     fn test_deactivate_cost_center() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let id = register_cost_center(
             env.clone(),
@@ -117,6 +130,7 @@ mod tests {
     fn test_allocate_cost() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let cc_id = register_cost_center(
             env.clone(),
@@ -150,6 +164,7 @@ mod tests {
     fn test_create_chargeback() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let cc_id = register_cost_center(
             env.clone(),
@@ -176,6 +191,7 @@ mod tests {
     fn test_create_showback() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let cc_id = register_cost_center(
             env.clone(),
@@ -202,6 +218,7 @@ mod tests {
     fn test_approve_chargeback() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let cc_id = register_cost_center(
             env.clone(),
@@ -235,6 +252,7 @@ mod tests {
     fn test_record_resource() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let resource_id = record_resource(
             env.clone(),
@@ -260,6 +278,7 @@ mod tests {
     fn test_generate_rightsizing() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let resource_id = record_resource(
             env.clone(),
@@ -285,6 +304,7 @@ mod tests {
     fn test_record_anomaly() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let resource_id = BytesN::from_slice(&env, b"resource-anomaly-test");
         let anomaly_id = record_anomaly(
@@ -312,6 +332,7 @@ mod tests {
     fn test_detect_anomalies() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let resource_id = BytesN::from_slice(&env, b"resource-anomaly-test-2");
         record_anomaly(
@@ -331,6 +352,7 @@ mod tests {
     fn test_resolve_anomaly() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let resource_id = BytesN::from_slice(&env, b"resource-anomaly-test-3");
         let anomaly_id = record_anomaly(
@@ -358,6 +380,7 @@ mod tests {
     fn test_create_budget() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let cc_id = register_cost_center(
             env.clone(),
@@ -390,6 +413,7 @@ mod tests {
     fn test_check_budget_alert() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let cc_id = register_cost_center(
             env.clone(),
@@ -421,6 +445,7 @@ mod tests {
     fn test_generate_dashboard() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let cc_id = register_cost_center(
             env.clone(),
@@ -458,6 +483,7 @@ mod tests {
     fn test_get_cost_summary() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         let cc_id = register_cost_center(
             env.clone(),
@@ -488,6 +514,7 @@ mod tests {
     fn test_cost_center_count() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         assert_eq!(get_cost_center_count(env.clone()), 0);
 
@@ -506,6 +533,7 @@ mod tests {
     fn test_active_anomaly_count() {
         let env = create_test_env();
         let caller = Address::random(&env);
+        grant_role(&env, &caller);
 
         assert_eq!(get_active_anomaly_count(env.clone()), 0);
 
@@ -520,5 +548,192 @@ mod tests {
         );
 
         assert_eq!(get_active_anomaly_count(env), 1);
+    }
+
+    // ── #859: deterministic bounds & overflow safety ───────────────────
+
+    #[test]
+    fn test_metadata_length_capped() {
+        let env = create_test_env();
+        let caller = Address::random(&env);
+        grant_role(&env, &caller);
+
+        let cc_id = register_cost_center(
+            env.clone(),
+            caller.clone(),
+            sample_name(&env),
+            100000,
+            Symbol::new(&env, "USD"),
+        );
+
+        let oversized = Bytes::from_slice(&env, &[0u8; (MAX_METADATA_LEN + 1) as usize]);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            allocate_cost(
+                env,
+                caller,
+                cc_id,
+                Symbol::new(&env, "compute"),
+                5000,
+                Symbol::new(&env, "USD"),
+                sample_period(&env),
+                oversized,
+            );
+        }));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_anomaly_deviation_overflow_safe() {
+        let env = create_test_env();
+        let caller = Address::random(&env);
+        grant_role(&env, &caller);
+
+        // actual >> expected: would have underflowed/overflowed as
+        // `(actual - expected) * 100` in u64 before the hardening.
+        let anomaly_id = record_anomaly(
+            env.clone(),
+            caller,
+            BytesN::from_slice(&env, b"ovf-resource"),
+            1,
+            u64::MAX,
+            bytes!(env, b"ovf"),
+        );
+
+        let anomaly = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CostAnomaly(anomaly_id))
+            .unwrap();
+        assert_eq!(anomaly.severity, 3);
+    }
+
+    #[test]
+    fn test_budget_utilization_overflow_safe() {
+        let env = create_test_env();
+        let caller = Address::random(&env);
+        grant_role(&env, &caller);
+
+        let cc_id = register_cost_center(
+            env.clone(),
+            caller.clone(),
+            sample_name(&env),
+            100000,
+            Symbol::new(&env, "USD"),
+        );
+
+        let thresholds = vec![&env, 50u32, 80];
+        let budget_id = create_budget(
+            env.clone(),
+            caller.clone(),
+            bytes!(env, b"ovf-budget"),
+            cc_id,
+            3,
+            Symbol::new(&env, "USD"),
+            sample_period(&env),
+            thresholds,
+        );
+
+        // `u64::MAX * 100` would have overflowed u64 before the hardening.
+        let alert_id = check_budget(env.clone(), caller, budget_id, u64::MAX);
+        assert!(!alert_id.to_vec().is_empty());
+    }
+
+    #[test]
+    fn test_threshold_vec_length_capped() {
+        let env = create_test_env();
+        let caller = Address::random(&env);
+        grant_role(&env, &caller);
+
+        let cc_id = register_cost_center(
+            env.clone(),
+            caller.clone(),
+            sample_name(&env),
+            100000,
+            Symbol::new(&env, "USD"),
+        );
+
+        let thresholds = vec![&env, 5u32; (MAX_ALERT_THRESHOLDS + 1) as usize];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            create_budget(
+                env,
+                caller,
+                bytes!(env, b"too-many-thresholds"),
+                cc_id,
+                50000,
+                Symbol::new(&env, "USD"),
+                sample_period(&env),
+                thresholds,
+            );
+        }));
+        assert!(result.is_err());
+    }
+
+    // ── #860: RBAC gating & audit trail ────────────────────────────────
+
+    #[test]
+    fn test_no_role_panics() {
+        let env = create_test_env();
+        let caller = Address::random(&env);
+        // no grant_role — caller holds no assigned role
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            register_cost_center(
+                env,
+                caller,
+                sample_name(&env),
+                100000,
+                Symbol::new(&env, "USD"),
+            );
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_audit_trail_events_emitted() {
+        let env = create_test_env();
+        let caller = Address::random(&env);
+        grant_role(&env, &caller);
+
+        register_cost_center(
+            env.clone(),
+            caller,
+            sample_name(&env),
+            100000,
+            Symbol::new(&env, "USD"),
+        );
+
+        // The mutation emits both the tamper-evident "finops_audit" event and
+        // the domain event "cc_create".
+        let events = env.events().all();
+        assert!(events.len() >= 2);
+    }
+
+    #[test]
+    fn test_detect_anomalies_works_via_index() {
+        let env = create_test_env();
+        let caller = Address::random(&env);
+        grant_role(&env, &caller);
+
+        let resource_id = BytesN::from_slice(&env, b"index-detect");
+        record_anomaly(
+            env.clone(),
+            caller.clone(),
+            resource_id.clone(),
+            1000,
+            3000, // 200% deviation -> severity 3, detectable
+            bytes!(env, b"idx"),
+        );
+        record_anomaly(
+            env.clone(),
+            caller.clone(),
+            BytesN::from_slice(&env, b"other-resource"),
+            1000,
+            3000,
+            bytes!(env, b"idx"),
+        );
+
+        let anomalies = detect_anomalies(env, caller, resource_id);
+        assert_eq!(anomalies.len(), 1);
     }
 }

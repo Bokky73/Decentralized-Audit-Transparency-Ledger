@@ -7189,6 +7189,9 @@ pub mod sandbox_graduation;
 // FinOps Module
 pub mod finops;
 
+// Role-Based Access Control (issue #686 #689 #688 #687)
+pub mod rbac;
+
 // Storage layout snapshot for upgrade safety validation (issue #414).
 pub mod storage_layout;
 

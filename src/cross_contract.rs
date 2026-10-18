@@ -3,10 +3,93 @@
 //! Provides primitives for referencing events across contracts, composing
 //! multi-step workflow definitions, recording workflow executions, and
 //! verifying cross-chain workflow integrity.
+//!
+//! ## Deterministic bounds & overflow safety (issue #864)
+//!
+//! Every user-supplied payload (`refs`, steps, `external_id`, `metadata`,
+//! pagination) is capped by [`MAX_REFS`], [`MAX_WORKFLOW_STEPS`],
+//! [`MAX_EXTERNAL_ID_LEN`], [`MAX_METADATA_LEN`] and [`MAX_PAGE_SIZE`].
+//! Workflow `step_index` writes are bounds-checked against the referenced
+//! definition, so `record_workflow_step` can never grow
+//! `step_events` unbounded (the previous `while len <= step_index` push
+//! loop would trap on a `u32::MAX` index). Every integer counter is
+//! incremented through [`bump_u32_counter`], which fails with a stable
+//! error instead of an arithmetic trap, and every `EventRef` /
+//! `ExternalEvent` payload is validated against zero-value identifiers
+//! before it reaches storage.
 
-use soroban_sdk::{contractimpl, contracttype, panic_with_error, Address, Bytes, BytesN, Env, Symbol, Vec};
+use soroban_sdk::{
+    contracterror, contractimpl, contracttype, panic_with_error, Address, Bytes, BytesN, Env,
+    Symbol, Vec,
+};
 
-use crate::{AuditLedger, AuditLedgerArgs, AuditLedgerClient, ContractError, DataKey};
+use crate::{AuditLedger, ContractError, DataKey};
+
+// Deterministic bounds (issue #864)
+
+/// Maximum number of event references in one composition.
+pub const MAX_REFS: u32 = 64;
+/// Maximum number of steps in one workflow definition.
+pub const MAX_WORKFLOW_STEPS: u32 = 64;
+/// Maximum length of free-form `metadata` payloads.
+pub const MAX_METADATA_LEN: u32 = 1024;
+/// Maximum length of an external event identifier.
+pub const MAX_EXTERNAL_ID_LEN: u32 = 256;
+/// Maximum number of records returned by paginated queries.
+pub const MAX_PAGE_SIZE: u32 = 100;
+
+// Cross-contract error codes (issue #864)
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum XContractError {
+    /// A bounded payload exceeded its deterministic limit.
+    LimitExceeded = 9700,
+    /// A payload failed structural validation (empty / malformed).
+    InvalidInput = 9701,
+    /// An auto-increment counter would overflow u32.
+    CounterOverflow = 9702,
+    /// An event reference carries a zero-valued identifier.
+    InvalidEventRef = 9703,
+    /// A workflow step index is outside the definition's step range.
+    StepIndexOutOfBounds = 9704,
+    /// A workflow step failed structural validation (index order, delays).
+    InvalidWorkflowStep = 9705,
+}
+
+/// Increment an instance-storage counter with overflow safety (#864).
+fn bump_u32_counter(env: &Env, key: &DataKey) -> u32 {
+    let cur: u32 = env.storage().instance().get(key).unwrap_or(0);
+    let next = match cur.checked_add(1) {
+        Some(next) => next,
+        None => panic_with_error!(env, XContractError::CounterOverflow),
+    };
+    env.storage().instance().set(key, &next);
+    next
+}
+
+/// Enforce a deterministic upper bound on a `Bytes` payload length (#864).
+fn require_bounded_bytes(env: &Env, value: &Bytes, max: u32) {
+    if value.len() > max {
+        panic_with_error!(env, XContractError::InvalidInput);
+    }
+}
+
+/// Reject empty `Bytes` payloads whose emptiness is structurally invalid (#864).
+fn require_non_empty_bytes(env: &Env, value: &Bytes) {
+    if value.is_empty() {
+        panic_with_error!(env, XContractError::InvalidInput);
+    }
+}
+
+/// Validate a cross-contract / external event reference identity (#864).
+fn require_valid_event_ref(env: &Env, event_ref: &EventRef) {
+    let zero = BytesN::from_array(env, &[0u8; 32]);
+    if event_ref.event_id == zero || event_ref.event_hash == zero {
+        panic_with_error!(env, XContractError::InvalidEventRef);
+    }
+}
 
 // Cross-contract event reference
 
@@ -155,7 +238,19 @@ impl AuditLedger {
     pub fn log_event_with_refs(env: Env, composer: Address, name: Symbol, refs: Vec<EventRef>, metadata: Bytes) -> u32 {
         composer.require_auth();
 
-        let comp_id: u32 = env.storage().instance().get(&DataKey::CrossContractCount).unwrap_or(0);
+        // Deterministic payload bounds (#864): a malformed or hostile
+        // composition can never blow the instance-storage entry limit or the
+        // compute budget via an unbounded refs vector.
+        if refs.len() > MAX_REFS {
+            panic_with_error!(&env, XContractError::LimitExceeded);
+        }
+        require_bounded_bytes(&env, &metadata, MAX_METADATA_LEN);
+        for i in 0..refs.len() {
+            let event_ref = refs.get(i).unwrap();
+            require_valid_event_ref(&env, event_ref);
+        }
+
+        let comp_id: u32 = bump_u32_counter(&env, &DataKey::CrossContractCount);
 
         let composition = CrossContractEvent {
             id: comp_id,
@@ -168,9 +263,6 @@ impl AuditLedger {
         env.storage()
             .instance()
             .set(&DataKey::CrossContractEvent(comp_id), &composition);
-        env.storage()
-            .instance()
-            .set(&DataKey::CrossContractCount, &(comp_id + 1));
 
         env.events().publish(
             (Symbol::new(&env, "xcontract"), Symbol::new(&env, "composed")),
@@ -180,13 +272,16 @@ impl AuditLedger {
     }
 
     /// Validate that all `EventRef`s in a composition are self-consistent
-    /// (contract address fields are non-zero, event IDs are 32 bytes).
+    /// (identifiers are non-zero, payload hashes are non-zero).
     /// Returns `true` if all refs are structurally valid.
     pub fn validate_cross_contract_refs(env: Env, refs: Vec<EventRef>) -> bool {
         let zero = BytesN::from_array(&env, &[0u8; 32]);
+        if refs.len() > MAX_REFS {
+            return false;
+        }
         for i in 0..refs.len() {
             let r = refs.get(i).unwrap();
-            if r.event_id == zero {
+            if r.event_id == zero || r.event_hash == zero {
                 return false;
             }
         }
@@ -204,7 +299,16 @@ impl AuditLedger {
     ) -> u32 {
         submitter.require_auth();
 
-        let ext_id: u32 = env.storage().instance().get(&DataKey::ExternalEventCount).unwrap_or(0);
+        // Deterministic payload bounds (#864).
+        require_non_empty_bytes(&env, &external_id);
+        require_bounded_bytes(&env, &external_id, MAX_EXTERNAL_ID_LEN);
+        require_bounded_bytes(&env, &metadata, MAX_METADATA_LEN);
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        if payload_hash == zero {
+            panic_with_error!(&env, XContractError::InvalidEventRef);
+        }
+
+        let ext_id: u32 = bump_u32_counter(&env, &DataKey::ExternalEventCount);
 
         let ext = ExternalEvent {
             id: ext_id,
@@ -216,9 +320,6 @@ impl AuditLedger {
             metadata,
         };
         env.storage().instance().set(&DataKey::ExternalEventData(ext_id), &ext);
-        env.storage()
-            .instance()
-            .set(&DataKey::ExternalEventCount, &(ext_id + 1));
 
         env.events().publish(
             (Symbol::new(&env, "xcontract"), Symbol::new(&env, "ext_anchored")),
@@ -234,7 +335,29 @@ impl AuditLedger {
         caller.require_auth();
         Self::require_owner_or_multisig(&env, &caller);
 
-        let wf_id: u32 = env.storage().instance().get(&DataKey::WorkflowCount).unwrap_or(0);
+        // Deterministic payload bounds (#864).
+        if steps.is_empty() {
+            panic_with_error!(&env, XContractError::InvalidInput);
+        }
+        if steps.len() > MAX_WORKFLOW_STEPS {
+            panic_with_error!(&env, XContractError::LimitExceeded);
+        }
+        for i in 0..steps.len() {
+            let step = steps.get(i).unwrap();
+            // `WorkflowExecution.step_events` is indexed positionally (see
+            // `verify_cross_chain_workflow` and `start_workflow`), so a
+            // definition whose steps are out of order is malformed.
+            if step.index != i {
+                panic_with_error!(&env, XContractError::InvalidWorkflowStep);
+            }
+            // `max_delay_secs == 0` means "no limit"; otherwise the window
+            // must be consistent.
+            if step.max_delay_secs != 0 && step.max_delay_secs < step.min_delay_secs {
+                panic_with_error!(&env, XContractError::InvalidWorkflowStep);
+            }
+        }
+
+        let wf_id: u32 = bump_u32_counter(&env, &DataKey::WorkflowCount);
 
         let wf = WorkflowDefinition {
             id: wf_id,
@@ -246,7 +369,6 @@ impl AuditLedger {
             active: true,
         };
         env.storage().instance().set(&DataKey::WorkflowDef(wf_id), &wf);
-        env.storage().instance().set(&DataKey::WorkflowCount, &(wf_id + 1));
 
         env.events().publish(
             (Symbol::new(&env, "workflow"), Symbol::new(&env, "defined")),
@@ -270,7 +392,23 @@ impl AuditLedger {
             panic_with_error!(&env, ContractError::WorkflowNotInProgress);
         }
 
-        // Extend step_events Vec if needed
+        // Bounds-check the step index against the referenced definition so
+        // the extension loop below can never grow `step_events` beyond the
+        // definition's step count (issue #864: a `u32::MAX` index previously
+        // trapped on an unbounded `push_back` loop).
+        let wf: WorkflowDefinition = env
+            .storage()
+            .instance()
+            .get(&DataKey::WorkflowDef(exec.definition_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EventDoesNotExist));
+        if step_index >= wf.steps.len() {
+            panic_with_error!(&env, XContractError::StepIndexOutOfBounds);
+        }
+
+        // Validate the referenced event identity (#864).
+        require_valid_event_ref(&env, &event_ref);
+
+        // Extend step_events Vec if needed (bounded by the check above).
         while exec.step_events.len() <= step_index {
             exec.step_events.push_back(None);
         }
@@ -318,6 +456,8 @@ impl AuditLedger {
 
     /// Return all workflow definitions (paginated by count starting at 0).
     pub fn list_workflows(env: Env, start: u32, limit: u32) -> Vec<WorkflowDefinition> {
+        // Deterministic page bound (#864).
+        let limit = limit.min(MAX_PAGE_SIZE);
         let total: u32 = env.storage().instance().get(&DataKey::WorkflowCount).unwrap_or(0);
         let mut out: Vec<WorkflowDefinition> = Vec::new(&env);
         let end = (start.saturating_add(limit)).min(total);
@@ -335,6 +475,8 @@ impl AuditLedger {
 
     /// Return cross-contract compositions (paginated).
     pub fn get_cross_contract_events(env: Env, start: u32, limit: u32) -> Vec<CrossContractEvent> {
+        // Deterministic page bound (#864).
+        let limit = limit.min(MAX_PAGE_SIZE);
         let total: u32 = env.storage().instance().get(&DataKey::CrossContractCount).unwrap_or(0);
         let mut out: Vec<CrossContractEvent> = Vec::new(&env);
         let end = (start.saturating_add(limit)).min(total);
@@ -364,7 +506,10 @@ impl AuditLedger {
             panic_with_error!(&env, ContractError::WorkflowNotActive);
         }
 
-        let exec_id: u32 = env.storage().instance().get(&DataKey::WorkflowExecCount).unwrap_or(0);
+        // Deterministic payload bounds (#864).
+        require_bounded_bytes(&env, &metadata, MAX_METADATA_LEN);
+
+        let exec_id: u32 = bump_u32_counter(&env, &DataKey::WorkflowExecCount);
 
         let step_count = wf.steps.len();
         let mut step_events: Vec<Option<EventRef>> = Vec::new(&env);
@@ -384,9 +529,6 @@ impl AuditLedger {
             metadata,
         };
         env.storage().instance().set(&DataKey::WorkflowExec(exec_id), &exec);
-        env.storage()
-            .instance()
-            .set(&DataKey::WorkflowExecCount, &(exec_id + 1));
 
         env.events().publish(
             (Symbol::new(&env, "workflow"), Symbol::new(&env, "started")),
@@ -407,6 +549,13 @@ impl AuditLedger {
             .get(&exec_key)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::EventDoesNotExist));
 
+        // Idempotency guard (#864): a completed, failed or cancelled
+        // execution can never be re-completed (or have its finish
+        // timestamp rewritten after the fact).
+        if exec.status != WorkflowStatus::InProgress {
+            panic_with_error!(&env, ContractError::WorkflowNotInProgress);
+        }
+
         exec.status = WorkflowStatus::Completed;
         exec.finished_at = env.ledger().timestamp();
         env.storage().instance().set(&exec_key, &exec);
@@ -415,5 +564,41 @@ impl AuditLedger {
             (Symbol::new(&env, "workflow"), Symbol::new(&env, "completed")),
             (execution_id, caller),
         );
+    }
+
+    /// Verify an execution satisfies its definition's mandatory steps.
+    pub fn verify_cross_chain_workflow(env: Env, execution_id: u32) -> bool {
+        let exec_key = DataKey::WorkflowExec(execution_id);
+        let exec: WorkflowExecution = match env.storage().instance().get(&exec_key) {
+            Some(e) => e,
+            None => return false,
+        };
+        let wf: WorkflowDefinition = match env.storage().instance().get(&DataKey::WorkflowDef(exec.definition_id)) {
+            Some(w) => w,
+            None => return false,
+        };
+
+        let zero = BytesN::from_array(&env, &[0u8; 32]);
+        for i in 0..wf.steps.len() {
+            let step = wf.steps.get(i).unwrap();
+            if step.optional {
+                continue;
+            }
+            if i >= exec.step_events.len() {
+                return false;
+            }
+            match exec.step_events.get(i).unwrap() {
+                // Deterministic identity validation (#864): a recorded
+                // reference carrying zero-valued identifiers makes the
+                // verification fail outright, even if the slot is filled.
+                Some(r) => {
+                    if r.event_id == zero || r.event_hash == zero {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+        true
     }
 }
