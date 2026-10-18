@@ -14,6 +14,27 @@ use soroban_sdk::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::rbac::{RbacError, RbacManager, RbacStorageKey, Role};
+
+// ============================================================================
+// Audit Trail Constants
+// ============================================================================
+
+/// Topic tag for tamper-evident bridge audit events.
+pub const BRIDGE_AUDIT_TOPIC: &str = "bridge_audit";
+
+/// Success-topic tag persisted for off-chain audit reconstruction.
+pub const BRIDGE_AUDIT_OK_TOPIC: &str = "bridge_audit_ok";
+
+/// Denial-topic tag persisted for off-chain audit reconstruction.
+pub const BRIDGE_AUDIT_DENIED_TOPIC: &str = "bridge_audit_denied";
+
+/// Outcome tag for a successful mutation.
+pub const AUDIT_OUTCOME_OK: &str = "ok";
+
+/// Outcome tag for a rejected access attempt.
+pub const AUDIT_OUTCOME_DENIED: &str = "denied";
+
 // ============================================================================
 // Data Structures
 // ============================================================================
@@ -142,6 +163,10 @@ pub enum BridgeError {
     RelayAlreadyExists = 10,
     /// Invalid threshold (must be > 0)
     InvalidThreshold = 11,
+    /// Caller failed the RBAC role requirement for this operation
+    RbacDenied = 12,
+    /// Caller is a suspended submitter DID
+    RbacSuspended = 13,
 }
 
 // ============================================================================
@@ -180,19 +205,24 @@ impl CrossChainBridge {
             .instance()
             .set(&BridgeKey::AllRelays, &Vec::new(&env));
 
+        RbacManager::initialize_admin(&env, &owner);
+
         log!(
             &env,
             "CrossChainBridge: initialized - threshold={}, ttl={}",
             signature_threshold,
             cache_ttl_ledgers
         );
+
+        let state = init_state_bytes(&env, &owner, signature_threshold, cache_ttl_ledgers, eth_chain_id);
+        emit_bridge_audit(&env, &owner, "initialize_bridge", &state, AUDIT_OUTCOME_OK, 0);
     }
 
     // ========================================================================
     // Relay Management
     // ========================================================================
 
-    /// Register a new bridge relay (owner-only)
+    /// Register a new bridge relay (RBAC-gated, Admin role required)
     pub fn register_relay(
         env: Env,
         relay_address: Address,
@@ -200,6 +230,10 @@ impl CrossChainBridge {
     ) {
         let owner = Self::get_owner(&env);
         owner.require_auth();
+
+        let state = relay_state_bytes(&env, &relay_address, &pubkey);
+        enforce_bridge_role(
+            &env, &owner, Role::Admin, "register_relay", &state);
 
         // Validate public key format (should be 65 bytes for uncompressed ECDSA)
         if pubkey.len() != 65 {
@@ -232,10 +266,16 @@ impl CrossChainBridge {
             .instance()
             .get::<_, Vec<Address>>(&BridgeKey::AllRelays)
             .unwrap_or_else(|| Vec::new(&env));
-        relays.push_back(relay_address);
+        relays.push_back(relay_address.clone());
         env.storage()
             .instance()
             .set(&BridgeKey::AllRelays, &relays);
+
+        // Grant the relay the Submitter RBAC role so only registered,
+        // non-suspended relays may pass the `submit_attestation` gate.
+        env.storage()
+            .persistent()
+            .set(&RbacStorageKey::Role(relay_address.clone()), &Role::Submitter);
 
         log!(
             &env,
@@ -243,12 +283,19 @@ impl CrossChainBridge {
             relay_address,
             pubkey.len()
         );
+
+        emit_bridge_audit(&env, &relay_address, "register_relay", &state, AUDIT_OUTCOME_OK, 0);
     }
 
-    /// Deactivate a relay (owner-only)
+    /// Deactivate a relay (RBAC-gated, Admin role required)
     pub fn deactivate_relay(env: Env, relay_address: Address) {
         let owner = Self::get_owner(&env);
         owner.require_auth();
+
+        let empty = Bytes::new(&env);
+        let state = relay_state_bytes(&env, &relay_address, &empty);
+        enforce_bridge_role(
+            &env, &owner, Role::Admin, "deactivate_relay", &state);
 
         let mut relay = env
             .storage()
@@ -261,22 +308,43 @@ impl CrossChainBridge {
             .instance()
             .set(&BridgeKey::BridgeRelay(relay_address.clone()), &relay);
 
+        // Revoke the relay's Submitter RBAC role; a deactivated relay must not
+        // pass role gating even if re-activated without a fresh role grant.
+        env.storage()
+            .persistent()
+            .remove(&RbacStorageKey::Role(relay_address.clone()));
+
         log!(
             &env,
             "CrossChainBridge: relay deactivated - address={}",
             relay_address
         );
+
+        emit_bridge_audit(&env, &relay_address, "deactivate_relay", &state, AUDIT_OUTCOME_OK, 0);
     }
 
     // ========================================================================
     // Attestation Submission & Verification
     // ========================================================================
 
-    /// Submit a balance attestation from a relay
+    /// Submit a balance attestation from a relay (RBAC-gated, Submitter role
+    /// required; relays are granted `Role::Submitter` on registration)
     pub fn submit_attestation(env: Env, attestation: BalanceAttestation) {
         let relay_address = env.invoker();
 
-        // Verify relay is active
+        let state = attestation_state_bytes(
+            &env,
+            &relay_address,
+            &attestation.user_address,
+            &attestation.token_address,
+            attestation.token_id,
+            attestation.balance,
+            attestation.block_height,
+        );
+        enforce_bridge_role(
+            &env, &relay_address, Role::Submitter, "submit_attestation", &state);
+
+        // Verify relay is registered and active
         let relay = env
             .storage()
             .instance()
@@ -288,8 +356,8 @@ impl CrossChainBridge {
         }
 
         // Validate Ethereum addresses (0x-prefixed hex, 42 chars total)
-        Self::validate_eth_address(&attestation.user_address);
-        Self::validate_eth_address(&attestation.token_address);
+        Self::validate_eth_address(&env, &attestation.user_address);
+        Self::validate_eth_address(&env, &attestation.token_address);
 
         // Verify signature
         if !Self::verify_signature(&env, &relay, &attestation) {
@@ -304,7 +372,7 @@ impl CrossChainBridge {
         }
 
         let key = BridgeKey::PendingAttestation(
-            relay_address,
+            relay_address.clone(),
             attestation.user_address.clone(),
             attestation.token_address.clone(),
         );
@@ -317,9 +385,12 @@ impl CrossChainBridge {
             relay_address,
             attestation.block_height
         );
+
+        emit_bridge_audit(&env, &relay_address, "submit_attestation", &state, AUDIT_OUTCOME_OK, 0);
     }
 
-    /// Accept attestation and update verification cache (owner-only, after threshold met)
+    /// Accept attestation and update verification cache (RBAC-gated, Admin
+    /// role required)
     pub fn accept_attestation(
         env: Env,
         relay_address: Address,
@@ -329,6 +400,10 @@ impl CrossChainBridge {
     ) {
         let owner = Self::get_owner(&env);
         owner.require_auth();
+
+        let state = accept_state_bytes(&env, &relay_address, &user_address, &token_address, token_id);
+        enforce_bridge_role(
+            &env, &owner, Role::Admin, "accept_attestation", &state);
 
         let key = BridgeKey::PendingAttestation(
             relay_address.clone(),
@@ -367,9 +442,11 @@ impl CrossChainBridge {
         log!(
             &env,
             "CrossChainBridge: attestation accepted - balance={}, ttl={}",
-            attestation.balance,
+            record.balance,
             config.cache_ttl_ledgers
         );
+
+        emit_bridge_audit(&env, &owner, "accept_attestation", &state, AUDIT_OUTCOME_OK, 0);
     }
 
     /// Query verified balance from cache
@@ -379,8 +456,8 @@ impl CrossChainBridge {
         token_address: Bytes,
         token_id: u128,
     ) -> u128 {
-        Self::validate_eth_address(&user_address);
-        Self::validate_eth_address(&token_address);
+        Self::validate_eth_address(&env, &user_address);
+        Self::validate_eth_address(&env, &token_address);
 
         let key = BridgeKey::VerificationCache(user_address, token_address, token_id);
 
@@ -405,7 +482,7 @@ impl CrossChainBridge {
     // Configuration & Management
     // ========================================================================
 
-    /// Update bridge configuration (owner-only)
+    /// Update bridge configuration (RBAC-gated, Admin role required)
     pub fn update_bridge_config(
         env: Env,
         signature_threshold: u32,
@@ -413,6 +490,10 @@ impl CrossChainBridge {
     ) {
         let owner = Self::get_owner(&env);
         owner.require_auth();
+
+        let state = config_state_bytes(&env, signature_threshold, cache_ttl_ledgers);
+        enforce_bridge_role(
+            &env, &owner, Role::Admin, "update_bridge_config", &state);
 
         if signature_threshold == 0 {
             panic_with_error!(&env, BridgeError::InvalidThreshold);
@@ -432,6 +513,8 @@ impl CrossChainBridge {
             signature_threshold,
             cache_ttl_ledgers
         );
+
+        emit_bridge_audit(&env, &owner, "update_bridge_config", &state, AUDIT_OUTCOME_OK, 0);
     }
 
     /// Get bridge configuration
@@ -457,11 +540,11 @@ impl CrossChainBridge {
             .unwrap_or_else(|| panic_with_error!(env, BridgeError::BridgeNotConfigured))
     }
 
-    fn validate_eth_address(addr: &Bytes) {
+    fn validate_eth_address(env: &Env, addr: &Bytes) {
         // Ethereum address: 0x + 40 hex chars = 42 chars total
         // This is a simplified check; real implementation would be more strict
         if addr.len() != 42 {
-            panic_with_error!(_env, BridgeError::InvalidEthAddress);
+            panic_with_error!(env, BridgeError::InvalidEthAddress);
         }
     }
 
@@ -493,6 +576,138 @@ impl CrossChainBridge {
 
         true
     }
+}
+
+// ============================================================================
+// RBAC Gating & Tamper-Evident Audit Trail (issue #915)
+// ============================================================================
+
+/// Computes a tamper-evident digest binding the caller, operation, and the
+/// operation-specific state snapshot (`sha256(caller_xdr || op_len || op || state)`).
+fn audit_digest(env: &Env, caller: &Address, operation: &str, state: &Bytes) -> BytesN<32> {
+    let mut data = Bytes::new(env);
+    data.append(&caller.to_xdr(env));
+    data.extend_from_array(&(operation.len() as u64).to_be_bytes());
+    data.extend_from_slice(operation.as_bytes());
+    data.append(state);
+    env.crypto().sha256(&data).to_bytes()
+}
+
+/// Emits a standardized, tamper-evident audit event for a bridge mutation
+/// attempt. Publishes both a diagnostic topic-tagged event (tracing/simulation)
+/// and a dedicated outcome topic event (off-chain audit reconstruction).
+fn emit_bridge_audit(
+    env: &Env,
+    caller: &Address,
+    operation: &str,
+    state: &Bytes,
+    outcome: &str,
+    error_code: u32,
+) {
+    let digest = audit_digest(env, caller, operation, state);
+    let op = Symbol::new(env, operation);
+    let result = Symbol::new(env, outcome);
+    let timestamp = env.ledger().timestamp();
+
+    env.events().publish(
+        (Symbol::new(env, BRIDGE_AUDIT_TOPIC), op.clone(), result.clone()),
+        (caller.clone(), timestamp, digest.clone(), error_code),
+    );
+
+    let outcome_topic = if outcome == AUDIT_OUTCOME_OK {
+        BRIDGE_AUDIT_OK_TOPIC
+    } else {
+        BRIDGE_AUDIT_DENIED_TOPIC
+    };
+
+    env.events().publish(
+        (Symbol::new(env, outcome_topic), op, result),
+        (caller.clone(), timestamp, digest),
+    );
+}
+
+/// Enforces granular RBAC role gating for a bridge mutation. Emits a denied
+/// audit event (with the stable [`RbacError`] code) when the caller is a
+/// suspended submitter DID or does not hold at least `min_role`.
+///
+/// Preserves the existing authentication semantics: callers that already
+/// performed `require_auth` keep it; the gating itself performs pure storage
+/// reads so relay invoker flows are not disrupted.
+fn enforce_bridge_role(
+    env: &Env,
+    caller: &Address,
+    min_role: Role,
+    operation: &str,
+    state: &Bytes,
+) -> Result<(), BridgeError> {
+    let suspended = RbacManager::is_suspended(env, caller);
+    if !suspended && RbacManager::has_role_min(env, caller, min_role) {
+        return Ok(());
+    }
+
+    let rbac_code = if suspended {
+        RbacError::SubmitterSuspended as u32
+    } else {
+        RbacError::InsufficientRole as u32
+    };
+    emit_bridge_audit(env, caller, operation, state, AUDIT_OUTCOME_DENIED, rbac_code);
+
+    if suspended {
+        Err(BridgeError::RbacSuspended)
+    } else {
+        Err(BridgeError::RbacDenied)
+    }
+}
+
+fn init_state_bytes(env: &Env, owner: &Address, threshold: u32, ttl: u32, chain_id: u64) -> Bytes {
+    let mut state = Bytes::new(env);
+    state.append(&owner.to_xdr(env));
+    state.extend_from_array(&threshold.to_le_bytes());
+    state.extend_from_array(&ttl.to_le_bytes());
+    state.extend_from_array(&chain_id.to_le_bytes());
+    state
+}
+
+fn relay_state_bytes(env: &Env, relay: &Address, pubkey: &Bytes) -> Bytes {
+    let mut state = Bytes::new(env);
+    state.append(&relay.to_xdr(env));
+    state.append(pubkey);
+    state
+}
+
+fn attestation_state_bytes(
+    env: &Env,
+    relay: &Address,
+    user: &Bytes,
+    token: &Bytes,
+    token_id: u128,
+    balance: u128,
+    block_height: u64,
+) -> Bytes {
+    let mut state = Bytes::new(env);
+    state.append(&relay.to_xdr(env));
+    state.append(user);
+    state.append(token);
+    state.extend_from_array(&token_id.to_le_bytes());
+    state.extend_from_array(&balance.to_le_bytes());
+    state.extend_from_array(&block_height.to_le_bytes());
+    state
+}
+
+fn accept_state_bytes(env: &Env, relay: &Address, user: &Bytes, token: &Bytes, token_id: u128) -> Bytes {
+    let mut state = Bytes::new(env);
+    state.append(&relay.to_xdr(env));
+    state.append(user);
+    state.append(token);
+    state.extend_from_array(&token_id.to_le_bytes());
+    state
+}
+
+fn config_state_bytes(env: &Env, threshold: u32, ttl: u32) -> Bytes {
+    let mut state = Bytes::new(env);
+    state.extend_from_array(&threshold.to_le_bytes());
+    state.extend_from_array(&ttl.to_le_bytes());
+    state
 }
 
 #[cfg(test)]

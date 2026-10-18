@@ -13,6 +13,18 @@ use crate::tax::{
     TaxJurisdiction,
 };
 
+/// Rate scale: basis points per 100% (2000 bps = 20%).
+pub const VAT_RATE_SCALE: u128 = 10_000;
+
+/// Upper bound on any accepted VAT rate in basis points (100%).
+pub const MAX_VAT_RATE_BPS: u32 = 10_000;
+
+/// Maximum supply amount accepted by the engine: any amount at or below this
+/// keeps every intermediate fixed-point product (amount x rate, gross = amount
+/// + VAT) representable in `u64`-sized outputs, so high-throughput ledger
+/// execution can never wrap arithmetic.
+pub const MAX_SUPPLY_AMOUNT: u64 = u64::MAX / VAT_RATE_SCALE as u64;
+
 /// VAT Rate Rules by Jurisdiction
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -49,6 +61,32 @@ pub struct VATExemptionRules {
 pub struct VATDeterminationEngine;
 
 impl VATDeterminationEngine {
+    /// Clamps a caller-supplied rate to the deterministic maximum so malformed
+    /// payloads (rate basis points above 100%) cannot skew downstream math.
+    pub fn normalize_rate(rate_bps: u32) -> u32 {
+        rate_bps.min(MAX_VAT_RATE_BPS)
+    }
+
+    /// Overflow-safe VAT amount for a net (exclusive) supply amount using
+    /// `u128` intermediates; the result is exact for any input pair and
+    /// saturates at `u64::MAX` instead of wrapping.
+    pub fn vat_amount_from_net(supply_amount: u64, vat_rate_bps: u32) -> u64 {
+        let rate = Self::normalize_rate(vat_rate_bps) as u128;
+        let vat = (supply_amount as u128)
+            .saturating_mul(rate)
+            .saturating_div(VAT_RATE_SCALE)
+            .min(u64::MAX as u128);
+        vat as u64
+    }
+
+    /// Enforces the deterministic input bounds for a VAT transaction.
+    /// Returns `false` for malformed payloads whose amounts or rates fall
+    /// outside the engine's representable range.
+    pub fn validate_transaction(transaction: &VATTransaction) -> bool {
+        transaction.supply_amount <= MAX_SUPPLY_AMOUNT
+            && transaction.vat_rate <= MAX_VAT_RATE_BPS
+    }
+
     /// Determine VAT rate for a transaction
     pub fn determine_rate(
         env: &Env,
@@ -277,7 +315,7 @@ impl VATDeterminationEngine {
         let vat_amount = if is_exempt || reverse_charge {
             0
         } else {
-            (transaction.supply_amount * vat_rate as u64) / 10000
+            Self::vat_amount_from_net(transaction.supply_amount, vat_rate)
         };
 
         VATDetermination {
@@ -303,15 +341,23 @@ impl VATDeterminationEngine {
         vat_rate: u32,
         is_inclusive: bool,
     ) -> (u64, u64, u64) {
+        let rate = Self::normalize_rate(vat_rate) as u128;
+        let amount = supply_amount as u128;
+        let u64_max = u64::MAX as u128;
+
         if is_inclusive {
             // supply_amount is gross (inclusive of VAT)
-            let vat_amount = (supply_amount * vat_rate as u64) / (10000 + vat_rate as u64);
-            let net_amount = supply_amount - vat_amount;
-            (net_amount, vat_amount, supply_amount)
+            let vat = (amount * rate) / (VAT_RATE_SCALE + rate);
+            // vat < amount for every well-formed rate, so the subtraction
+            // below cannot underflow; clamp defensively against a malformed
+            // payload anyway.
+            let vat_amount = vat.min(u64_max).min(amount) as u64;
+            (supply_amount - vat_amount, vat_amount, supply_amount)
         } else {
             // supply_amount is net (exclusive of VAT)
-            let vat_amount = (supply_amount * vat_rate as u64) / 10000;
-            (supply_amount, vat_amount, supply_amount + vat_amount)
+            let vat_amount = Self::vat_amount_from_net(supply_amount, vat_rate);
+            let gross = (amount + vat_amount as u128).min(u64_max) as u64;
+            (supply_amount, vat_amount, gross)
         }
     }
 }

@@ -19,6 +19,7 @@ pub mod tamper_evidence;
 pub mod compliance_validators;
 pub mod tax;
 pub mod vat_engine;
+pub mod rwa_oracle;
 pub mod tax_engines;
 pub mod tax_audit_trail;
 #[cfg(test)]
@@ -44,6 +45,9 @@ use soroban_sdk::{
     bytes, contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Bytes, BytesN, Env, String, Symbol,
     Vec,
 };
+
+pub mod rbac;
+pub mod cross_chain_bridge;
 
 pub mod supply_chain;
 pub mod digital_passport;
