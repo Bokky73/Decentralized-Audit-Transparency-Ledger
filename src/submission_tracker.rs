@@ -25,10 +25,10 @@
 //! Retry delay respects `retry_delay_seconds` and optionally doubles it on each
 //! attempt when `exponential_backoff` is `true`.
 
-use soroban_sdk::{Bytes, BytesN, Env, Vec};
+use soroban_sdk::{Bytes, BytesN, Env, Vec, Address, contracttype, panic_with_error};
 
 use crate::regulatory_reporting::{
-    AuthorityConfig, RegulatoryReport, RegulatorySubmission,
+    AuthorityConfig, RegulatoryAuthority, RegulatoryReport, RegulatorySubmission,
     ReportAction, ReportStatus, ReportingError, SubmissionAcknowledgment,
 };
 
@@ -276,6 +276,227 @@ pub fn next_attempt(
     } else {
         Ok(next)
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Storage keys, pagination, filtering and TTL management (#897 #896)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Maximum number of index entries scanned per paginated read, bounding
+/// on-chain CPU/storage reads so large datasets cannot exhaust the budget.
+const SUBMISSION_PAGE_SCAN_CAP: u32 = 512;
+
+/// Persistent storage keys for the submission tracker.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SubmissionTrackerKey {
+    /// RegulatorySubmission keyed by its content-addressed id.
+    Submission(BytesN<32>),
+    /// SubmissionAcknowledgment keyed by its id.
+    Receipt(BytesN<32>),
+    /// Last consumed submission nonce per submitter address (idempotency).
+    Nonce(Address),
+    /// Append-only ordered index: sequence u32 → submission id BytesN<32>.
+    SubmissionIndex(u32),
+    /// Total number of submissions recorded.
+    SubmissionCount,
+}
+
+/// Multi-predicate filter for read queries over submissions.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubmissionFilter {
+    /// Optional authority filter.
+    pub authority: Option<RegulatoryAuthority>,
+    /// Optional submission status filter.
+    pub status: Option<ReportStatus>,
+    /// Optional report id filter.
+    pub report_id: Option<BytesN<32>>,
+    /// Only include submissions submitted at or after this timestamp.
+    pub min_submitted_at: Option<u64>,
+    /// Only include submissions submitted before this timestamp.
+    pub max_submitted_at: Option<u64>,
+}
+
+impl Default for SubmissionFilter {
+    fn default() -> Self {
+        SubmissionFilter {
+            authority: None,
+            status: None,
+            report_id: None,
+            min_submitted_at: None,
+            max_submitted_at: None,
+        }
+    }
+}
+
+/// Cursor-based pagination result.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubmissionPage {
+    /// Matching submissions for this page (at most `limit`).
+    pub items: Vec<RegulatorySubmission>,
+    /// Next starting index to continue pagination, or `None` when exhausted.
+    pub next_cursor: Option<u32>,
+}
+
+/// Store a submission and append it to the ordered index.
+pub fn store_submission(env: &Env, submission: &RegulatorySubmission) {
+    let sub_key = SubmissionTrackerKey::Submission(submission.id.clone());
+    env.storage().persistent().set(&sub_key, submission);
+
+    let count: u32 = env
+        .storage()
+        .persistent()
+        .get(&SubmissionTrackerKey::SubmissionCount)
+        .unwrap_or(0);
+    env.storage()
+        .persistent()
+        .set(&SubmissionTrackerKey::SubmissionIndex(count), &submission.id.clone());
+    env.storage()
+        .persistent()
+        .set(&SubmissionTrackerKey::SubmissionCount, &(count + 1));
+}
+
+/// Retrieve a submission by id.
+pub fn get_submission(env: &Env, id: &BytesN<32>) -> Option<RegulatorySubmission> {
+    env.storage()
+        .persistent()
+        .get(&SubmissionTrackerKey::Submission(id.clone()))
+}
+
+/// Store an acknowledgment receipt.
+pub fn store_receipt(env: &Env, receipt: &SubmissionAcknowledgment) {
+    let key = SubmissionTrackerKey::Receipt(receipt.id.clone());
+    env.storage().persistent().set(&key, receipt);
+}
+
+/// Retrieve an acknowledgment receipt by id.
+pub fn get_receipt(env: &Env, id: &BytesN<32>) -> Option<SubmissionAcknowledgment> {
+    env.storage()
+        .persistent()
+        .get(&SubmissionTrackerKey::Receipt(id.clone()))
+}
+
+/// Get the current (last consumed) nonce for a submitter.
+pub fn get_nonce(env: &Env, submitter: &Address) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&SubmissionTrackerKey::Nonce(submitter.clone()))
+        .unwrap_or(0)
+}
+
+/// Atomically increment and return the next nonce for a submitter.
+/// Rejects replay when the supplied `expected` nonce does not match the
+/// stored one, providing idempotent submission handling.
+pub fn increment_nonce(
+    env: &Env,
+    submitter: &Address,
+    expected: u64,
+) -> Result<u64, ReportingError> {
+    let current = get_nonce(env, submitter);
+    if current != expected {
+        return Err(ReportingError::NonceTooLow);
+    }
+    let next = current.checked_add(1).ok_or(ReportingError::NonceExhausted)?;
+    env.storage()
+        .persistent()
+        .set(&SubmissionTrackerKey::Nonce(submitter.clone()), &next);
+    Ok(next)
+}
+
+/// Return `true` when `submission` matches every predicate set in `filter`.
+fn matches_filter(_env: &Env, submission: &RegulatorySubmission, filter: &SubmissionFilter) -> bool {
+    if let Some(status) = filter.status {
+        if submission.status != status {
+            return false;
+        }
+    }
+    if let Some(report_id) = filter.report_id {
+        if submission.report_id != *report_id {
+            return false;
+        }
+    }
+    if let Some(min_submitted_at) = filter.min_submitted_at {
+        if submission.submitted_at < min_submitted_at {
+            return false;
+        }
+    }
+    if let Some(max_submitted_at) = filter.max_submitted_at {
+        if submission.submitted_at >= max_submitted_at {
+            return false;
+        }
+    }
+    true
+}
+
+/// Cursor-based, filtered paginated read over submissions.
+///
+/// At most `limit` index entries are scanned per call, bounding storage reads
+/// and CPU cost. `cursor` is the starting index (0-based); `next_cursor` in
+/// the result is the index to resume from, or `None` when no more entries
+/// remain.
+pub fn list_submissions(
+    env: &Env,
+    filter: &SubmissionFilter,
+    cursor: u32,
+    limit: u32,
+) -> SubmissionPage {
+    let count: u32 = env
+        .storage()
+        .persistent()
+        .get(&SubmissionTrackerKey::SubmissionCount)
+        .unwrap_or(0);
+
+    let start = cursor.min(count);
+    let scan_cap = limit.min(SUBMISSION_PAGE_SCAN_CAP);
+    let mut end = start.saturating_add(scan_cap);
+    if end > count {
+        end = count;
+    }
+
+    let mut items = Vec::new(env);
+    let mut i = start;
+    while i < end && items.len() as u32 < limit {
+        let id: BytesN<32> = env
+            .storage()
+            .persistent()
+            .get(&SubmissionTrackerKey::SubmissionIndex(i))
+            .unwrap_or_else(|| BytesN::from_array(env, &[0u8; 32]));
+        let key = SubmissionTrackerKey::Submission(id.clone());
+        if let Some(submission) = env.storage().persistent().get::<_, RegulatorySubmission>(&key) {
+            if matches_filter(env, &submission, filter) {
+                items.push_back(submission);
+            }
+        }
+        i += 1;
+    }
+
+    let next_cursor = if end < count { Some(end) } else { None };
+
+    SubmissionPage {
+        items,
+        next_cursor,
+    }
+}
+
+/// Bump the TTL of a submission so it is not reclaimed by rent/expiry.
+/// Returns the ledger sequence the key was extended to.
+pub fn bump_submission_ttl(env: &Env, id: &BytesN<32>, threshold: u32, expires_to: u32) -> u32 {
+    let key = SubmissionTrackerKey::Submission(id.clone());
+    env.storage().persistent().extend_ttl(&key, threshold, expires_to)
+}
+
+/// Bump the TTL of an acknowledgment receipt.
+pub fn bump_receipt_ttl(env: &Env, id: &BytesN<32>, threshold: u32, expires_to: u32) -> u32 {
+    let key = SubmissionTrackerKey::Receipt(id.clone());
+    env.storage().persistent().extend_ttl(&key, threshold, expires_to)
+}
+
+/// Bump the TTL of a submitter nonce record.
+pub fn bump_nonce_ttl(env: &Env, submitter: &Address, threshold: u32, expires_to: u32) -> u32 {
+    let key = SubmissionTrackerKey::Nonce(submitter.clone());
+    env.storage().persistent().extend_ttl(&key, threshold, expires_to)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

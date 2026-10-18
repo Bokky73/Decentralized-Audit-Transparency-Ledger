@@ -11,6 +11,9 @@ use soroban_sdk::{
     Vec, panic_with_error, log,
 };
 
+use crate::rbac::{RbacManager, RbacError};
+use crate::rbac::Role as RbacRole;
+
 // ============================================================================
 // Data Structures
 // ============================================================================
@@ -249,6 +252,17 @@ impl DAODisputeResolution {
             .instance()
             .set(&DisputeKey::AppealCounter, &0u32);
 
+        // Bootstrap the owner as the RBAC super-admin.
+        RbacManager::initialize_admin(&env, &owner);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "dao_dispute"),
+                Symbol::new(&env, "initialized"),
+            ),
+            (owner.clone()),
+        );
+
         log!(
             &env,
             "DAODisputeResolution: initialized - jurors_per_dispute={}",
@@ -267,8 +281,11 @@ impl DAODisputeResolution {
         description: String,
         evidence_uri: String,
         stake_amount: u128,
-    ) -> u32 {
+    ) -> Result<u32, RbacError> {
         let plaintiff = env.invoker();
+
+        // Granular RBAC: caller must be an active, non-suspended submitter (or higher).
+        RbacManager::require_active_submitter(&env, &plaintiff)?;
 
         if plaintiff == defendant {
             panic_with_error!(&env, DisputeError::InvalidParties);
@@ -303,6 +320,14 @@ impl DAODisputeResolution {
 
         // TODO: Collect stake from plaintiff
 
+        env.events().publish(
+            (
+                Symbol::new(&env, "dao_dispute"),
+                Symbol::new(&env, "dispute_filed"),
+            ),
+            (dispute_id, plaintiff.clone(), defendant.clone(), stake_amount),
+        );
+
         log!(
             &env,
             "DAODisputeResolution: dispute filed - id={}, plaintiff={}, defendant={}",
@@ -311,7 +336,7 @@ impl DAODisputeResolution {
             defendant
         );
 
-        dispute_id
+        Ok(dispute_id)
     }
 
     /// Submit evidence for a dispute
@@ -320,8 +345,12 @@ impl DAODisputeResolution {
         dispute_id: u32,
         evidence_uri: String,
         is_plaintiff: bool,
-    ) {
+    ) -> Result<(), RbacError> {
         let submitter = env.invoker();
+
+        // Granular RBAC: caller must be an active, non-suspended submitter (or higher).
+        RbacManager::require_active_submitter(&env, &submitter)?;
+
         let mut dispute = Self::get_dispute_or_panic(&env, dispute_id);
         let config = Self::get_config(&env);
         let current_ledger = env.ledger().sequence();
@@ -353,22 +382,39 @@ impl DAODisputeResolution {
             .instance()
             .set(&DisputeKey::Dispute(dispute_id), &dispute);
 
+        env.events().publish(
+            (
+                Symbol::new(&env, "dao_dispute"),
+                Symbol::new(&env, "evidence_submitted"),
+            ),
+            (dispute_id, submitter.clone(), is_plaintiff),
+        );
+
         log!(
             &env,
             "DAODisputeResolution: evidence submitted - dispute={}, submitter={}",
             dispute_id,
             submitter
         );
+
+        Ok(())
     }
 
     // ========================================================================
     // Juror Management & Voting
     // ========================================================================
 
-    /// Assign jurors to dispute (owner-only, off-chain random selection)
-    pub fn assign_jurors(env: Env, dispute_id: u32, jurors: Vec<Address>) {
-        let owner = Self::get_owner(&env);
-        owner.require_auth();
+    /// Assign jurors to dispute (admin-only, off-chain random selection)
+    pub fn assign_jurors(
+        env: Env,
+        dispute_id: u32,
+        jurors: Vec<Address>,
+    ) -> Result<(), RbacError> {
+        let caller = env.invoker();
+
+        // Granular RBAC: caller must have Admin role.
+        RbacManager::require_role_min(&env, &caller, RbacRole::Admin)?;
+        caller.require_auth();
 
         let config = Self::get_config(&env);
         let mut dispute = Self::get_dispute_or_panic(&env, dispute_id);
@@ -401,17 +447,35 @@ impl DAODisputeResolution {
             .instance()
             .set(&DisputeKey::Dispute(dispute_id), &dispute);
 
+        env.events().publish(
+            (
+                Symbol::new(&env, "dao_dispute"),
+                Symbol::new(&env, "jurors_assigned"),
+            ),
+            (dispute_id, config.jurors_per_dispute),
+        );
+
         log!(
             &env,
             "DAODisputeResolution: jurors assigned - dispute={}, count={}",
             dispute_id,
             config.jurors_per_dispute
         );
+
+        Ok(())
     }
 
     /// Cast vote as juror
-    pub fn cast_juror_vote(env: Env, dispute_id: u32, outcome: DisputeOutcome) {
+    pub fn cast_juror_vote(
+        env: Env,
+        dispute_id: u32,
+        outcome: DisputeOutcome,
+    ) -> Result<(), RbacError> {
         let juror = env.invoker();
+
+        // Granular RBAC: caller must be an active, non-suspended submitter (or higher).
+        RbacManager::require_active_submitter(&env, &juror)?;
+
         let mut dispute = Self::get_dispute_or_panic(&env, dispute_id);
         let current_ledger = env.ledger().sequence();
 
@@ -456,6 +520,14 @@ impl DAODisputeResolution {
             .instance()
             .set(&DisputeKey::Dispute(dispute_id), &dispute);
 
+        env.events().publish(
+            (
+                Symbol::new(&env, "dao_dispute"),
+                Symbol::new(&env, "vote_cast"),
+            ),
+            (dispute_id, juror.clone(), outcome as u32),
+        );
+
         log!(
             &env,
             "DAODisputeResolution: vote cast - dispute={}, juror={}, votes_cast={}",
@@ -463,12 +535,20 @@ impl DAODisputeResolution {
             juror,
             dispute.votes_cast
         );
+
+        Ok(())
     }
 
     /// Tally votes and finalize dispute
-    pub fn finalize_dispute(env: Env, dispute_id: u32) {
-        let owner = Self::get_owner(&env);
-        owner.require_auth();
+    pub fn finalize_dispute(
+        env: Env,
+        dispute_id: u32,
+    ) -> Result<(), RbacError> {
+        let caller = env.invoker();
+
+        // Granular RBAC: caller must have Admin role.
+        RbacManager::require_role_min(&env, &caller, RbacRole::Admin)?;
+        caller.require_auth();
 
         let mut dispute = Self::get_dispute_or_panic(&env, dispute_id);
         let config = Self::get_config(&env);
@@ -494,10 +574,11 @@ impl DAODisputeResolution {
         dispute.outcome = Some(outcome);
         dispute.status = DisputeStatus::Decided;
 
+        let mut slashed_amount: u128 = 0;
+
         // Apply slashing if defendant loses
         if outcome == DisputeOutcome::PlaintiffWins {
-            // TODO: Slash defendant
-            let slashed_amount = (dispute.stake_amount * config.slashing_bps as u128) / 10_000u128;
+            slashed_amount = (dispute.stake_amount * config.slashing_bps as u128) / 10_000u128;
             let current_total = env
                 .storage()
                 .instance()
@@ -529,12 +610,22 @@ impl DAODisputeResolution {
             .instance()
             .set(&DisputeKey::Dispute(dispute_id), &dispute);
 
+        env.events().publish(
+            (
+                Symbol::new(&env, "dao_dispute"),
+                Symbol::new(&env, "dispute_finalized"),
+            ),
+            (dispute_id, outcome as u32, slashed_amount),
+        );
+
         log!(
             &env,
             "DAODisputeResolution: dispute finalized - id={}, outcome={}",
             dispute_id,
             outcome as u32
         );
+
+        Ok(())
     }
 
     // ========================================================================
@@ -542,8 +633,16 @@ impl DAODisputeResolution {
     // ========================================================================
 
     /// File an appeal
-    pub fn file_appeal(env: Env, dispute_id: u32, reason: String) -> u32 {
+    pub fn file_appeal(
+        env: Env,
+        dispute_id: u32,
+        reason: String,
+    ) -> Result<u32, RbacError> {
         let appellant = env.invoker();
+
+        // Granular RBAC: caller must be an active, non-suspended submitter (or higher).
+        RbacManager::require_active_submitter(&env, &appellant)?;
+
         let dispute = Self::get_dispute_or_panic(&env, dispute_id);
 
         if dispute.status != DisputeStatus::Decided {
@@ -570,6 +669,14 @@ impl DAODisputeResolution {
             .instance()
             .set(&DisputeKey::Appeal(appeal_id), &appeal);
 
+        env.events().publish(
+            (
+                Symbol::new(&env, "dao_dispute"),
+                Symbol::new(&env, "appeal_filed"),
+            ),
+            (appeal_id, dispute_id, appellant.clone()),
+        );
+
         log!(
             &env,
             "DAODisputeResolution: appeal filed - id={}, dispute={}, appellant={}",
@@ -578,7 +685,7 @@ impl DAODisputeResolution {
             appellant
         );
 
-        appeal_id
+        Ok(appeal_id)
     }
 
     // ========================================================================
