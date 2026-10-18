@@ -21,6 +21,96 @@ from pathlib import Path
 
 TOMBSTONE_KEYWORDS = ("tombstone", "replaced by", "deprecated")
 
+# Storage tier classification keywords. A variant's doc comment may declare its
+# retention SLA tier explicitly (e.g. "Tier: Temporary"). When absent we fall
+# back to a heuristic based on the variant name.
+TIER_PERSISTENT = "Persistent"
+TIER_TEMPORARY = "Temporary"
+TIER_INSTANCE = "Instance"
+
+TIER_KEYWORDS = {
+    TIER_PERSISTENT: ("persistent", "permanent", "audit", "archive", "long-lived"),
+    TIER_TEMPORARY: ("temporary", "temp", "ephemeral", "transient", "short-lived"),
+    TIER_INSTANCE: ("instance", "singleton", "config", "admin", "global"),
+}
+
+# Heuristic name-based tier classification used when no explicit tier is
+# declared in the variant's doc comment.
+INSTANCE_NAME_HINTS = ("admin", "config", "owner", "initialized", "paused", "version")
+TEMPORARY_NAME_HINTS = ("nonce", "cache", "temp", "pending", "session", "proof")
+
+# Approximate XDR-encoded byte sizes for common primitive field types. These
+# are used to estimate the serialized footprint of each variant so the snapshot
+# can pin byte budgets for the storage-footprint regression assertions.
+PRIMITIVE_XDR_SIZES = {
+    "u8": 4,
+    "i8": 4,
+    "u16": 4,
+    "i16": 4,
+    "u32": 4,
+    "i32": 4,
+    "u64": 8,
+    "i64": 8,
+    "u128": 16,
+    "i128": 16,
+    "u256": 32,
+    "i256": 32,
+    "bool": 4,
+    "()": 0,
+}
+
+# Fixed XDR overhead: enum discriminant (4 bytes) plus a small per-record
+# envelope allowance for length prefixes / padding.
+XDR_ENUM_DISCRIMINANT_SIZE = 4
+XDR_RECORD_OVERHEAD = 4
+# Bytes charged for a variable-length field (String, Bytes, Vec, Address, ...).
+XDR_VARIABLE_FIELD_SIZE = 16
+
+
+def classify_tier(name: str, comment: str) -> str:
+    """Classify a variant into a storage tier based on comment then name."""
+    lowered_comment = comment.lower()
+    for tier, keywords in TIER_KEYWORDS.items():
+        if any(kw in lowered_comment for kw in keywords):
+            return tier
+
+    lowered_name = name.lower()
+    if any(hint in lowered_name for hint in INSTANCE_NAME_HINTS):
+        return TIER_INSTANCE
+    if any(hint in lowered_name for hint in TEMPORARY_NAME_HINTS):
+        return TIER_TEMPORARY
+    return TIER_PERSISTENT
+
+
+def estimate_field_size(field_type: str) -> int:
+    """Estimate the XDR-encoded byte size of a single field type."""
+    t = field_type.strip()
+    # Strip references and lifetimes.
+    t = re.sub(r"^&\s*(?:'[a-zA-Z_][a-zA-Z0-9_]*\s*)?", "", t)
+    t = t.strip()
+
+    if t in PRIMITIVE_XDR_SIZES:
+        return PRIMITIVE_XDR_SIZES[t]
+
+    # Option<T> / Vec<T> / tuples / generics: charge a variable-size allowance.
+    if t.startswith("Option<") or t.startswith("Vec<") or t.startswith("("):
+        return XDR_VARIABLE_FIELD_SIZE
+    if t.startswith("String") or t.startswith("Bytes") or t.startswith("Symbol"):
+        return XDR_VARIABLE_FIELD_SIZE
+    if t.startswith("Address") or t.startswith("BytesN"):
+        return XDR_VARIABLE_FIELD_SIZE
+
+    # Unknown / user-defined type: assume a conservative fixed allowance.
+    return XDR_VARIABLE_FIELD_SIZE
+
+
+def estimate_variant_size(variant: dict) -> int:
+    """Estimate the serialized XDR byte size of a variant record."""
+    size = XDR_ENUM_DISCRIMINANT_SIZE + XDR_RECORD_OVERHEAD
+    for field in variant.get("fields", []):
+        size += estimate_field_size(field.get("type") or "")
+    return size
+
 
 def get_git_commit() -> str:
     """Return the current HEAD SHA, or 'unknown' on failure."""
@@ -210,6 +300,9 @@ def parse_variants(block: str) -> list:
         # Determine tombstone status
         tombstone = any(kw in comment.lower() for kw in TOMBSTONE_KEYWORDS)
 
+        # Determine storage tier classification
+        tier = classify_tier(name, comment)
+
         # Match variant patterns:
         # Unit:   Name
         # Tuple:  Name(T1, T2, ...)
@@ -228,6 +321,10 @@ def parse_variants(block: str) -> list:
                 "fields": fields,
                 "tombstone": tombstone,
                 "comment": comment,
+                "tier": tier,
+                "serialized_bytes": estimate_variant_size({
+                    "fields": fields,
+                }),
             })
             ordinal += 1
             i = j
@@ -246,6 +343,10 @@ def parse_variants(block: str) -> list:
                 "fields": fields,
                 "tombstone": tombstone,
                 "comment": comment,
+                "tier": tier,
+                "serialized_bytes": estimate_variant_size({
+                    "fields": fields,
+                }),
             })
             ordinal += 1
             i = j
@@ -262,6 +363,8 @@ def parse_variants(block: str) -> list:
                 "fields": [],
                 "tombstone": tombstone,
                 "comment": comment,
+                "tier": tier,
+                "serialized_bytes": estimate_variant_size({"fields": []}),
             })
             ordinal += 1
             i = j
@@ -316,6 +419,20 @@ def main() -> int:
 
     tombstone_count = sum(1 for v in variants if v["tombstone"])
 
+    # Aggregate tier classification and byte budgets for the snapshot.
+    tier_counts = {
+        TIER_PERSISTENT: 0,
+        TIER_TEMPORARY: 0,
+        TIER_INSTANCE: 0,
+    }
+    for v in variants:
+        tier_counts[v["tier"]] = tier_counts.get(v["tier"], 0) + 1
+
+    total_serialized_bytes = sum(v["serialized_bytes"] for v in variants)
+    max_serialized_bytes = max(
+        (v["serialized_bytes"] for v in variants), default=0
+    )
+
     # Build snapshot
     snapshot = {
         "version": 1,
@@ -323,6 +440,9 @@ def main() -> int:
         "generated_at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         "git_commit": get_git_commit(),
         "rust_toolchain": get_rust_toolchain(),
+        "tier_counts": tier_counts,
+        "total_serialized_bytes": total_serialized_bytes,
+        "max_serialized_bytes": max_serialized_bytes,
         "variants": variants,
     }
 
@@ -337,6 +457,16 @@ def main() -> int:
 
     print(
         f"Extracted {len(variants)} variants ({tombstone_count} tombstones) → {output_path}"
+    )
+    print(
+        "Tier counts: "
+        f"Persistent={tier_counts[TIER_PERSISTENT]} "
+        f"Temporary={tier_counts[TIER_TEMPORARY]} "
+        f"Instance={tier_counts[TIER_INSTANCE]}"
+    )
+    print(
+        f"Serialized byte budget: total={total_serialized_bytes} "
+        f"max={max_serialized_bytes}"
     )
     return 0
 

@@ -170,6 +170,115 @@ pub struct CostSummary {
     pub timestamp: u64,
 }
 
+// ── Pagination & Filtering ──────────────────────────────────────────────
+
+/// Hard cap on the number of items returned by any single paginated query.
+pub const MAX_PAGE_LIMIT: u32 = 100;
+
+/// Opaque cursor token wrapping a stable ordering key.
+///
+/// The key is `(timestamp, insertion_index)` which is deterministic and
+/// survives ledger upgrades and archival restores because it is derived
+/// from persisted record fields rather than transient storage layout.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PageCursor {
+    pub timestamp: u64,
+    pub index: u32,
+}
+
+/// Requested page size, clamped to `MAX_PAGE_LIMIT`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PageLimit {
+    pub limit: u32,
+}
+
+impl PageLimit {
+    /// Build a page limit, clamping to the hard cap.
+    pub fn new(limit: u32) -> Self {
+        let clamped = if limit == 0 {
+            1
+        } else if limit > MAX_PAGE_LIMIT {
+            MAX_PAGE_LIMIT
+        } else {
+            limit
+        };
+        PageLimit { limit: clamped }
+    }
+
+    /// Effective (clamped) limit.
+    pub fn effective(&self) -> u32 {
+        if self.limit == 0 {
+            1
+        } else if self.limit > MAX_PAGE_LIMIT {
+            MAX_PAGE_LIMIT
+        } else {
+            self.limit
+        }
+    }
+}
+
+/// Status filter for records carrying a status enum.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StatusFilter {
+    Any,
+    Pending,
+    Approved,
+    Resolved,
+}
+
+/// Multi-predicate filter applied to collection queries.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FinOpsFilter {
+    /// Inclusive lower bound on ledger timestamp (None = unbounded).
+    pub start_timestamp: Option<u64>,
+    /// Inclusive upper bound on ledger timestamp (None = unbounded).
+    pub end_timestamp: Option<u64>,
+    /// Optional status predicate.
+    pub status: StatusFilter,
+    /// Optional submitter address predicate.
+    pub submitter: Option<Address>,
+}
+
+impl FinOpsFilter {
+    /// An unfiltered filter matching every record.
+    pub fn none() -> Self {
+        FinOpsFilter {
+            start_timestamp: None,
+            end_timestamp: None,
+            status: StatusFilter::Any,
+            submitter: None,
+        }
+    }
+
+    /// Returns true when `timestamp` falls within the configured range.
+    pub fn matches_timestamp(&self, timestamp: u64) -> bool {
+        if let Some(start) = self.start_timestamp {
+            if timestamp < start {
+                return false;
+            }
+        }
+        if let Some(end) = self.end_timestamp {
+            if timestamp > end {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// A single page of results with a deterministic continuation token.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<PageCursor>,
+    pub total: u32,
+}
+
 // ── Storage Keys ────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -442,6 +551,93 @@ pub fn get_center_allocations(env: Env, cost_center_id: BytesN<32>) -> Vec<Bytes
         .persistent()
         .get(&DataKey::CenterAllocations(cost_center_id.clone()))
         .unwrap_or_else(|| Vec::new(&env))
+}
+
+/// Paginated, filtered query over the allocations of a cost center.
+///
+/// Ordering is deterministic: records are ordered by `(timestamp, index)`
+/// where `index` is the position in the persisted allocation list. The
+/// cursor encodes the last returned key so traversal is stable across
+/// ledger upgrades and archival restores.
+pub fn get_center_allocations_page(
+    env: Env,
+    cost_center_id: BytesN<32>,
+    cursor: Option<PageCursor>,
+    limit: PageLimit,
+    filter: FinOpsFilter,
+) -> Page<BytesN<32>> {
+    let ids: Vec<BytesN<32>> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::CenterAllocations(cost_center_id.clone()))
+        .unwrap_or_else(|| Vec::new(&env));
+
+    let page_limit = limit.effective();
+    let mut items = Vec::new(&env);
+    let mut total = 0u32;
+    let mut last_key: Option<PageCursor> = None;
+    let mut emitted = 0u32;
+
+    let len = ids.len();
+    for i in 0..len {
+        let id = ids.get(i).unwrap();
+        let alloc: CostAllocation = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::CostAllocation(id.clone()))
+        {
+            Some(a) => a,
+            None => continue,
+        };
+
+        // Apply filter predicates.
+        if !filter.matches_timestamp(alloc.timestamp) {
+            continue;
+        }
+        if let Some(submitter) = filter.submitter.clone() {
+            if alloc.submitted_by != submitter {
+                continue;
+            }
+        }
+        if filter.status != StatusFilter::Any {
+            // Allocations have no status field; only `Any` matches.
+            continue;
+        }
+
+        total += 1;
+
+        let key = PageCursor {
+            timestamp: alloc.timestamp,
+            index: i,
+        };
+
+        // Skip records at or before the cursor.
+        if let Some(c) = cursor.clone() {
+            if key.timestamp < c.timestamp
+                || (key.timestamp == c.timestamp && key.index <= c.index)
+            {
+                continue;
+            }
+        }
+
+        if emitted < page_limit {
+            items.push_back(id);
+            emitted += 1;
+            last_key = Some(key);
+        }
+    }
+
+    let next_cursor = if emitted == page_limit && total > emitted {
+        last_key
+    } else {
+        None
+    };
+
+    Page {
+        items,
+        next_cursor,
+        total,
+    }
 }
 
 // ── Chargeback / Showback ───────────────────────────────────────────────
@@ -780,6 +976,90 @@ pub fn detect_anomalies(env: Env, caller: Address, resource_id: BytesN<32>) -> V
     anomalies
 }
 
+/// Paginated, filtered anomaly detection query.
+///
+/// Deterministic ordering by `(timestamp, index)` where `index` is the
+/// monotonic insertion index of the anomaly record.
+pub fn detect_anomalies_page(
+    env: Env,
+    caller: Address,
+    resource_id: BytesN<32>,
+    cursor: Option<PageCursor>,
+    limit: PageLimit,
+    filter: FinOpsFilter,
+) -> Page<BytesN<32>> {
+    caller.require_auth();
+
+    let count: u32 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::AnomalyCount)
+        .unwrap_or(0u32);
+
+    let page_limit = limit.effective();
+    let mut items = Vec::new(&env);
+    let mut total = 0u32;
+    let mut last_key: Option<PageCursor> = None;
+    let mut emitted = 0u32;
+
+    for i in 0..count {
+        let key = DataKey::CostAnomaly(BytesN::from_array(&env, &u32_key(i.to_le_bytes())));
+        let anomaly: CostAnomaly = match env.storage().persistent().get(&key) {
+            Some(a) => a,
+            None => continue,
+        };
+
+        if anomaly.resource_id != resource_id || anomaly.resolved || anomaly.severity < 2 {
+            continue;
+        }
+
+        if !filter.matches_timestamp(anomaly.timestamp) {
+            continue;
+        }
+        if filter.status != StatusFilter::Any {
+            // Anomalies have no status enum; only `Any` matches.
+            continue;
+        }
+        if filter.submitter.is_some() {
+            // Anomalies carry no submitter; a submitter filter excludes all.
+            continue;
+        }
+
+        total += 1;
+
+        let cursor_key = PageCursor {
+            timestamp: anomaly.timestamp,
+            index: i,
+        };
+
+        if let Some(c) = cursor.clone() {
+            if cursor_key.timestamp < c.timestamp
+                || (cursor_key.timestamp == c.timestamp && cursor_key.index <= c.index)
+            {
+                continue;
+            }
+        }
+
+        if emitted < page_limit {
+            items.push_back(anomaly.id);
+            emitted += 1;
+            last_key = Some(cursor_key);
+        }
+    }
+
+    let next_cursor = if emitted == page_limit && total > emitted {
+        last_key
+    } else {
+        None
+    };
+
+    Page {
+        items,
+        next_cursor,
+        total,
+    }
+}
+
 /// Resolve anomaly
 pub fn resolve_anomaly(env: Env, caller: Address, id: BytesN<32>) {
     caller.require_auth();
@@ -934,6 +1214,27 @@ pub fn get_budget(env: Env, id: BytesN<32>) -> Budget {
 
 /// Generate cost dashboard summary
 pub fn generate_dashboard(env: Env) -> CostDashboard {
+    generate_dashboard_page(env, None, PageLimit::new(MAX_PAGE_LIMIT), FinOpsFilter::none()).dashboard
+}
+
+/// Paginated dashboard generation.
+///
+/// The dashboard is a single aggregate record, so the page always contains
+/// at most one item. The cursor is used to bound the number of storage
+/// reads performed per invocation: each call scans at most `limit` records
+/// per collection, resuming from the cursor on the next call.
+pub fn generate_dashboard_page(
+    env: Env,
+    cursor: Option<PageCursor>,
+    limit: PageLimit,
+    filter: FinOpsFilter,
+) -> Page<CostDashboard> {
+    let page_limit = limit.effective();
+    let start_index = match cursor.clone() {
+        Some(c) => c.index,
+        None => 0,
+    };
+
     let mut total_cost = 0u64;
     let cost_by_category = Vec::new(&env);
     let cost_by_team = Vec::new(&env);
@@ -948,9 +1249,26 @@ pub fn generate_dashboard(env: Env) -> CostDashboard {
         .get(&DataKey::AllocationCount)
         .unwrap_or(0u32);
 
-    for i in 0..allocation_count {
+    let alloc_end = if start_index + page_limit > allocation_count {
+        allocation_count
+    } else {
+        start_index + page_limit
+    };
+
+    for i in start_index..alloc_end {
         let key = DataKey::CostAllocation(BytesN::from_array(&env, &u32_key(i.to_le_bytes())));
         if let Some(alloc) = env.storage().persistent().get::<_, CostAllocation>(&key) {
+            if !filter.matches_timestamp(alloc.timestamp) {
+                continue;
+            }
+            if let Some(submitter) = filter.submitter.clone() {
+                if alloc.submitted_by != submitter {
+                    continue;
+                }
+            }
+            if filter.status != StatusFilter::Any {
+                continue;
+            }
             total_cost += alloc.amount;
         }
     }
@@ -961,10 +1279,25 @@ pub fn generate_dashboard(env: Env) -> CostDashboard {
         .get(&DataKey::AnomalyCount)
         .unwrap_or(0u32);
 
-    for i in 0..anomaly_count {
+    let anomaly_end = if start_index + page_limit > anomaly_count {
+        anomaly_count
+    } else {
+        start_index + page_limit
+    };
+
+    for i in start_index..anomaly_end {
         let key = DataKey::CostAnomaly(BytesN::from_array(&env, &u32_key(i.to_le_bytes())));
         if let Some(anomaly) = env.storage().persistent().get::<_, CostAnomaly>(&key) {
             if !anomaly.resolved {
+                if !filter.matches_timestamp(anomaly.timestamp) {
+                    continue;
+                }
+                if filter.status != StatusFilter::Any {
+                    continue;
+                }
+                if filter.submitter.is_some() {
+                    continue;
+                }
                 active_anomalies += 1;
             }
         }
@@ -976,9 +1309,24 @@ pub fn generate_dashboard(env: Env) -> CostDashboard {
         .get(&DataKey::RightsizingCount)
         .unwrap_or(0u32);
 
-    for i in 0..rightsizing_count {
+    let rightsizing_end = if start_index + page_limit > rightsizing_count {
+        rightsizing_count
+    } else {
+        start_index + page_limit
+    };
+
+    for i in start_index..rightsizing_end {
         let key = DataKey::RightsizingRec(BytesN::from_array(&env, &u32_key(i.to_le_bytes())));
         if let Some(rec) = env.storage().persistent().get::<_, RightsizingRecommendation>(&key) {
+            if !filter.matches_timestamp(rec.timestamp) {
+                continue;
+            }
+            if filter.status != StatusFilter::Any {
+                continue;
+            }
+            if filter.submitter.is_some() {
+                continue;
+            }
             total_savings += rec.monthly_savings;
         }
     }
@@ -1008,7 +1356,7 @@ pub fn generate_dashboard(env: Env) -> CostDashboard {
         budget_util /= budget_count;
     }
 
-    CostDashboard {
+    let dashboard = CostDashboard {
         total_cost,
         cost_by_category,
         cost_by_team,
@@ -1017,14 +1365,66 @@ pub fn generate_dashboard(env: Env) -> CostDashboard {
         active_anomalies,
         budget_utilization: budget_util,
         timestamp: env.ledger().timestamp(),
+    };
+
+    let max_count = if allocation_count > anomaly_count {
+        allocation_count
+    } else {
+        anomaly_count
+    };
+    let max_count = if max_count > rightsizing_count {
+        max_count
+    } else {
+        rightsizing_count
+    };
+
+    let next_cursor = if start_index + page_limit < max_count {
+        Some(PageCursor {
+            timestamp: env.ledger().timestamp(),
+            index: start_index + page_limit,
+        })
+    } else {
+        None
+    };
+
+    let mut items = Vec::new(&env);
+    items.push_back(dashboard);
+
+    Page {
+        items,
+        next_cursor,
+        total: 1,
     }
 }
 
 /// Generate cost summary for a period
 pub fn get_cost_summary(env: Env, period: Bytes) -> CostSummary {
+    get_cost_summary_page(env, period, None, PageLimit::new(MAX_PAGE_LIMIT), FinOpsFilter::none())
+        .items
+        .get(0)
+        .unwrap()
+}
+
+/// Paginated cost summary query.
+///
+/// Scans at most `limit` allocations per invocation, resuming from the
+/// cursor on subsequent calls. The summary is emitted on the first page;
+/// `next_cursor` is set while more allocations remain to be scanned.
+pub fn get_cost_summary_page(
+    env: Env,
+    period: Bytes,
+    cursor: Option<PageCursor>,
+    limit: PageLimit,
+    filter: FinOpsFilter,
+) -> Page<CostSummary> {
+    let page_limit = limit.effective();
+    let start_index = match cursor.clone() {
+        Some(c) => c.index,
+        None => 0,
+    };
+
     let mut total_cost = 0u64;
     let top_drivers = Vec::new(&env);
-    let mut forecasted = 0u64;
 
     let allocation_count: u32 = env
         .storage()
@@ -1032,26 +1432,64 @@ pub fn get_cost_summary(env: Env, period: Bytes) -> CostSummary {
         .get(&DataKey::AllocationCount)
         .unwrap_or(0u32);
 
-    for i in 0..allocation_count {
+    let end = if start_index + page_limit > allocation_count {
+        allocation_count
+    } else {
+        start_index + page_limit
+    };
+
+    for i in start_index..end {
         let key = DataKey::CostAllocation(BytesN::from_array(&env, &u32_key(i.to_le_bytes())));
         if let Some(alloc) = env.storage().persistent().get::<_, CostAllocation>(&key) {
-            if alloc.period == period {
-                total_cost += alloc.amount;
+            if alloc.period != period {
+                continue;
             }
+            if !filter.matches_timestamp(alloc.timestamp) {
+                continue;
+            }
+            if let Some(submitter) = filter.submitter.clone() {
+                if alloc.submitted_by != submitter {
+                    continue;
+                }
+            }
+            if filter.status != StatusFilter::Any {
+                continue;
+            }
+            total_cost += alloc.amount;
         }
     }
 
-    if total_cost > 0 {
-        forecasted = total_cost + (total_cost / 10);
-    }
+    let forecasted = if total_cost > 0 {
+        total_cost + (total_cost / 10)
+    } else {
+        0
+    };
 
-    CostSummary {
+    let summary = CostSummary {
         period,
         total_cost,
         forecasted_cost: forecasted,
         variance_pct: 0,
         top_cost_drivers: top_drivers,
         timestamp: env.ledger().timestamp(),
+    };
+
+    let next_cursor = if start_index + page_limit < allocation_count {
+        Some(PageCursor {
+            timestamp: env.ledger().timestamp(),
+            index: start_index + page_limit,
+        })
+    } else {
+        None
+    };
+
+    let mut items = Vec::new(&env);
+    items.push_back(summary);
+
+    Page {
+        items,
+        next_cursor,
+        total: 1,
     }
 }
 
@@ -1075,21 +1513,74 @@ pub fn get_allocation_count(env: Env) -> u32 {
 
 /// Get active anomaly count
 pub fn get_active_anomaly_count(env: Env) -> u32 {
+    get_active_anomaly_count_page(env, None, PageLimit::new(MAX_PAGE_LIMIT), FinOpsFilter::none()).total
+}
+
+/// Paginated active anomaly count query.
+///
+/// Scans at most `limit` anomaly records per invocation, resuming from the
+/// cursor on subsequent calls. `total` is the number of active anomalies
+/// observed in the scanned window; `next_cursor` is set while more records
+/// remain to be scanned.
+pub fn get_active_anomaly_count_page(
+    env: Env,
+    cursor: Option<PageCursor>,
+    limit: PageLimit,
+    filter: FinOpsFilter,
+) -> Page<u32> {
+    let page_limit = limit.effective();
+    let start_index = match cursor.clone() {
+        Some(c) => c.index,
+        None => 0,
+    };
+
     let count: u32 = env
         .storage()
         .persistent()
         .get(&DataKey::AnomalyCount)
         .unwrap_or(0u32);
 
+    let end = if start_index + page_limit > count {
+        count
+    } else {
+        start_index + page_limit
+    };
+
     let mut active = 0u32;
-    for i in 0..count {
+    for i in start_index..end {
         let key = DataKey::CostAnomaly(BytesN::from_array(&env, &u32_key(i.to_le_bytes())));
         if let Some(anomaly) = env.storage().persistent().get::<_, CostAnomaly>(&key) {
-            if !anomaly.resolved {
-                active += 1;
+            if anomaly.resolved {
+                continue;
             }
+            if !filter.matches_timestamp(anomaly.timestamp) {
+                continue;
+            }
+            if filter.status != StatusFilter::Any {
+                continue;
+            }
+            if filter.submitter.is_some() {
+                continue;
+            }
+            active += 1;
         }
     }
 
-    active
+    let next_cursor = if start_index + page_limit < count {
+        Some(PageCursor {
+            timestamp: env.ledger().timestamp(),
+            index: start_index + page_limit,
+        })
+    } else {
+        None
+    };
+
+    let mut items = Vec::new(&env);
+    items.push_back(active);
+
+    Page {
+        items,
+        next_cursor,
+        total: active,
+    }
 }

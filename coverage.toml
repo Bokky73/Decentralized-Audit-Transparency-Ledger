@@ -33,6 +33,10 @@ files = [
     # Property-based test drivers (proptest strategy declarations)
     "src/proptest.rs",
 
+    # Supply-chain invariant / chaos test modules (issue #873)
+    "src/supply_chain_invariants.rs",
+    "src/supply_chain_chaos_tests.rs",
+
     # Test modules — we measure *production* code coverage only
     "src/test.rs",
     "src/supply_chain_tests.rs",
@@ -132,8 +136,8 @@ description = "Audit trail for the reporting pipeline itself"
 [[module]]
 name = "supply_chain"
 path_prefix = "src/supply_chain.rs"
-line = 90.0
-branch = 90.0
+line = 92.0
+branch = 91.0
 description = "Product provenance, certifications, chain of custody — hardened against overflow and unbounded growth (issue #869)"
 
 # ─ Stablecoin reserve auditing ────────────────────────────────────────────────

@@ -16,6 +16,77 @@ from typing import Any, Dict, Generator, List, Optional, Sequence
 from .batch import BatchResult, BatchSubmitRequest, batch_get, batch_submit, batch_verify
 from .cache import CacheConfig, LRUCache
 from .models import Address, Event, EventId, EventType, Metadata, Page, ContractError, RPCError
+
+MAX_PAGE_LIMIT = 100
+"""Hard cap on the number of items returned by any paginated query."""
+
+
+def _encode_cursor(cursor: Optional[str]) -> Optional[str]:
+    """Normalise a cursor token for transport to the contract."""
+    if cursor is None:
+        return None
+    cursor = str(cursor)
+    return cursor or None
+
+
+def _normalise_limit(limit: int) -> int:
+    """Clamp a requested page size to the contract-enforced maximum."""
+    try:
+        value = int(limit)
+    except (TypeError, ValueError):
+        value = MAX_PAGE_LIMIT
+    if value < 1:
+        return 1
+    return min(value, MAX_PAGE_LIMIT)
+
+
+def _build_query_params(
+    *,
+    cursor: Optional[str] = None,
+    limit: int = MAX_PAGE_LIMIT,
+    from_timestamp: Optional[int] = None,
+    to_timestamp: Optional[int] = None,
+    status: Optional[Any] = None,
+    submitter: Optional[Address] = None,
+) -> Dict[str, Any]:
+    """Build the deterministic, filtered query parameter map.
+
+    Only non-``None`` filters are forwarded so the contract can apply its
+    default (unfiltered) behaviour for omitted predicates.
+    """
+    params: Dict[str, Any] = {"limit": _normalise_limit(limit)}
+    encoded_cursor = _encode_cursor(cursor)
+    if encoded_cursor is not None:
+        params["cursor"] = encoded_cursor
+    if from_timestamp is not None:
+        params["from_timestamp"] = int(from_timestamp)
+    if to_timestamp is not None:
+        params["to_timestamp"] = int(to_timestamp)
+    if status is not None:
+        params["status"] = status
+    if submitter is not None:
+        params["submitter"] = submitter
+    return params
+
+
+def _parse_page(result: Any) -> Page[Any]:
+    """Parse a contract page response into a :class:`Page`."""
+    if isinstance(result, Page):
+        return result
+    if isinstance(result, dict):
+        raw_items = result.get("items", [])
+        items = list(raw_items) if raw_items is not None else []
+        next_cursor = result.get("next_cursor")
+        return Page(
+            items=items,
+            total=result.get("total", len(items)),
+            offset=result.get("offset", 0),
+            limit=result.get("limit", len(items)),
+            next_cursor=next_cursor,
+        )
+    if isinstance(result, list):
+        return Page(items=list(result), total=len(result), offset=0, limit=len(result), next_cursor=None)
+    return Page(items=[], total=0, offset=0, limit=0, next_cursor=None)
 from .streaming import StreamConfig, stream_by_type, stream_events
 
 try:
@@ -210,6 +281,112 @@ class AuditLedgerClient:
         for idx in range(start, end):
             items.append(self.get_event_by_order(idx))
         return Page(items=items, total=total, offset=offset, limit=limit)
+
+    def query_finops(
+        self,
+        *,
+        cursor: Optional[str] = None,
+        limit: int = MAX_PAGE_LIMIT,
+        from_timestamp: Optional[int] = None,
+        to_timestamp: Optional[int] = None,
+        status: Optional[Any] = None,
+        submitter: Optional[Address] = None,
+    ) -> Page[Any]:
+        """Query FinOps tracker records with cursor pagination and filters.
+
+        Returns a :class:`Page` whose ``items`` are the matching records and
+        whose ``next_cursor`` is ``None`` once the final page is reached.
+        The page size is always clamped to :data:`MAX_PAGE_LIMIT` (100).
+        """
+        params = _build_query_params(
+            cursor=cursor,
+            limit=limit,
+            from_timestamp=from_timestamp,
+            to_timestamp=to_timestamp,
+            status=status,
+            submitter=submitter,
+        )
+        result = self._invoke("query_finops", params)
+        return _parse_page(result)
+
+    def query_cross_contract(
+        self,
+        *,
+        cursor: Optional[str] = None,
+        limit: int = MAX_PAGE_LIMIT,
+        from_timestamp: Optional[int] = None,
+        to_timestamp: Optional[int] = None,
+        status: Optional[Any] = None,
+        submitter: Optional[Address] = None,
+    ) -> Page[Any]:
+        """Query cross-contract audit batch records with pagination and filters.
+
+        Returns a :class:`Page` whose ``items`` are the matching records and
+        whose ``next_cursor`` is ``None`` once the final page is reached.
+        The page size is always clamped to :data:`MAX_PAGE_LIMIT` (100).
+        """
+        params = _build_query_params(
+            cursor=cursor,
+            limit=limit,
+            from_timestamp=from_timestamp,
+            to_timestamp=to_timestamp,
+            status=status,
+            submitter=submitter,
+        )
+        result = self._invoke("query_cross_contract", params)
+        return _parse_page(result)
+
+    def iter_finops(
+        self,
+        *,
+        limit: int = MAX_PAGE_LIMIT,
+        from_timestamp: Optional[int] = None,
+        to_timestamp: Optional[int] = None,
+        status: Optional[Any] = None,
+        submitter: Optional[Address] = None,
+    ) -> Generator[Any, None, None]:
+        """Yield every FinOps record across all pages, following the cursor."""
+        cursor: Optional[str] = None
+        while True:
+            page = self.query_finops(
+                cursor=cursor,
+                limit=limit,
+                from_timestamp=from_timestamp,
+                to_timestamp=to_timestamp,
+                status=status,
+                submitter=submitter,
+            )
+            for item in page.items:
+                yield item
+            if not page.next_cursor:
+                break
+            cursor = page.next_cursor
+
+    def iter_cross_contract(
+        self,
+        *,
+        limit: int = MAX_PAGE_LIMIT,
+        from_timestamp: Optional[int] = None,
+        to_timestamp: Optional[int] = None,
+        status: Optional[Any] = None,
+        submitter: Optional[Address] = None,
+    ) -> Generator[Any, None, None]:
+        """Yield every cross-contract record across all pages, following the cursor."""
+        cursor: Optional[str] = None
+        while True:
+            page = self.query_cross_contract(
+                cursor=cursor,
+                limit=limit,
+                from_timestamp=from_timestamp,
+                to_timestamp=to_timestamp,
+                status=status,
+                submitter=submitter,
+            )
+            for item in page.items:
+                yield item
+            if not page.next_cursor:
+                break
+            cursor = page.next_cursor
 
     def health_check(self) -> Dict[str, Any]:
         status: Dict[str, Any] = {

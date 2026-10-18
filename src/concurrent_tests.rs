@@ -185,6 +185,18 @@ fn feed_actors(env: &Env, count: u32) -> Vec<Address> {
     addrs
 }
 
+// ---------------------------------------------------------------------------
+// Multi-actor concurrent access scenarios for `src/supply_chain.rs`
+// ---------------------------------------------------------------------------
+
+fn supply_chain_actors(env: &Env, count: u32) -> Vec<Address> {
+    let mut addrs = Vec::new(env);
+    for _ in 0..count {
+        addrs.push_back(Address::generate(env));
+    }
+    addrs
+}
+
 fn feed_payload(env: &Env, actor_index: u32, sequence: u32) -> Bytes {
     Bytes::from_slice(
         env,
@@ -477,6 +489,125 @@ fn concurrent_reconciliation_queue_drain_and_enqueue() {
     for vid in drained.iter() {
         assert!(!seen.contains(&vid));
         seen.push_back(vid);
+    }
+}
+
+fn register_supply_chain_product(
+    env: &Env,
+    client: &AuditLedgerClient,
+    brand: &Address,
+    product_id: u32,
+) {
+    client.register_product(
+        brand,
+        &symbol_short!("coffee"),
+        &Bytes::from_slice(env, &[product_id as u8, (product_id >> 8) as u8]),
+        &Bytes::from_slice(env, &[0xAA, 0xBB]),
+    );
+}
+
+#[test]
+fn concurrent_supply_chain_custody_transfers_interleaved() {
+    let (env, _owner, client) = create_ledger(600);
+    let actors = supply_chain_actors(&env, 4);
+
+    env.mock_all_auths();
+    register_supply_chain_product(&env, &client, &actors.get(0).unwrap(), 1);
+
+    // Interleave custody handoffs across multiple actors. Each transfer must
+    // preserve the hash-chain linkage to the previous custody record.
+    for round in 0..50u32 {
+        let from = actors.get(round % 4).unwrap();
+        let to = actors.get((round + 1) % 4).unwrap();
+        client.transfer_custody(
+            &from,
+            &to,
+            &Bytes::from_slice(&env, &[round as u8, (round >> 8) as u8]),
+            &None,
+        );
+    }
+
+    let history = client.get_custody_history();
+    assert_eq!(history.len(), 50);
+
+    // Verify hash-chain integrity: each record links to the prior hash.
+    let mut previous_hash: Option<Bytes> = None;
+    for i in 0..history.len() {
+        let record = history.get(i).unwrap();
+        if let Some(prev) = previous_hash {
+            assert_eq!(record.previous_hash, prev);
+        }
+        previous_hash = Some(record.record_hash.clone());
+    }
+}
+
+#[test]
+fn concurrent_supply_chain_certification_and_reports() {
+    let (env, _owner, client) = create_ledger(600);
+    let actors = supply_chain_actors(&env, 3);
+
+    env.mock_all_auths();
+    register_supply_chain_product(&env, &client, &actors.get(0).unwrap(), 7);
+
+    for round in 0..40u32 {
+        let actor = actors.get(round % 3).unwrap();
+        if round % 2 == 0 {
+            client.submit_certification(
+                &actor,
+                &symbol_short!("organic"),
+                &Bytes::from_slice(&env, &[round as u8]),
+            );
+        } else {
+            client.submit_labor_report(
+                &actor,
+                &Bytes::from_slice(&env, &[round as u8, 0x01]),
+            );
+            client.submit_environmental_report(
+                &actor,
+                &Bytes::from_slice(&env, &[round as u8, 0x02]),
+            );
+        }
+    }
+
+    // State consistency: certifications and reports remain independently
+    // queryable and counts match the interleaved submissions.
+    assert_eq!(client.certification_count(), 20);
+    assert_eq!(client.labor_report_count(), 20);
+    assert_eq!(client.environmental_report_count(), 20);
+}
+
+#[test]
+fn concurrent_supply_chain_brand_and_product_registration() {
+    let (env, _owner, client) = create_ledger(600);
+    let brands = supply_chain_actors(&env, 3);
+
+    env.mock_all_auths();
+    for brand_index in 0..3u32 {
+        let brand = brands.get(brand_index).unwrap();
+        client.register_brand(
+            &brand,
+            &Bytes::from_slice(&env, &[brand_index as u8]),
+        );
+    }
+
+    // Concurrent product registration across brands with interleaved ids.
+    for product_id in 0..30u32 {
+        let brand = brands.get(product_id % 3).unwrap();
+        register_supply_chain_product(&env, &client, &brand, product_id);
+    }
+
+    assert_eq!(client.brand_count(), 3);
+    assert_eq!(client.product_count(), 30);
+
+    // Hash-chain integrity must hold after concurrent registrations.
+    let history = client.get_custody_history();
+    let mut previous_hash: Option<Bytes> = None;
+    for i in 0..history.len() {
+        let record = history.get(i).unwrap();
+        if let Some(prev) = previous_hash {
+            assert_eq!(record.previous_hash, prev);
+        }
+        previous_hash = Some(record.record_hash.clone());
     }
 }
 

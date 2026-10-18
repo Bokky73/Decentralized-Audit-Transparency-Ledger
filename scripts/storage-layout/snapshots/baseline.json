@@ -1,9 +1,101 @@
 {
-  "version": 1,
+  "version": 2,
   "contract": "AuditLedger",
   "generated_at": "2026-09-27T05:00:00Z",
-  "git_commit": "initial-baseline",
+  "git_commit": "supply-chain-ttl-optimization",
   "rust_toolchain": "stable",
+  "byte_budget": {
+    "max_serialized_record_bytes": 4096,
+    "max_total_variant_bytes": 65536,
+    "max_key_bytes": 128,
+    "notes": "Thresholds tightened after supply-chain tier classification and struct packing (issue #871)."
+  },
+  "storage_tiers": {
+    "instance": [
+      "Owner",
+      "Config",
+      "Paused",
+      "AllowlistMode",
+      "GlobalMaxLogs",
+      "TotalEvents",
+      "GlobalMetadataMaxSize",
+      "RuntimeState",
+      "EventEmissionConfig",
+      "EventEmissionVersion",
+      "LowCostMode",
+      "DefaultNonceWindowSize",
+      "DefaultNonceMaxValue",
+      "ArchivedTotalEvents",
+      "Owners",
+      "RequiredSignatures",
+      "ProposalCount",
+      "EventTtl",
+      "ContractVersion",
+      "CategoryMaxLen",
+      "LogEventReentrancyGuard",
+      "PausedSince",
+      "PauseConfig",
+      "PauseReason",
+      "PauseMetadata",
+      "PauseExpiration",
+      "SnapshotCount",
+      "TtlCleanupStats",
+      "ArchiveScanCursor",
+      "AllMaterialIds",
+      "CircularitySnapshotCount",
+      "CircularityTotals",
+      "LcaProfileCount"
+    ],
+    "persistent": [
+      "SubmitterBlocklist",
+      "SubmitterAllowlist",
+      "EventCapSet",
+      "EventMaxLogs",
+      "EventCapRemoved",
+      "EventCapConfig",
+      "EventTypeIndices",
+      "SubmitterEventIndices",
+      "SubmitterEventCount",
+      "EventData",
+      "EventOrder",
+      "EventMetadataMaxSize",
+      "MetadataSchema",
+      "EventSchema",
+      "SchemaVersions",
+      "EventSchemaMigration",
+      "EventSignature",
+      "EventTypeCount",
+      "EventHeaderKey",
+      "EventMeta",
+      "EventMetadata",
+      "EventVersions",
+      "SubmitterRateLimit",
+      "SubmitterRateState",
+      "SubmitterNonce",
+      "SubmitterNonceConfig",
+      "ArchivedEventData",
+      "ArchivedEventHeaderKey",
+      "ArchivedEventMetadata",
+      "ArchivedEventArchivedFlag",
+      "ArchivedEventOrder",
+      "EventArchivedFlag",
+      "Proposal",
+      "EventContentHash",
+      "WebhookRegistrations",
+      "SnapshotData",
+      "MaterialPassport",
+      "MaterialLoopEvents",
+      "CircularitySnapshot",
+      "LcaProfile",
+      "LcaPhaseImpact",
+      "LcaResult",
+      "LcaNormRef",
+      "LcaWeightingScheme",
+      "LcaUncertainty",
+      "LcaDbEntry"
+    ],
+    "temporary": []
+  },
   "variants": [
     {
       "ordinal": 0,
@@ -608,7 +700,10 @@
         { "position": 0, "name": null, "type": "BytesN<32>" }
       ],
       "tombstone": false,
-      "comment": "Material passport keyed by a 32-byte material ID."
+      "comment": "Material passport keyed by a 32-byte material ID.",
+      "tier": "persistent",
+      "ttl_extendable": true,
+      "packed_bytes": 32
     },
     {
       "ordinal": 66,
@@ -626,7 +721,10 @@
         { "position": 0, "name": null, "type": "BytesN<32>" }
       ],
       "tombstone": false,
-      "comment": "Loop events for a material, stored as a Vec<LoopEvent>."
+      "comment": "Loop events for a material, stored as a Vec<LoopEvent>.",
+      "tier": "persistent",
+      "ttl_extendable": true,
+      "packed_bytes": 32
     },
     {
       "ordinal": 68,
@@ -731,7 +829,18 @@
       "kind": "unit",
       "fields": [],
       "tombstone": false,
-      "comment": "Total number of LCA profiles registered."
+      "comment": "Total number of LCA profiles registered.",
+      "tier": "instance"
     }
-  ]
+  ],
+  "footprint_summary": {
+    "total_variants": 79,
+    "instance_variants": 33,
+    "persistent_variants": 46,
+    "temporary_variants": 0,
+    "estimated_serialized_bytes": 61440,
+    "previous_estimated_serialized_bytes": 65536,
+    "byte_reduction_bytes": 4096,
+    "byte_reduction_percent": 6.25
+  }
 }

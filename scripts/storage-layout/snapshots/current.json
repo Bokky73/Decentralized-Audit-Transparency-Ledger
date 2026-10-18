@@ -732,6 +732,124 @@
       "fields": [],
       "tombstone": false,
       "comment": "Total number of LCA profiles registered."
+    },
+    {
+      "ordinal": 79,
+      "name": "SupplyChainCustody",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "BytesN<32>" }
+      ],
+      "tombstone": false,
+      "tier": "Persistent",
+      "comment": "Custody handoff record keyed by a 32-byte custody ID. Persistent tier: archival-critical audit record, TTL extended via extend_ttl helper."
+    },
+    {
+      "ordinal": 80,
+      "name": "SupplyChainCustodyCount",
+      "kind": "unit",
+      "fields": [],
+      "tombstone": false,
+      "tier": "Instance",
+      "comment": "Monotonic count of custody records. Instance tier: small, hot, contract-lifetime state."
+    },
+    {
+      "ordinal": 81,
+      "name": "SupplyChainCustodyIndex",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "u32" }
+      ],
+      "tombstone": false,
+      "tier": "Persistent",
+      "comment": "Sequential index → custody ID for ordered retrieval. Persistent tier."
+    },
+    {
+      "ordinal": 82,
+      "name": "SupplyChainCustodyByMaterial",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "BytesN<32>" }
+      ],
+      "tombstone": false,
+      "tier": "Persistent",
+      "comment": "Packed Bytes of u32 custody indices (4 bytes each, LE) for a material ID. Persistent tier."
+    },
+    {
+      "ordinal": 83,
+      "name": "SupplyChainCustodyByHolder",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "Address" }
+      ],
+      "tombstone": false,
+      "tier": "Persistent",
+      "comment": "Packed Bytes of u32 custody indices (4 bytes each, LE) for a holder address. Persistent tier."
+    },
+    {
+      "ordinal": 84,
+      "name": "SupplyChainCustodyStatus",
+      "kind": "tuple",
+      "fields": [
+        { "position": 0, "name": null, "type": "BytesN<32>" }
+      ],
+      "tombstone": false,
+      "tier": "Temporary",
+      "comment": "Transient per-custody status cache (packed u8 discriminant). Temporary tier: rebuilt on demand, no archival SLA."
+    },
+    {
+      "ordinal": 85,
+      "name": "SupplyChainCustodyTtl",
+      "kind": "unit",
+      "fields": [],
+      "tombstone": false,
+      "tier": "Instance",
+      "comment": "TTL configuration for supply-chain custody records. Instance tier."
+    },
+    {
+      "ordinal": 86,
+      "name": "SupplyChainCustodyTtlStats",
+      "kind": "unit",
+      "fields": [],
+      "tombstone": false,
+      "tier": "Instance",
+      "comment": "Cumulative TTL extension statistics for custody records. Instance tier."
+    }
+  ],
+  "tier_summary": {
+    "Persistent": [
+      "SupplyChainCustody",
+      "SupplyChainCustodyIndex",
+      "SupplyChainCustodyByMaterial",
+      "SupplyChainCustodyByHolder"
+    ],
+    "Temporary": [
+      "SupplyChainCustodyStatus"
+    ],
+    "Instance": [
+      "SupplyChainCustodyCount",
+      "SupplyChainCustodyTtl",
+      "SupplyChainCustodyTtlStats"
+    ]
+  },
+  "packed_encodings": [
+    {
+      "name": "SupplyChainCustodyStatus",
+      "encoding": "u8",
+      "bytes": 1,
+      "comment": "Enum discriminant packed to a single byte instead of a full XDR enum."
+    },
+    {
+      "name": "SupplyChainCustodyByMaterial",
+      "encoding": "packed_u32_le",
+      "bytes_per_entry": 4,
+      "comment": "Custody indices packed as little-endian u32 chunks."
+    },
+    {
+      "name": "SupplyChainCustodyByHolder",
+      "encoding": "packed_u32_le",
+      "bytes_per_entry": 4,
+      "comment": "Custody indices packed as little-endian u32 chunks."
     }
   ]
 }

@@ -368,14 +368,72 @@ K-framework claim label, and the current verification status.
 
 ---
 
+## Supply Chain Custody Properties (`src/supply_chain.rs`)
+
+The `SupplyChain` module tracks multi-tier custody handoffs for physical goods.
+Each custody record is a `CustodyEvent` appended to a per-item hash chain, and
+each batch of handoffs is committed with a Merkle root over the batch leaves.
+The properties below define the state-machine invariants that the property-based
+and concurrency test suites (`src/proptest.rs`, `src/concurrent_tests.rs`) must
+uphold under duplicate submissions, out-of-order timestamps, mid-batch
+rollbacks, and concurrent multi-actor access.
+
+### SC-01 — Custody Chain Continuity
+
+| Field | Value |
+|-------|-------|
+| **Category** | safety |
+| **Description** | For every item, the custody chain is a single unbroken sequence. Each `CustodyEvent` at position `n > 0` has `prev_hash == events[n-1].event_hash`, and the genesis custody event has `prev_hash == [0x00; 32]`. No handoff may reference a predecessor that was never committed, and no committed event may be orphaned by a later rollback. |
+| **CVL Rule** | `custodyChainContinuity` |
+| **K Claim** | `SC-SPEC-1` |
+| **Status** | 🔶 Partial (bounded depth; property tests cover 1,000+ sequences) |
+
+---
+
+### SC-02 — Custody Timestamp Monotonicity
+
+| Field | Value |
+|-------|-------|
+| **Category** | safety |
+| **Description** | Within a single item's custody chain, timestamps are strictly non-decreasing: for all `n > 0`, `events[n].timestamp >= events[n-1].timestamp`. Out-of-order submissions are rejected with `TimestampOutOfOrder` and never mutate stored state. Duplicate submissions of an already-committed handoff are idempotent and leave the chain, counters, and Merkle root unchanged. |
+| **CVL Rule** | `custodyTimestampMonotone`, `duplicateHandoffIdempotent` |
+| **K Claim** | `SC-SPEC-2` |
+| **Status** | 🔶 Partial (bounded depth; property tests cover 1,000+ sequences) |
+
+---
+
+### SC-03 — Certification Validity
+
+| Field | Value |
+|-------|-------|
+| **Category** | safety |
+| **Description** | A custody handoff is only accepted when the receiving actor holds a valid, unexpired certification for the item's tier. An expired or revoked certification causes the handoff to revert with `CertificationInvalid` and leaves the chain unchanged. Certification validity is checked against the RBAC/governance state in `src/rbac.rs` and cannot be bypassed by a concurrent writer. |
+| **CVL Rule** | `certificationValidityEnforced` |
+| **K Claim** | `SC-SPEC-3` |
+| **Status** | 🔶 Partial (bounded depth; RBAC integration pending K rules) |
+
+---
+
+### SC-04 — Merkle Root and Hash-Chain Integrity After Recovery
+
+| Field | Value |
+|-------|-------|
+| **Category** | safety |
+| **Description** | After any simulated recovery — including mid-batch rollbacks, replayed batches, and reordered event delivery — the recomputed Merkle root over the committed batch leaves equals the stored root, and every Merkle inclusion proof for a committed leaf verifies against that root. The per-item hash chain remains intact (see SC-01). A partially applied batch must never leave a stored root that does not match its leaves. |
+| **CVL Rule** | `merkleRootMatchesLeaves`, `merkleProofVerifiesAfterRecovery` |
+| **K Claim** | `SC-SPEC-4` |
+| **Status** | 🔶 Partial (bounded depth; property tests cover 1,000+ sequences) |
+
+---
+
 ## Verification Coverage Summary
 
 | Category | Total | Verified ✅ | Partial 🔶 | Pending 🔲 |
 |----------|-------|------------|-----------|-----------|
-| safety | 23 | 9 | 4 | 10 |
+| safety | 27 | 9 | 8 | 10 |
 | access-control | 5 | 5 | 0 | 0 |
 | liveness | 1 | 0 | 1 | 0 |
-| **Total** | **29** | **14** | **5** | **10** |
+| **Total** | **33** | **14** | **9** | **10** |
 
 ---
 

@@ -521,4 +521,329 @@ mod tests {
 
         assert_eq!(get_active_anomaly_count(env), 1);
     }
+
+    // ── Pagination Edge-Case Tests ─────────────────────────────────────
+
+    fn seed_allocations(env: &Env, caller: &Address, count: u32) -> BytesN<32> {
+        let cc_id = register_cost_center(
+            env.clone(),
+            caller.clone(),
+            sample_name(env),
+            1_000_000,
+            Symbol::new(env, "USD"),
+        );
+
+        for i in 0..count {
+            allocate_cost(
+                env.clone(),
+                caller.clone(),
+                cc_id.clone(),
+                Symbol::new(env, "compute"),
+                100 + i as i128,
+                Symbol::new(env, "USD"),
+                sample_period(env),
+                bytes!(env, b"pagination-seed"),
+            );
+        }
+
+        cc_id
+    }
+
+    #[test]
+    fn test_page_limit_cap_enforced() {
+        // The page limit cap must be 100; anything above is rejected or clamped.
+        assert_eq!(MAX_PAGE_LIMIT, 100);
+
+        let env = create_test_env();
+        let caller = Address::random(&env);
+        seed_allocations(&env, &caller, 3);
+
+        let query = AllocationQuery {
+            cursor: None,
+            limit: 500,
+            filter: QueryFilter::default(),
+        };
+
+        let page = query_allocations(env.clone(), query);
+        assert!(page.items.len() <= MAX_PAGE_LIMIT);
+    }
+
+    #[test]
+    fn test_empty_result_set() {
+        let env = create_test_env();
+
+        let query = AllocationQuery {
+            cursor: None,
+            limit: 10,
+            filter: QueryFilter::default(),
+        };
+
+        let page = query_allocations(env, query);
+        assert_eq!(page.items.len(), 0);
+        assert!(page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn test_single_item_page() {
+        let env = create_test_env();
+        let caller = Address::random(&env);
+        seed_allocations(&env, &caller, 5);
+
+        let query = AllocationQuery {
+            cursor: None,
+            limit: 1,
+            filter: QueryFilter::default(),
+        };
+
+        let page = query_allocations(env.clone(), query);
+        assert_eq!(page.items.len(), 1);
+        assert!(page.next_cursor.is_some());
+
+        // Second single-item page must not repeat the first item.
+        let query2 = AllocationQuery {
+            cursor: page.next_cursor.clone(),
+            limit: 1,
+            filter: QueryFilter::default(),
+        };
+        let page2 = query_allocations(env, query2);
+        assert_eq!(page2.items.len(), 1);
+        assert_ne!(page.items.get(0).unwrap().id, page2.items.get(0).unwrap().id);
+    }
+
+    #[test]
+    fn test_cursor_past_end_returns_empty_page() {
+        let env = create_test_env();
+        let caller = Address::random(&env);
+        seed_allocations(&env, &caller, 3);
+
+        // Walk to the end to obtain a terminal cursor.
+        let mut cursor: Option<PageCursor> = None;
+        loop {
+            let query = AllocationQuery {
+                cursor: cursor.clone(),
+                limit: 2,
+                filter: QueryFilter::default(),
+            };
+            let page = query_allocations(env.clone(), query);
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        // A cursor past the end must yield an empty page with no next_cursor.
+        let query = AllocationQuery {
+            cursor,
+            limit: 2,
+            filter: QueryFilter::default(),
+        };
+        let page = query_allocations(env, query);
+        assert_eq!(page.items.len(), 0);
+        assert!(page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn test_full_multi_page_traversal_reconstructs_collection() {
+        let env = create_test_env();
+        let caller = Address::random(&env);
+        let total = 25u32;
+        seed_allocations(&env, &caller, total);
+
+        let mut seen: Vec<BytesN<32>> = Vec::new();
+        let mut cursor: Option<PageCursor> = None;
+
+        loop {
+            let query = AllocationQuery {
+                cursor: cursor.clone(),
+                limit: 7,
+                filter: QueryFilter::default(),
+            };
+            let page = query_allocations(env.clone(), query);
+
+            for item in page.items.iter() {
+                seen.push(item.id.clone());
+            }
+
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+
+        assert_eq!(seen.len() as u32, total);
+
+        // No duplicates across pages.
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), seen.len());
+    }
+
+    #[test]
+    fn test_filter_by_timestamp_range() {
+        let env = create_test_env();
+        let caller = Address::random(&env);
+        seed_allocations(&env, &caller, 5);
+
+        let filter = QueryFilter {
+            from_timestamp: Some(0),
+            to_timestamp: Some(u64::MAX),
+            status: None,
+            submitter: None,
+        };
+
+        let query = AllocationQuery {
+            cursor: None,
+            limit: 100,
+            filter,
+        };
+        let page = query_allocations(env.clone(), query);
+        assert_eq!(page.items.len(), 5);
+
+        // A range that excludes everything.
+        let filter_none = QueryFilter {
+            from_timestamp: Some(u64::MAX - 1),
+            to_timestamp: Some(u64::MAX),
+            status: None,
+            submitter: None,
+        };
+        let query_none = AllocationQuery {
+            cursor: None,
+            limit: 100,
+            filter: filter_none,
+        };
+        let page_none = query_allocations(env, query_none);
+        assert_eq!(page_none.items.len(), 0);
+    }
+
+    #[test]
+    fn test_filter_by_status_enum() {
+        let env = create_test_env();
+        let caller = Address::random(&env);
+        seed_allocations(&env, &caller, 4);
+
+        let filter = QueryFilter {
+            from_timestamp: None,
+            to_timestamp: None,
+            status: Some(AllocationStatus::Active),
+            submitter: None,
+        };
+        let query = AllocationQuery {
+            cursor: None,
+            limit: 100,
+            filter,
+        };
+        let page = query_allocations(env.clone(), query);
+        assert_eq!(page.items.len(), 4);
+
+        let filter_other = QueryFilter {
+            from_timestamp: None,
+            to_timestamp: None,
+            status: Some(AllocationStatus::Archived),
+            submitter: None,
+        };
+        let query_other = AllocationQuery {
+            cursor: None,
+            limit: 100,
+            filter: filter_other,
+        };
+        let page_other = query_allocations(env, query_other);
+        assert_eq!(page_other.items.len(), 0);
+    }
+
+    #[test]
+    fn test_filter_by_submitter_address() {
+        let env = create_test_env();
+        let caller = Address::random(&env);
+        seed_allocations(&env, &caller, 3);
+
+        let filter = QueryFilter {
+            from_timestamp: None,
+            to_timestamp: None,
+            status: None,
+            submitter: Some(caller.clone()),
+        };
+        let query = AllocationQuery {
+            cursor: None,
+            limit: 100,
+            filter,
+        };
+        let page = query_allocations(env.clone(), query);
+        assert_eq!(page.items.len(), 3);
+
+        let other = Address::random(&env);
+        let filter_other = QueryFilter {
+            from_timestamp: None,
+            to_timestamp: None,
+            status: None,
+            submitter: Some(other),
+        };
+        let query_other = AllocationQuery {
+            cursor: None,
+            limit: 100,
+            filter: filter_other,
+        };
+        let page_other = query_allocations(env, query_other);
+        assert_eq!(page_other.items.len(), 0);
+    }
+
+    #[test]
+    fn test_combined_filters() {
+        let env = create_test_env();
+        let caller = Address::random(&env);
+        seed_allocations(&env, &caller, 6);
+
+        let filter = QueryFilter {
+            from_timestamp: Some(0),
+            to_timestamp: Some(u64::MAX),
+            status: Some(AllocationStatus::Active),
+            submitter: Some(caller.clone()),
+        };
+        let query = AllocationQuery {
+            cursor: None,
+            limit: 100,
+            filter,
+        };
+        let page = query_allocations(env.clone(), query);
+        assert_eq!(page.items.len(), 6);
+
+        // Combining an impossible predicate yields nothing.
+        let filter_impossible = QueryFilter {
+            from_timestamp: Some(0),
+            to_timestamp: Some(u64::MAX),
+            status: Some(AllocationStatus::Active),
+            submitter: Some(Address::random(&env)),
+        };
+        let query_impossible = AllocationQuery {
+            cursor: None,
+            limit: 100,
+            filter: filter_impossible,
+        };
+        let page_impossible = query_allocations(env, query_impossible);
+        assert_eq!(page_impossible.items.len(), 0);
+    }
+
+    #[test]
+    fn test_deterministic_ordering_stable_across_queries() {
+        let env = create_test_env();
+        let caller = Address::random(&env);
+        seed_allocations(&env, &caller, 10);
+
+        let query = AllocationQuery {
+            cursor: None,
+            limit: 100,
+            filter: QueryFilter::default(),
+        };
+
+        let first = query_allocations(env.clone(), query.clone());
+        let second = query_allocations(env.clone(), query.clone());
+        let third = query_allocations(env, query);
+
+        let ids_first: Vec<BytesN<32>> = first.items.iter().map(|i| i.id.clone()).collect();
+        let ids_second: Vec<BytesN<32>> = second.items.iter().map(|i| i.id.clone()).collect();
+        let ids_third: Vec<BytesN<32>> = third.items.iter().map(|i| i.id.clone()).collect();
+
+        assert_eq!(ids_first, ids_second);
+        assert_eq!(ids_second, ids_third);
+    }
 }
