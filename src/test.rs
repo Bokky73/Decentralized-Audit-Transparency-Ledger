@@ -98,8 +98,7 @@ fn test_event_ids_are_bytes32() {
     let payment = symbol_short!("payment");
 
     env.mock_all_auths();
-    let id: BytesN<32> =
-        client.log_event(&submitter, &payment, &Bytes::from_slice(&env, b"tx1"));
+    let id: BytesN<32> = client.log_event(&submitter, &payment, &Bytes::from_slice(&env, b"tx1"));
     // ID is a 32-byte value (BytesN<32> by type)
     assert_eq!(id.len(), 32);
 }
@@ -156,7 +155,11 @@ fn test_verify_integrity_single_event() {
     let submitter = Address::generate(&env);
 
     env.mock_all_auths();
-    client.log_event(&submitter, &symbol_short!("p"), &Bytes::from_slice(&env, b"x"));
+    client.log_event(
+        &submitter,
+        &symbol_short!("p"),
+        &Bytes::from_slice(&env, b"x"),
+    );
 
     assert!(client.verify_integrity());
 }
@@ -494,10 +497,18 @@ fn test_metadata_size_cap_owner_can_set_global() {
     env.mock_all_auths();
     client.set_metadata_max_size(&owner, &50);
     // 50 bytes → passes
-    let id = client.log_event(&submitter, &symbol_short!("t"), &Bytes::from_slice(&env, &[0u8; 50]));
+    let id = client.log_event(
+        &submitter,
+        &symbol_short!("t"),
+        &Bytes::from_slice(&env, &[0u8; 50]),
+    );
     assert_eq!(client.total_events(), 1);
     // 51 bytes → rejected
-    let r2 = client.try_log_event(&submitter, &symbol_short!("t"), &Bytes::from_slice(&env, &[0u8; 51]));
+    let r2 = client.try_log_event(
+        &submitter,
+        &symbol_short!("t"),
+        &Bytes::from_slice(&env, &[0u8; 51]),
+    );
     assert!(r2.is_err());
 }
 
@@ -524,7 +535,11 @@ fn test_metadata_size_cap_per_type_overrides_global() {
     let id = client.log_event(&submitter, &lett, &Bytes::from_slice(&env, &[0u8; 50]));
     assert_eq!(client.total_events(), 1);
     // type "z" uses global cap of 10 → 11 fails
-    let r2 = client.try_log_event(&submitter, &symbol_short!("z"), &Bytes::from_slice(&env, &[0u8; 11]));
+    let r2 = client.try_log_event(
+        &submitter,
+        &symbol_short!("z"),
+        &Bytes::from_slice(&env, &[0u8; 11]),
+    );
     assert!(r2.is_err());
 }
 
@@ -579,7 +594,11 @@ fn test_get_event_signature_returns_none_for_unsigned() {
     let submitter = Address::generate(&env);
 
     env.mock_all_auths();
-    let id = client.log_event(&submitter, &symbol_short!("p"), &Bytes::from_slice(&env, b"x"));
+    let id = client.log_event(
+        &submitter,
+        &symbol_short!("p"),
+        &Bytes::from_slice(&env, b"x"),
+    );
     let stored = client.get_event_signature(&id);
     assert!(stored.is_none());
 }
@@ -637,9 +656,9 @@ fn test_low_cost_mode_logs_without_indexing() {
 
     env.mock_all_auths();
     let id = client.log_event(&submitter, &payment, &meta);
-    
+
     assert_eq!(client.total_events(), 1);
-    
+
     // In low-cost mode, event_count should panic (no try_event_count method)
     // This is expected behavior - event_count will panic with ContractError::CapNotSet
 }
@@ -655,11 +674,11 @@ fn test_low_cost_mode_emission() {
 
     env.mock_all_auths();
     let id = client.log_event(&submitter, &payment, &meta);
-    
+
     let contract_events = env.events().all();
     let events = contract_events.events();
     assert!(!events.is_empty());
-    
+
     // With low-cost mode and index-only emission, events are emitted
 }
 
@@ -703,11 +722,11 @@ fn test_event_emission_index_only() {
 
     env.mock_all_auths();
     let id = client.log_event(&submitter, &payment, &meta);
-    
+
     let contract_events = env.events().all();
     let events = contract_events.events();
     assert!(!events.is_empty());
-    
+
     // With index-only mode, events are emitted (data format verified by contract logic)
 }
 
@@ -722,7 +741,7 @@ fn test_get_event_metadata() {
 
     env.mock_all_auths();
     let id = client.log_event(&submitter, &payment, &meta);
-    
+
     let retrieved_meta = client.get_event_metadata(&id);
     assert_eq!(retrieved_meta, meta);
 }
@@ -737,7 +756,7 @@ fn test_get_event_header() {
     env.ledger().set_timestamp(1000);
     env.mock_all_auths();
     let id = client.log_event(&submitter, &payment, &meta);
-    
+
     let header = client.get_event_header(&id);
     // EventHeader contains only index/timestamp/event_type/submitter — no metadata (issue #56)
     assert_eq!(header.index, 0);

@@ -1,9 +1,17 @@
 #![no_std]
 
+pub mod capacity_planning;
+pub mod rbac;
+
 use soroban_sdk::{
     bytes, contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Bytes,
     BytesN, Env, Symbol, Vec,
 };
+
+use crate::capacity_planning::{
+    CapacityForecast, ShardCapacityConfig, ShardTelemetrySample, ThresholdAlert,
+};
+use crate::rbac::{RbacAuditEvent, RbacError, Role};
 
 /// Default maximum metadata size (1 KB). Used when no explicit cap is set.
 const DEFAULT_MAX_METADATA_SIZE: u32 = 1024;
@@ -218,18 +226,11 @@ impl AuditLedger {
         };
 
         // --- issue #70: compute content-addressed event ID ---
-        let event_id = Self::compute_event_id(
-            &env,
-            &submitter,
-            &event_type,
-            &metadata,
-            timestamp,
-            index,
-        );
+        let event_id =
+            Self::compute_event_id(&env, &submitter, &event_type, &metadata, timestamp, index);
 
         // --- issue #66: compute this event's hash (includes prev_hash) ---
-        let event_hash =
-            Self::compute_event_hash(&env, &event_id, &prev_hash, index, timestamp);
+        let event_hash = Self::compute_event_hash(&env, &event_id, &prev_hash, index, timestamp);
 
         let evt = Event {
             index,
@@ -278,13 +279,17 @@ impl AuditLedger {
                 .instance()
                 .set(&DataKey::EventTypeCount(event_type.clone()), &count);
         }
-        
+
         if Self::effective_low_cost_mode(&env) {
             // In low-cost mode, emit only index to save gas
             let emission_mode = Self::effective_event_emission_mode(&env);
             if emission_mode == 1 {
                 env.events().publish(
-                    (Symbol::new(&env, "log_event"), event_type.clone(), submitter.clone()),
+                    (
+                        Symbol::new(&env, "log_event"),
+                        event_type.clone(),
+                        submitter.clone(),
+                    ),
                     (index,),
                 );
             }
@@ -342,7 +347,7 @@ impl AuditLedger {
                 panic_with_error!(&env, ContractError::EventDoesNotExist);
             })
     }
-    
+
     /// Retrieve only the event metadata (optimized for low-fee environments, issue #57).
     pub fn get_event_metadata(env: Env, id: BytesN<32>) -> Bytes {
         env.storage()
@@ -352,7 +357,7 @@ impl AuditLedger {
                 panic_with_error!(&env, ContractError::EventDoesNotExist);
             })
     }
-    
+
     /// Retrieve only the event header (index, timestamp, event_type, submitter) — no metadata (issue #56).
     pub fn get_event_header(env: Env, id: BytesN<32>) -> EventHeader {
         env.storage()
@@ -453,7 +458,7 @@ impl AuditLedger {
         env.storage()
             .instance()
             .set(&DataKey::EventMaxLogs(event_type.clone()), &new_max);
-        
+
         if !Self::effective_low_cost_mode(&env) {
             if !env
                 .storage()
@@ -489,7 +494,7 @@ impl AuditLedger {
         env.storage()
             .instance()
             .remove(&DataKey::EventTypeCount(event_type.clone()));
-        
+
         if Self::effective_low_cost_mode(&env) {
             env.storage()
                 .instance()
@@ -548,7 +553,8 @@ impl AuditLedger {
         caller.require_auth();
         Self::require_owner(&env, &caller);
         env.storage().instance().set(&DataKey::Paused, &true);
-        env.events().publish((Symbol::new(&env, "contract_paused"),), (caller,));
+        env.events()
+            .publish((Symbol::new(&env, "contract_paused"),), (caller,));
     }
 
     /// Unpause write operations. Owner-only.
@@ -565,7 +571,7 @@ impl AuditLedger {
     pub fn get_metadata_max_size(env: Env, event_type: Symbol) -> u32 {
         Self::effective_metadata_max_size(&env, &event_type)
     }
-    
+
     /// Set the event emission mode (owner-only).
     /// 0 = full metadata emission (default, backward compatible)
     /// 1 = index-only emission (issue #60)
@@ -581,12 +587,12 @@ impl AuditLedger {
             .instance()
             .set(&DataKey::EventEmissionVersion, &2u32);
     }
-    
+
     /// Get the current event emission mode.
     pub fn get_event_emission_mode(env: Env) -> u32 {
         Self::effective_event_emission_mode(&env)
     }
-    
+
     /// Enable/disable low-cost mode (owner-only).
     /// Low-cost mode sacrifices some features (e.g., per-type indexing) for lower per-event cost.
     /// This is useful for environments with strict fee budgets (issue #57).
@@ -597,7 +603,7 @@ impl AuditLedger {
             .instance()
             .set(&DataKey::LowCostMode, &enabled);
     }
-    
+
     /// Check if low-cost mode is enabled.
     pub fn is_low_cost_mode(env: Env) -> bool {
         env.storage()
@@ -667,13 +673,11 @@ impl AuditLedger {
             }
         }
 
-        env.events().publish(
-            (Symbol::new(&env, "storage_compacted"),),
-            (removed,),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "storage_compacted"),), (removed,));
         removed
     }
-    
+
     fn effective_low_cost_mode(env: &Env) -> bool {
         env.storage()
             .instance()
@@ -700,7 +704,7 @@ impl AuditLedger {
         }
         DEFAULT_MAX_METADATA_SIZE
     }
-    
+
     fn effective_event_emission_mode(env: &Env) -> u32 {
         env.storage()
             .instance()
@@ -728,9 +732,10 @@ impl AuditLedger {
             panic_with_error!(&env, ContractError::InvalidSignature);
         }
         let event_id = Self::log_event(env.clone(), submitter, event_type, metadata.clone());
-        env.storage()
-            .instance()
-            .set(&DataKey::EventSignature(event_id.clone()), &signature_payload);
+        env.storage().instance().set(
+            &DataKey::EventSignature(event_id.clone()),
+            &signature_payload,
+        );
         event_id
     }
 
@@ -740,6 +745,134 @@ impl AuditLedger {
         env.storage()
             .instance()
             .get(&DataKey::EventSignature(event_id))
+    }
+
+    // ── issue #900: RBAC & capacity planning entrypoints ────────────────────
+
+    /// Grant an RBAC role and bind a submitter DID to `target` (requires `Role::Admin`).
+    pub fn grant_role(
+        env: Env,
+        caller: Address,
+        target: Address,
+        role: Role,
+        submitter_did: Bytes,
+    ) -> Result<(), RbacError> {
+        rbac::grant_role(&env, &caller, &target, role, submitter_did)
+    }
+
+    /// Revoke an assigned RBAC role from `target` (requires `Role::Admin`).
+    pub fn revoke_role(env: Env, caller: Address, target: Address) -> Result<(), RbacError> {
+        rbac::revoke_role(&env, &caller, &target)
+    }
+
+    /// Suspend a submitter address and its bound DID URI (requires `Role::Admin`).
+    pub fn suspend_submitter_did(
+        env: Env,
+        caller: Address,
+        target: Address,
+    ) -> Result<(), RbacError> {
+        rbac::suspend_submitter_did(&env, &caller, &target)
+    }
+
+    /// Reinstate a suspended submitter address and its bound DID URI (requires `Role::Admin`).
+    pub fn reinstate_submitter_did(
+        env: Env,
+        caller: Address,
+        target: Address,
+    ) -> Result<(), RbacError> {
+        rbac::reinstate_submitter_did(&env, &caller, &target)
+    }
+
+    /// Configure capacity warning and critical thresholds for `shard_id` (requires `Role::CapacityPlanner`+).
+    pub fn configure_shard_threshold(
+        env: Env,
+        caller: Address,
+        shard_id: u32,
+        max_capacity_events: u64,
+        warning_bps: u32,
+        critical_bps: u32,
+    ) -> Result<ShardCapacityConfig, RbacError> {
+        capacity_planning::configure_shard_threshold(
+            &env,
+            &caller,
+            shard_id,
+            max_capacity_events,
+            warning_bps,
+            critical_bps,
+        )
+    }
+
+    /// Record shard utilization telemetry and evaluate threshold alerts (requires `Role::Operator`+).
+    pub fn record_shard_utilization(
+        env: Env,
+        caller: Address,
+        shard_id: u32,
+        used_events: u64,
+        growth_rate_per_hour: u64,
+    ) -> Result<ShardTelemetrySample, RbacError> {
+        capacity_planning::record_shard_utilization(
+            &env,
+            &caller,
+            shard_id,
+            used_events,
+            growth_rate_per_hour,
+        )
+    }
+
+    /// Generate a shard capacity forecast over `horizon_hours` (requires `Role::CapacityPlanner`+).
+    pub fn generate_capacity_forecast(
+        env: Env,
+        caller: Address,
+        shard_id: u32,
+        horizon_hours: u64,
+    ) -> Result<CapacityForecast, RbacError> {
+        capacity_planning::generate_capacity_forecast(&env, &caller, shard_id, horizon_hours)
+    }
+
+    /// Acknowledge an open capacity threshold alert (requires `Role::Operator`+).
+    pub fn acknowledge_threshold_alert(
+        env: Env,
+        caller: Address,
+        alert_id: u32,
+    ) -> Result<ThresholdAlert, RbacError> {
+        capacity_planning::acknowledge_threshold_alert(&env, &caller, alert_id)
+    }
+
+    /// Resolve a capacity threshold alert with a resolution digest (requires `Role::Auditor`+).
+    pub fn resolve_threshold_alert(
+        env: Env,
+        caller: Address,
+        alert_id: u32,
+        resolution_digest: BytesN<32>,
+    ) -> Result<ThresholdAlert, RbacError> {
+        capacity_planning::resolve_threshold_alert(&env, &caller, alert_id, resolution_digest)
+    }
+
+    /// Override shard capacity ceiling and emergency freeze status (requires `Role::Auditor`+).
+    pub fn override_shard_capacity_policy(
+        env: Env,
+        caller: Address,
+        shard_id: u32,
+        new_max_capacity_events: u64,
+        emergency_frozen: bool,
+    ) -> Result<ShardCapacityConfig, RbacError> {
+        capacity_planning::override_shard_capacity_policy(
+            &env,
+            &caller,
+            shard_id,
+            new_max_capacity_events,
+            emergency_frozen,
+        )
+    }
+
+    /// Return the total count of RBAC audit trail records.
+    pub fn rbac_audit_trail_count(env: Env) -> u32 {
+        rbac::audit_trail_count(&env)
+    }
+
+    /// Retrieve an RBAC audit trail record by sequence number.
+    pub fn get_rbac_audit_event(env: Env, sequence: u32) -> Option<RbacAuditEvent> {
+        rbac::get_audit_trail_event(&env, sequence)
     }
 
     // ── Private helpers ─────────────────────────────────────────────────────
@@ -841,10 +974,11 @@ impl AuditLedger {
         let mut expected_prev: BytesN<32> = if from == 0 {
             BytesN::from_array(env, &[0u8; 32])
         } else {
-            let prev_id: BytesN<32> = match env.storage().instance().get(&DataKey::EventOrder(from - 1)) {
-                Some(v) => v,
-                None => return false,
-            };
+            let prev_id: BytesN<32> =
+                match env.storage().instance().get(&DataKey::EventOrder(from - 1)) {
+                    Some(v) => v,
+                    None => return false,
+                };
             let prev_evt: Event = match env.storage().instance().get(&DataKey::EventData(prev_id)) {
                 Some(v) => v,
                 None => return false,
@@ -852,15 +986,15 @@ impl AuditLedger {
             prev_evt.event_hash
         };
         for i in from..to {
-            let id: BytesN<32> = match env
-                .storage()
-                .instance()
-                .get(&DataKey::EventOrder(i))
-            {
+            let id: BytesN<32> = match env.storage().instance().get(&DataKey::EventOrder(i)) {
                 Some(v) => v,
                 None => return false,
             };
-            let evt: Event = match env.storage().instance().get(&DataKey::EventData(id.clone())) {
+            let evt: Event = match env
+                .storage()
+                .instance()
+                .get(&DataKey::EventData(id.clone()))
+            {
                 Some(v) => v,
                 None => return false,
             };
@@ -868,8 +1002,7 @@ impl AuditLedger {
                 return false;
             }
             // Re-derive and compare the stored hash
-            let recomputed =
-                Self::compute_event_hash(env, &id, &evt.prev_hash, i, evt.timestamp);
+            let recomputed = Self::compute_event_hash(env, &id, &evt.prev_hash, i, evt.timestamp);
             if evt.event_hash != recomputed {
                 return false;
             }
@@ -907,5 +1040,7 @@ impl AuditLedger {
     }
 }
 
+#[cfg(test)]
+mod rbac_gating_tests;
 #[cfg(test)]
 mod test;
