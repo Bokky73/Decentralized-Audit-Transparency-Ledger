@@ -896,20 +896,21 @@ pub fn process_consensus(
 
     // Build canonical price and chain it against the previous archival entry.
     let count_key = OracleDataKey::PriceHistoryCount(asset_id.clone());
-    let count: u32 = env
+    let history_count: u32 = env
         .storage()
         .persistent()
         .get(&count_key)
         .unwrap_or(0);
 
-    let history_index: u64 = count as u64;    let prev_hash: BytesN<32> = if count == 0 {
+    let history_index_u64: u64 = history_count as u64;
+    let prev_hash: BytesN<32> = if history_count == 0 {
         BytesN::from_array(env, &[0u8; 32])
     } else {
         env.storage()
             .persistent()
             .get::<_, CanonicalPrice>(&OracleDataKey::PriceHistoryEntry(
                 asset_id.clone(),
-                (count - 1) as u64,
+                (history_count - 1) as u64,
             ))
             .map(|prev| prev.chain_hash)
             .unwrap_or_else(|| BytesN::from_array(env, &[0u8; 32]))
@@ -924,7 +925,7 @@ pub fn process_consensus(
         consensus_at: now,
         oldest_observation: oldest,
         result: ConsensusResult::Accepted as u8,
-        history_index,
+        history_index: history_count,
         chain_hash,
         prev_hash,
     };
@@ -932,22 +933,23 @@ pub fn process_consensus(
     // Append to per-entry persistent archival storage, respecting the rolling
     // window cap: once the cap is reached the oldest entry's key is retired so
     // per-asset rent stays bounded instead of growing forever.
-    if count >= MAX_PRICE_HISTORY {
+    if history_count >= MAX_PRICE_HISTORY {
         env.storage().persistent().remove(&OracleDataKey::PriceHistoryEntry(
             asset_id.clone(),
-            (count - MAX_PRICE_HISTORY) as u64,
+            (history_count - MAX_PRICE_HISTORY) as u64,
         ));
     }
 
-    let entry_key = OracleDataKey::PriceHistoryEntry(asset_id.clone(), history_index);
+    let entry_key = OracleDataKey::PriceHistoryEntry(asset_id.clone(), history_index_u64);
     env.storage().persistent().set(&entry_key, &canonical);
     env.storage()
         .persistent()
         .extend_ttl(&entry_key, TTL_BUMP_THRESHOLD_LEDGERS, ARCHIVE_TTL_EXTEND_LEDGERS);
 
+    let next_history_count = history_count.checked_add(1).ok_or(OracleError::Overflow)?;
     env.storage()
         .persistent()
-        .set(&count_key, &(count.saturating_add(1)));
+        .set(&count_key, &next_history_count);
 
     // Update latest price (hot read key, archival window).
     let latest_key = OracleDataKey::LatestPrice(asset_id.clone());
@@ -959,7 +961,7 @@ pub fn process_consensus(
     // Update asset total_updates counter.
     let akey = OracleDataKey::Asset(asset_id.clone());
     if let Some(mut arec) = env.storage().persistent().get::<_, AssetRecord>(&akey) {
-        arec.total_updates = arec.total_updates.saturating_add(1);
+        arec.total_updates = arec.total_updates.checked_add(1).ok_or(OracleError::Overflow)?;
         env.storage().persistent().set(&akey, &arec);
         env.storage()
             .persistent()
@@ -972,9 +974,10 @@ pub fn process_consensus(
         .instance()
         .get(&OracleDataKey::TotalRounds)
         .unwrap_or(0);
+    let next_rounds = rounds.checked_add(1).ok_or(OracleError::Overflow)?;
     env.storage()
         .instance()
-        .set(&OracleDataKey::TotalRounds, &(rounds.saturating_add(1)));
+        .set(&OracleDataKey::TotalRounds, &next_rounds);
 
     // Clear pending feeds so the next round starts fresh.
     let fresh = Vec::<PriceFeed>::new(env);
@@ -1064,6 +1067,66 @@ pub fn extend_latest_price_ttl(env: &Env, asset_id: &Symbol) {
 
 /// Hard cap on the number of price-history entries returned in a single page.
 pub const MAX_PRICE_PAGE_LIMIT: u32 = 100;
+
+/// Maximum byte length for a price feed's opaque metadata blob (#809).
+pub const MAX_FEED_METADATA_LEN: u32 = 512;
+
+/// Maximum number of asset classes an oracle may register at once (#809).
+pub const MAX_SUPPORTED_CLASSES_LEN: u32 = 16;
+
+/// Maximum allowed scaled price to prevent overflow during weighted-mean consensus (`u128::MAX / 1_000`) (#809).
+pub const MAX_SAFE_ORACLE_PRICE: u128 = u128::MAX / 1_000;
+
+/// Validate deterministic bounds and overflow safety on raw price feed inputs (#809).
+pub fn validate_price_feed_bounds(
+    price: u128,
+    confidence: u128,
+    metadata: &Bytes,
+) -> Result<(), OracleError> {
+    if price == 0 || price > MAX_SAFE_ORACLE_PRICE {
+        return Err(OracleError::InvalidPrice);
+    }
+    let max_conf = price.checked_div(2).ok_or(OracleError::Overflow)?;
+    if confidence >= max_conf {
+        return Err(OracleError::ConfidenceTooWide);
+    }
+    if metadata.len() > MAX_FEED_METADATA_LEN {
+        return Err(OracleError::OracleNameTooLong);
+    }
+    Ok(())
+}
+
+/// Compute reputation-weighted mean price and mean confidence using strictly
+/// checked `checked_mul`, `checked_add`, and `checked_div` arithmetic (#809).
+pub fn checked_weighted_mean_price(
+    entries: &[(u128, u128, u32)],
+) -> Result<(u128, u128), OracleError> {
+    if entries.is_empty() {
+        return Err(OracleError::NoFeedsAvailable);
+    }
+    let mut weight_sum: u128 = 0;
+    let mut price_sum: u128 = 0;
+    let mut conf_sum: u128 = 0;
+
+    for &(price, conf, rep) in entries.iter() {
+        if price == 0 || price > MAX_SAFE_ORACLE_PRICE {
+            return Err(OracleError::InvalidPrice);
+        }
+        let w = rep as u128;
+        let weighted = price.checked_mul(w).ok_or(OracleError::Overflow)?;
+        weight_sum = weight_sum.checked_add(w).ok_or(OracleError::Overflow)?;
+        price_sum = price_sum.checked_add(weighted).ok_or(OracleError::Overflow)?;
+        conf_sum = conf_sum.checked_add(conf).ok_or(OracleError::Overflow)?;
+    }
+    if weight_sum == 0 {
+        return Err(OracleError::InvalidPrice);
+    }
+    let weighted_price = price_sum.checked_div(weight_sum).ok_or(OracleError::Overflow)?;
+    let mean_conf = conf_sum
+        .checked_div(entries.len() as u128)
+        .ok_or(OracleError::Overflow)?;
+    Ok((weighted_price, mean_conf))
+}
 
 /// Cursor token for deterministic cursor-based pagination over price history.
 ///
@@ -1268,14 +1331,12 @@ pub fn get_price_history_paginated(
     filter.validate()?;
     let effective = limit.effective();
 
-    let history: Vec<CanonicalPrice> = env.storage().instance().get(
-        &OracleDataKey::PriceHistory(asset_id.clone()),
-    ).unwrap_or(Vec::new(env));
+    let history: Vec<CanonicalPrice> = get_price_history(env, asset_id);
 
     // Collect matching keys and sort deterministically.
     let mut keys: Vec<(u64, u32)> = Vec::new(env);
     for (i, cp) in history.iter().enumerate() {
-        if !filter.matches(cp) {
+        if !filter.matches(&cp) {
             continue;
         }
         keys.push_back((cp.consensus_at, i as u32));
@@ -1286,21 +1347,21 @@ pub fn get_price_history_paginated(
     let mut last_key: Option<(u64, u32)> = None;
     let mut page_len = 0u32;
 
-        for key in keys.iter() {
-            if let Some(c) = cursor {
-                if !price_key_after_cursor(&key, c) {
-                    continue;
-                }
-            }
-            if page_len >= effective {
-                break;
-            }
-            if let Some(cp) = history.get(key.1) {
-                items.push_back(cp.clone());
-                last_key = Some(key.clone());
-                page_len += 1;
+    for key in keys.iter() {
+        if let Some(c) = cursor {
+            if !price_key_after_cursor(&key, c) {
+                continue;
             }
         }
+        if page_len >= effective {
+            break;
+        }
+        if let Some(cp) = history.get(key.1) {
+            items.push_back(cp.clone());
+            last_key = Some(key);
+            page_len += 1;
+        }
+    }
 
     let next_cursor = match last_key {
         Some(k) => price_next_cursor_for(&k, page_len, effective),
@@ -2019,4 +2080,26 @@ mod tests {
         let rec = get_oracle(&env, &oracle).unwrap();
         assert_eq!(rec.total_submissions, 1);
     }
+
+    #[test]
+    fn test_oracle_bounds_and_checked_weighted_mean_overflow_safety() {
+        let env = setup_env();
+        assert_eq!(
+            validate_price_feed_bounds(0, 0, &Bytes::new(&env)),
+            Err(OracleError::InvalidPrice)
+        );
+        assert_eq!(
+            validate_price_feed_bounds(u128::MAX, 1, &Bytes::new(&env)),
+            Err(OracleError::InvalidPrice)
+        );
+        let entries = [(100_000_000u128, 1_000_000u128, 80u32), (102_000_000u128, 1_000_000u128, 20u32)];
+        let (weighted, conf) = checked_weighted_mean_price(&entries).unwrap();
+        assert_eq!(weighted, 100_400_000u128);
+        assert_eq!(conf, 1_000_000u128);
+        assert_eq!(
+            checked_weighted_mean_price(&[(u128::MAX, 1, 100)]),
+            Err(OracleError::InvalidPrice)
+        );
+    }
 }
+

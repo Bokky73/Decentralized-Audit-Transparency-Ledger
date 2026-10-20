@@ -15,6 +15,10 @@ updates:
       prefix: "chore(deps)"
       prefix-development: "chore(deps)"
       include: "scope"
+    groups:
+      soroban-sdk:
+        patterns:
+          - "soroban-sdk*"
 
   - package-ecosystem: github-actions
     directory: /
