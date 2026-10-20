@@ -31,7 +31,7 @@
 
 #![no_std]
 
-use soroban_sdk::{contracttype, Address, Bytes, BytesN, Symbol, Vec};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, Symbol, Vec};
 
 // ---------------------------------------------------------------------------
 // Enumerations
@@ -773,6 +773,377 @@ impl SanctionsChecker {
 }
 
 // ---------------------------------------------------------------------------
+// Cursor-Based Pagination & Filtered Batch Queries (#822)
+// ---------------------------------------------------------------------------
+
+/// Hard cap on the number of KYC/AML records returned in a single page.
+pub const MAX_KYC_PAGE_LIMIT: u32 = 100;
+
+/// Cursor token for deterministic cursor-based pagination over KYC/AML records.
+///
+/// Ordered by composite key `(last_updated, seq_index)` for stable traversal
+/// across ledger upgrades and archival restores.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KycPageCursor {
+    /// Timestamp (`last_updated` or `last_review_at`) of the last returned item.
+    pub updated_at: u64,
+    /// Tie-breaking sequence index of the last returned item.
+    pub seq_index: u32,
+}
+
+/// Requested page size for KYC/AML batch queries, clamped to [`MAX_KYC_PAGE_LIMIT`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KycPageLimit {
+    /// Requested number of items.
+    pub limit: u32,
+}
+
+impl KycPageLimit {
+    /// Construct a validated page limit, rejecting zero and clamping to the cap.
+    pub fn new(limit: u32) -> Result<Self, &'static str> {
+        if limit == 0 {
+            return Err("Page limit must be greater than zero");
+        }
+        Ok(Self {
+            limit: if limit > MAX_KYC_PAGE_LIMIT {
+                MAX_KYC_PAGE_LIMIT
+            } else {
+                limit
+            },
+        })
+    }
+
+    /// Effective (clamped) limit.
+    pub fn effective(&self) -> u32 {
+        if self.limit > MAX_KYC_PAGE_LIMIT {
+            MAX_KYC_PAGE_LIMIT
+        } else {
+            self.limit
+        }
+    }
+}
+
+/// Multi-predicate filter for batch KYC record queries.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KycBatchFilter {
+    /// Optional exact verification status filter (`VerificationStatus as u8`).
+    pub status: Option<u8>,
+    /// Optional exact jurisdiction filter (`Jurisdiction as u8`).
+    pub jurisdiction: Option<u8>,
+    /// Inclusive lower bound on `last_updated`.
+    pub min_updated_at: Option<u64>,
+    /// Inclusive upper bound on `last_updated`.
+    pub max_updated_at: Option<u64>,
+    /// Optional timestamp at which the record must be active (approved & non-expired).
+    pub active_at: Option<u64>,
+}
+
+impl KycBatchFilter {
+    /// Empty filter matching all KYC records.
+    pub fn none() -> Self {
+        Self {
+            status: None,
+            jurisdiction: None,
+            min_updated_at: None,
+            max_updated_at: None,
+            active_at: None,
+        }
+    }
+
+    /// Validate timestamp range bounds.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if let (Some(min), Some(max)) = (self.min_updated_at, self.max_updated_at) {
+            if min > max {
+                return Err("Invalid updated_at range: min exceeds max");
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns `true` when `record` satisfies all configured filter predicates.
+    pub fn matches(&self, record: &KycRecord) -> bool {
+        if let Some(status) = self.status {
+            if record.status != status {
+                return false;
+            }
+        }
+        if let Some(jurisdiction) = self.jurisdiction {
+            if record.jurisdiction != jurisdiction {
+                return false;
+            }
+        }
+        if let Some(min_ts) = self.min_updated_at {
+            if record.last_updated < min_ts {
+                return false;
+            }
+        }
+        if let Some(max_ts) = self.max_updated_at {
+            if record.last_updated > max_ts {
+                return false;
+            }
+        }
+        if let Some(now) = self.active_at {
+            if !record.is_active(now) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Paginated batch query result for KYC records.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KycRecordPage {
+    /// Matching records for this page, deterministically ordered.
+    pub items: Vec<KycRecord>,
+    /// Cursor for the next page, or `None` when results are exhausted.
+    pub next_cursor: Option<KycPageCursor>,
+    /// Total number of records matching the filter across all pages.
+    pub total_matched: u32,
+}
+
+/// Multi-predicate filter for batch [`ComplianceProfile`] queries.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComplianceProfileFilter {
+    /// Optional exact KYC status (`VerificationStatus as u8`).
+    pub kyc_status: Option<u8>,
+    /// Optional exact AML screening state (`AmlScreeningState as u8`).
+    pub aml_state: Option<u8>,
+    /// Minimum composite compliance score (inclusive).
+    pub min_score: Option<u32>,
+    /// Maximum composite compliance score (inclusive).
+    pub max_score: Option<u32>,
+    /// Optional watchlist status filter.
+    pub watchlisted: Option<bool>,
+    /// Optional exact jurisdiction (`Jurisdiction as u8`).
+    pub jurisdiction: Option<u8>,
+}
+
+impl ComplianceProfileFilter {
+    /// Empty filter matching all compliance profiles.
+    pub fn none() -> Self {
+        Self {
+            kyc_status: None,
+            aml_state: None,
+            min_score: None,
+            max_score: None,
+            watchlisted: None,
+            jurisdiction: None,
+        }
+    }
+
+    /// Validate score range bounds.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if let (Some(min), Some(max)) = (self.min_score, self.max_score) {
+            if min > max {
+                return Err("Invalid compliance score range: min exceeds max");
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns `true` when `profile` satisfies all predicates.
+    pub fn matches(&self, profile: &ComplianceProfile) -> bool {
+        if let Some(kyc) = self.kyc_status {
+            if profile.kyc_status != kyc {
+                return false;
+            }
+        }
+        if let Some(aml) = self.aml_state {
+            if profile.aml_state != aml {
+                return false;
+            }
+        }
+        if let Some(min_s) = self.min_score {
+            if profile.compliance_score < min_s {
+                return false;
+            }
+        }
+        if let Some(max_s) = self.max_score {
+            if profile.compliance_score > max_s {
+                return false;
+            }
+        }
+        if let Some(wl) = self.watchlisted {
+            if profile.watchlisted != wl {
+                return false;
+            }
+        }
+        if let Some(jur) = self.jurisdiction {
+            if profile.jurisdiction != jur {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Paginated batch query result for [`ComplianceProfile`] entries.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComplianceProfilePage {
+    /// Matching profiles for this page, deterministically ordered.
+    pub items: Vec<ComplianceProfile>,
+    /// Cursor for the next page, or `None` when results are exhausted.
+    pub next_cursor: Option<KycPageCursor>,
+    /// Total number of profiles matching the filter across all pages.
+    pub total_matched: u32,
+}
+
+fn compare_kyc_keys(a: &(u64, u32), b: &(u64, u32)) -> core::cmp::Ordering {
+    match a.0.cmp(&b.0) {
+        core::cmp::Ordering::Equal => a.1.cmp(&b.1),
+        other => other,
+    }
+}
+
+fn kyc_key_after_cursor(key: &(u64, u32), cursor: &KycPageCursor) -> bool {
+    compare_kyc_keys(key, &(cursor.updated_at, cursor.seq_index)) == core::cmp::Ordering::Greater
+}
+
+fn sort_kyc_keys(keys: &mut Vec<(u64, u32)>) {
+    let len = keys.len();
+    if len < 2 {
+        return;
+    }
+    let mut i = 1u32;
+    while i < len {
+        let mut j = i;
+        while j > 0 {
+            let prev = keys.get(j - 1).unwrap();
+            let cur = keys.get(j).unwrap();
+            if compare_kyc_keys(&prev, &cur) == core::cmp::Ordering::Greater {
+                keys.set(j - 1, cur);
+                keys.set(j, prev);
+                j -= 1;
+            } else {
+                break;
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Execute a deterministic cursor-based paginated and filtered batch query over [`KycRecord`] items.
+pub fn query_kyc_records_page(
+    env: &Env,
+    records: &Vec<KycRecord>,
+    filter: &KycBatchFilter,
+    cursor: &Option<KycPageCursor>,
+    limit: &KycPageLimit,
+) -> Result<KycRecordPage, &'static str> {
+    filter.validate()?;
+    let effective = limit.effective();
+
+    let mut keys: Vec<(u64, u32)> = Vec::new(env);
+    let mut idx = 0u32;
+    for rec in records.iter() {
+        if filter.matches(&rec) {
+            keys.push_back((rec.last_updated, idx));
+        }
+        idx = idx.saturating_add(1);
+    }
+    let total_matched = keys.len();
+    sort_kyc_keys(&mut keys);
+
+    let mut items: Vec<KycRecord> = Vec::new(env);
+    let mut last_key: Option<(u64, u32)> = None;
+    let mut remaining_after = false;
+
+    for key in keys.iter() {
+        if let Some(c) = cursor {
+            if !kyc_key_after_cursor(&key, c) {
+                continue;
+            }
+        }
+        if items.len() >= effective {
+            remaining_after = true;
+            break;
+        }
+        if let Some(rec) = records.get(key.1) {
+            items.push_back(rec);
+            last_key = Some(key);
+        }
+    }
+
+    let next_cursor = match (last_key, remaining_after) {
+        (Some(k), true) => Some(KycPageCursor {
+            updated_at: k.0,
+            seq_index: k.1,
+        }),
+        _ => None,
+    };
+
+    Ok(KycRecordPage {
+        items,
+        next_cursor,
+        total_matched,
+    })
+}
+
+/// Execute a deterministic cursor-based paginated and filtered batch query over [`ComplianceProfile`] items.
+pub fn query_compliance_profiles_page(
+    env: &Env,
+    profiles: &Vec<ComplianceProfile>,
+    filter: &ComplianceProfileFilter,
+    cursor: &Option<KycPageCursor>,
+    limit: &KycPageLimit,
+) -> Result<ComplianceProfilePage, &'static str> {
+    filter.validate()?;
+    let effective = limit.effective();
+
+    let mut keys: Vec<(u64, u32)> = Vec::new(env);
+    let mut idx = 0u32;
+    for prof in profiles.iter() {
+        if filter.matches(&prof) {
+            keys.push_back((prof.last_review_at, idx));
+        }
+        idx = idx.saturating_add(1);
+    }
+    let total_matched = keys.len();
+    sort_kyc_keys(&mut keys);
+
+    let mut items: Vec<ComplianceProfile> = Vec::new(env);
+    let mut last_key: Option<(u64, u32)> = None;
+    let mut remaining_after = false;
+
+    for key in keys.iter() {
+        if let Some(c) = cursor {
+            if !kyc_key_after_cursor(&key, c) {
+                continue;
+            }
+        }
+        if items.len() >= effective {
+            remaining_after = true;
+            break;
+        }
+        if let Some(prof) = profiles.get(key.1) {
+            items.push_back(prof);
+            last_key = Some(key);
+        }
+    }
+
+    let next_cursor = match (last_key, remaining_after) {
+        (Some(k), true) => Some(KycPageCursor {
+            updated_at: k.0,
+            seq_index: k.1,
+        }),
+        _ => None,
+    };
+
+    Ok(ComplianceProfilePage {
+        items,
+        next_cursor,
+        total_matched,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1276,4 +1647,83 @@ mod tests {
         };
         assert!(!result.is_clear());
     }
+
+    // --- Cursor-Based Pagination & Filtered Batch Queries (#822) ---
+
+    #[test]
+    fn test_kyc_page_limit_validation_and_clamping() {
+        assert!(KycPageLimit::new(0).is_err());
+        let lim = KycPageLimit::new(25).unwrap();
+        assert_eq!(lim.effective(), 25);
+        let clamped = KycPageLimit::new(500).unwrap();
+        assert_eq!(clamped.effective(), MAX_KYC_PAGE_LIMIT);
+    }
+
+    #[test]
+    fn test_query_kyc_records_cursor_pagination_and_filtering() {
+        let env = mock_env();
+        let mut records = Vec::new(&env);
+        for i in 0u32..5 {
+            records.push_back(KycRecord {
+                entity: Address::generate(&env),
+                status: if i % 2 == 0 {
+                    VerificationStatus::Approved as u8
+                } else {
+                    VerificationStatus::Pending as u8
+                },
+                jurisdiction: Jurisdiction::US as u8,
+                last_updated: 1_000 + (i as u64) * 100,
+                expires_at: 10_000,
+                document_hash: zero_hash(&env),
+                reviewed_by: None,
+                version: 1,
+                notes: Bytes::new(&env),
+            });
+        }
+
+        let mut filter = KycBatchFilter::none();
+        filter.status = Some(VerificationStatus::Approved as u8);
+        let limit = KycPageLimit::new(2).unwrap();
+
+        let page1 = query_kyc_records_page(&env, &records, &filter, &None, &limit).unwrap();
+        assert_eq!(page1.total_matched, 3);
+        assert_eq!(page1.items.len(), 2);
+        assert!(page1.next_cursor.is_some());
+
+        let page2 =
+            query_kyc_records_page(&env, &records, &filter, &page1.next_cursor, &limit).unwrap();
+        assert_eq!(page2.items.len(), 1);
+        assert!(page2.next_cursor.is_none());
+    }
+
+    #[test]
+    fn test_query_compliance_profiles_filtered_batch() {
+        let env = mock_env();
+        let mut profiles = Vec::new(&env);
+        for i in 0u32..4 {
+            profiles.push_back(ComplianceProfile {
+                entity: Address::generate(&env),
+                kyc_status: VerificationStatus::Approved as u8,
+                aml_state: AmlScreeningState::Clear as u8,
+                risk_level: RiskLevel::Low as u8,
+                compliance_score: 10 + i * 20,
+                aml_flag_count: 0,
+                sanctions_hit_count: 0,
+                watchlisted: i == 3,
+                last_review_at: 2_000 + (i as u64) * 50,
+                jurisdiction: Jurisdiction::EU as u8,
+            });
+        }
+
+        let mut filter = ComplianceProfileFilter::none();
+        filter.watchlisted = Some(false);
+        filter.max_score = Some(40);
+        let limit = KycPageLimit::new(10).unwrap();
+
+        let page = query_compliance_profiles_page(&env, &profiles, &filter, &None, &limit).unwrap();
+        assert_eq!(page.total_matched, 2);
+        assert_eq!(page.items.len(), 2);
+        assert!(page.next_cursor.is_none());
+    }
 }
+
