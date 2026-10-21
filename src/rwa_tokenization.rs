@@ -13,7 +13,7 @@
 
 #![no_std]
 
-use soroban_sdk::{contracttype, Address, Bytes, BytesN, Symbol, Vec};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, Symbol, Vec};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Enumerations
@@ -609,6 +609,466 @@ impl RwaConfig {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Deterministic Bounds, Overflow Safety, RBAC & Storage TTL (#824, #825, #826)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Maximum length in bytes of a token display name.
+pub const MAX_TOKEN_NAME_LEN: u32 = 128;
+
+/// Maximum decimal precision permitted for tokenized assets.
+pub const MAX_TOKEN_DECIMALS: u8 = 18;
+
+/// Maximum number of jurisdiction codes per holder record.
+pub const MAX_HOLDER_JURISDICTIONS: u32 = 16;
+
+/// Maximum length in bytes of a holder compliance note or pause reason.
+pub const MAX_COMPLIANCE_NOTE_LEN: u32 = 512;
+
+/// Maximum number of per-token audit trail entries retained in rolling archival storage.
+pub const MAX_TOKEN_AUDIT_TRAIL: u32 = 500;
+
+/// Ledger threshold below which persistent keys have their TTL extended.
+pub const TTL_BUMP_THRESHOLD_LEDGERS: u32 = 10_000;
+
+/// Standard TTL extension window (ledgers) for active token and holder records.
+pub const TOKEN_RECORD_TTL_EXTEND_LEDGERS: u32 = 100_000;
+
+/// Extended archival TTL window (ledgers) for immutable tokenization audit trail entries.
+pub const TOKEN_ARCHIVE_TTL_EXTEND_LEDGERS: u32 = 200_000;
+
+/// Deterministic error codes for RWA tokenization bounds, overflow, and RBAC checks.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum TokenizationError {
+    /// Arithmetic overflow detected during supply or balance update.
+    ArithmeticOverflow = 2400,
+    /// Arithmetic underflow detected during burn or balance debit.
+    ArithmeticUnderflow = 2401,
+    /// Operation amount must be strictly positive.
+    ZeroOrNegativeAmount = 2402,
+    /// Mint would exceed the token's configured `max_supply`.
+    SupplyCapExceeded = 2403,
+    /// Operation amount exceeds `RwaConfig::max_single_op_amount`.
+    SingleOpCapExceeded = 2404,
+    /// Token name is empty or exceeds `MAX_TOKEN_NAME_LEN`.
+    InvalidTokenNameLength = 2405,
+    /// Token decimals exceed `MAX_TOKEN_DECIMALS`.
+    InvalidDecimals = 2406,
+    /// Holder jurisdiction list exceeds `MAX_HOLDER_JURISDICTIONS`.
+    TooManyJurisdictions = 2407,
+    /// Compliance note or pause reason exceeds `MAX_COMPLIANCE_NOTE_LEN`.
+    ComplianceNoteTooLong = 2408,
+    /// Token lifecycle transition is not permitted from the current state.
+    InvalidStateTransition = 2409,
+    /// Caller lacks the required RBAC role for this operation.
+    UnauthorizedRole = 2410,
+    /// Token count or holder count would exceed global configuration bounds.
+    CapacityLimitReached = 2411,
+}
+
+/// Granular RBAC roles for RWA tokenization lifecycle and supply operations (#825).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum TokenizationRole {
+    /// Read-only observer; cannot mutate state.
+    Viewer = 0,
+    /// Independent auditor; can inspect and extend archival TTLs.
+    Auditor = 1,
+    /// Transfer agent; can register holders and update holder allowlists.
+    TransferAgent = 2,
+    /// Compliance officer; can approve/reject proposals, pause/resume tokens, and block holders.
+    ComplianceOfficer = 3,
+    /// Authorized token issuer; can propose tokens and execute mint/burn within caps.
+    Issuer = 4,
+    /// Super-administrator; full lifecycle, role assignment, and configuration authority.
+    Admin = 5,
+}
+
+impl TokenizationRole {
+    /// Decode a stored `u8` into a [`TokenizationRole`].
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(TokenizationRole::Viewer),
+            1 => Some(TokenizationRole::Auditor),
+            2 => Some(TokenizationRole::TransferAgent),
+            3 => Some(TokenizationRole::ComplianceOfficer),
+            4 => Some(TokenizationRole::Issuer),
+            5 => Some(TokenizationRole::Admin),
+            _ => None,
+        }
+    }
+
+    /// Whether this role may propose or mint/burn tokens.
+    pub fn can_mint_burn(&self) -> bool {
+        matches!(self, TokenizationRole::Issuer | TokenizationRole::Admin)
+    }
+
+    /// Whether this role may approve/reject token proposals or pause/resume active tokens.
+    pub fn can_govern_lifecycle(&self) -> bool {
+        matches!(
+            self,
+            TokenizationRole::ComplianceOfficer | TokenizationRole::Admin
+        )
+    }
+
+    /// Whether this role may update holder KYC, allowlist, or blocklist flags.
+    pub fn can_manage_holders(&self) -> bool {
+        matches!(
+            self,
+            TokenizationRole::TransferAgent
+                | TokenizationRole::ComplianceOfficer
+                | TokenizationRole::Admin
+        )
+    }
+}
+
+/// Structured audit trail event emitted and archived on every gated tokenization mutation (#825).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenizationAuditEvent {
+    /// Sequential per-token audit index (0-based).
+    pub seq: u32,
+    /// Token identifier.
+    pub token_id: BytesN<32>,
+    /// Actor that authorized the mutation.
+    pub actor: Address,
+    /// Actor's RBAC role at execution time (`TokenizationRole as u8`).
+    pub actor_role: u8,
+    /// Short action symbol (e.g. `"MINT"`, `"BURN"`, `"STATE"`, `"ROLE"`).
+    pub action: Symbol,
+    /// Amount involved (0 for non-supply mutations).
+    pub amount: u128,
+    /// Lifecycle state after the mutation (`TokenizationState as u8`).
+    pub resulting_state: u8,
+    /// Ledger timestamp.
+    pub timestamp: u64,
+}
+
+/// Persistent storage keys for tokenization state, RBAC bindings, and rolling audit entries (#826).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TokenizationDataKey {
+    /// Immutable token definition: `TokenDef(token_id)`.
+    TokenDef(BytesN<32>),
+    /// Mutable token runtime state: `TokenState(token_id)`.
+    TokenState(BytesN<32>),
+    /// Per-holder record: `Holder(token_id, holder_address)`.
+    Holder(BytesN<32>, Address),
+    /// Assigned RBAC role for an address: `RoleBinding(actor)`.
+    RoleBinding(Address),
+    /// Total number of audit trail entries recorded for a token: `AuditCount(token_id)`.
+    AuditCount(BytesN<32>),
+    /// Individual audit trail entry: `AuditEntry(token_id, seq)`.
+    AuditEntry(BytesN<32>, u32),
+}
+
+impl TokenDefinition {
+    /// Validate deterministic field bounds on a token definition (#824).
+    pub fn validate_bounds(&self) -> Result<(), TokenizationError> {
+        if self.name.is_empty() || self.name.len() > MAX_TOKEN_NAME_LEN {
+            return Err(TokenizationError::InvalidTokenNameLength);
+        }
+        if self.decimals > MAX_TOKEN_DECIMALS {
+            return Err(TokenizationError::InvalidDecimals);
+        }
+        Ok(())
+    }
+
+    /// Checked supply cap validation returning a typed [`TokenizationError`].
+    pub fn checked_can_mint(
+        &self,
+        current_supply: u128,
+        amount: u128,
+    ) -> Result<u128, TokenizationError> {
+        if amount == 0 {
+            return Err(TokenizationError::ZeroOrNegativeAmount);
+        }
+        let next_supply = current_supply
+            .checked_add(amount)
+            .ok_or(TokenizationError::ArithmeticOverflow)?;
+        if self.max_supply > 0 && next_supply > self.max_supply {
+            return Err(TokenizationError::SupplyCapExceeded);
+        }
+        Ok(next_supply)
+    }
+}
+
+impl TokenState {
+    /// Apply a mint operation using checked arithmetic and Supply/Config bounds (#824).
+    pub fn checked_apply_mint(
+        &mut self,
+        def: &TokenDefinition,
+        config: &RwaConfig,
+        amount: u128,
+        is_new_holder: bool,
+        now: u64,
+    ) -> Result<(), TokenizationError> {
+        if !self.lifecycle_state().allows_mint_burn() {
+            return Err(TokenizationError::InvalidStateTransition);
+        }
+        if amount == 0 {
+            return Err(TokenizationError::ZeroOrNegativeAmount);
+        }
+        if config.max_single_op_amount > 0 && amount > config.max_single_op_amount {
+            return Err(TokenizationError::SingleOpCapExceeded);
+        }
+        let new_supply = def.checked_can_mint(self.current_supply, amount)?;
+        let new_total_minted = self
+            .total_minted
+            .checked_add(amount)
+            .ok_or(TokenizationError::ArithmeticOverflow)?;
+        if is_new_holder {
+            if self.holder_count >= config.max_holders_per_token {
+                return Err(TokenizationError::CapacityLimitReached);
+            }
+            self.holder_count = self
+                .holder_count
+                .checked_add(1)
+                .ok_or(TokenizationError::ArithmeticOverflow)?;
+        }
+        self.current_supply = new_supply;
+        self.total_minted = new_total_minted;
+        self.last_transition_at = now;
+        Ok(())
+    }
+
+    /// Apply a burn operation using checked arithmetic (#824).
+    pub fn checked_apply_burn(
+        &mut self,
+        config: &RwaConfig,
+        amount: u128,
+        holder_emptied: bool,
+        now: u64,
+    ) -> Result<(), TokenizationError> {
+        if !self.lifecycle_state().allows_mint_burn() {
+            return Err(TokenizationError::InvalidStateTransition);
+        }
+        if amount == 0 {
+            return Err(TokenizationError::ZeroOrNegativeAmount);
+        }
+        if config.max_single_op_amount > 0 && amount > config.max_single_op_amount {
+            return Err(TokenizationError::SingleOpCapExceeded);
+        }
+        let new_supply = self
+            .current_supply
+            .checked_sub(amount)
+            .ok_or(TokenizationError::ArithmeticUnderflow)?;
+        let new_total_burned = self
+            .total_burned
+            .checked_add(amount)
+            .ok_or(TokenizationError::ArithmeticOverflow)?;
+        if holder_emptied && self.holder_count > 0 {
+            self.holder_count -= 1;
+        }
+        self.current_supply = new_supply;
+        self.total_burned = new_total_burned;
+        self.last_transition_at = now;
+        Ok(())
+    }
+}
+
+impl HolderRecord {
+    /// Validate deterministic collection and note bounds (#824).
+    pub fn validate_bounds(&self) -> Result<(), TokenizationError> {
+        if self.jurisdictions.len() > MAX_HOLDER_JURISDICTIONS {
+            return Err(TokenizationError::TooManyJurisdictions);
+        }
+        if let Some(ref note) = self.compliance_note {
+            if note.len() > MAX_COMPLIANCE_NOTE_LEN {
+                return Err(TokenizationError::ComplianceNoteTooLong);
+            }
+        }
+        Ok(())
+    }
+
+    /// Credit holder balance with overflow check (#824).
+    pub fn checked_credit(&mut self, amount: u128, now: u64) -> Result<u128, TokenizationError> {
+        if amount == 0 {
+            return Err(TokenizationError::ZeroOrNegativeAmount);
+        }
+        let next = self
+            .balance
+            .checked_add(amount)
+            .ok_or(TokenizationError::ArithmeticOverflow)?;
+        self.balance = next;
+        self.last_updated = now;
+        Ok(next)
+    }
+
+    /// Debit holder balance with underflow check (#824).
+    pub fn checked_debit(&mut self, amount: u128, now: u64) -> Result<u128, TokenizationError> {
+        if amount == 0 {
+            return Err(TokenizationError::ZeroOrNegativeAmount);
+        }
+        let next = self
+            .balance
+            .checked_sub(amount)
+            .ok_or(TokenizationError::ArithmeticUnderflow)?;
+        self.balance = next;
+        self.last_updated = now;
+        Ok(next)
+    }
+}
+
+/// Assign an RBAC role to `actor` in persistent storage and bump its TTL (#825, #826).
+pub fn assign_tokenization_role(env: &Env, actor: &Address, role: TokenizationRole) {
+    let key = TokenizationDataKey::RoleBinding(actor.clone());
+    let role_u8 = role as u8;
+    env.storage().persistent().set(&key, &role_u8);
+    env.storage().persistent().extend_ttl(
+        &key,
+        TTL_BUMP_THRESHOLD_LEDGERS,
+        TOKEN_RECORD_TTL_EXTEND_LEDGERS,
+    );
+}
+
+/// Look up the assigned [`TokenizationRole`] for `actor` (defaults to `Viewer`).
+pub fn get_tokenization_role(env: &Env, actor: &Address) -> TokenizationRole {
+    let key = TokenizationDataKey::RoleBinding(actor.clone());
+    env.storage()
+        .persistent()
+        .get::<_, u8>(&key)
+        .and_then(TokenizationRole::from_u8)
+        .unwrap_or(TokenizationRole::Viewer)
+}
+
+/// Append a structured audit event to per-entry persistent storage with rolling
+/// eviction at [`MAX_TOKEN_AUDIT_TRAIL`] and emit a Soroban event (#825, #826).
+pub fn record_tokenization_audit_event(
+    env: &Env,
+    token_id: &BytesN<32>,
+    actor: &Address,
+    actor_role: TokenizationRole,
+    action: Symbol,
+    amount: u128,
+    resulting_state: TokenizationState,
+) -> TokenizationAuditEvent {
+    let count_key = TokenizationDataKey::AuditCount(token_id.clone());
+    let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+
+    if count >= MAX_TOKEN_AUDIT_TRAIL {
+        let evict_seq = count - MAX_TOKEN_AUDIT_TRAIL;
+        env.storage()
+            .persistent()
+            .remove(&TokenizationDataKey::AuditEntry(token_id.clone(), evict_seq));
+    }
+
+    let event = TokenizationAuditEvent {
+        seq: count,
+        token_id: token_id.clone(),
+        actor: actor.clone(),
+        actor_role: actor_role as u8,
+        action: action.clone(),
+        amount,
+        resulting_state: resulting_state as u8,
+        timestamp: env.ledger().timestamp(),
+    };
+
+    let entry_key = TokenizationDataKey::AuditEntry(token_id.clone(), count);
+    env.storage().persistent().set(&entry_key, &event);
+    env.storage().persistent().extend_ttl(
+        &entry_key,
+        TTL_BUMP_THRESHOLD_LEDGERS,
+        TOKEN_ARCHIVE_TTL_EXTEND_LEDGERS,
+    );
+
+    let next_count = count.saturating_add(1);
+    env.storage().persistent().set(&count_key, &next_count);
+    env.storage().persistent().extend_ttl(
+        &count_key,
+        TTL_BUMP_THRESHOLD_LEDGERS,
+        TOKEN_ARCHIVE_TTL_EXTEND_LEDGERS,
+    );
+
+    env.events().publish(
+        (Symbol::new(env, "rwa_token"), action),
+        (token_id.clone(), actor.clone(), amount, resulting_state as u8),
+    );
+
+    event
+}
+
+/// Role-gated lifecycle transition with bounds validation, persistent TTL bump, and audit event (#824, #825, #826).
+pub fn transition_token_state_gated(
+    env: &Env,
+    actor: &Address,
+    token_id: &BytesN<32>,
+    state: &mut TokenState,
+    next_state: TokenizationState,
+    pause_reason: Option<Bytes>,
+) -> Result<TokenizationAuditEvent, TokenizationError> {
+    let role = get_tokenization_role(env, actor);
+    if !role.can_govern_lifecycle() {
+        return Err(TokenizationError::UnauthorizedRole);
+    }
+    let current = state.lifecycle_state();
+    if !current.can_transition_to(next_state) {
+        return Err(TokenizationError::InvalidStateTransition);
+    }
+    if let Some(ref reason) = pause_reason {
+        if reason.len() > MAX_COMPLIANCE_NOTE_LEN {
+            return Err(TokenizationError::ComplianceNoteTooLong);
+        }
+    }
+
+    state.state = next_state as u8;
+    state.last_transition_at = env.ledger().timestamp();
+    state.pause_reason = pause_reason;
+
+    let state_key = TokenizationDataKey::TokenState(token_id.clone());
+    env.storage().persistent().set(&state_key, state);
+    env.storage().persistent().extend_ttl(
+        &state_key,
+        TTL_BUMP_THRESHOLD_LEDGERS,
+        TOKEN_RECORD_TTL_EXTEND_LEDGERS,
+    );
+
+    Ok(record_tokenization_audit_event(
+        env,
+        token_id,
+        actor,
+        role,
+        Symbol::new(env, "STATE"),
+        0,
+        next_state,
+    ))
+}
+
+/// Permissionless TTL extension helper for hot token definition and state keys (#826).
+pub fn extend_token_records_ttl(env: &Env, token_id: &BytesN<32>) {
+    let def_key = TokenizationDataKey::TokenDef(token_id.clone());
+    if env.storage().persistent().has(&def_key) {
+        env.storage().persistent().extend_ttl(
+            &def_key,
+            TTL_BUMP_THRESHOLD_LEDGERS,
+            TOKEN_RECORD_TTL_EXTEND_LEDGERS,
+        );
+    }
+    let state_key = TokenizationDataKey::TokenState(token_id.clone());
+    if env.storage().persistent().has(&state_key) {
+        env.storage().persistent().extend_ttl(
+            &state_key,
+            TTL_BUMP_THRESHOLD_LEDGERS,
+            TOKEN_RECORD_TTL_EXTEND_LEDGERS,
+        );
+    }
+}
+
+/// Permissionless TTL extension helper for an individual archival audit entry (#826).
+pub fn extend_token_audit_entry_ttl(env: &Env, token_id: &BytesN<32>, seq: u32) {
+    let key = TokenizationDataKey::AuditEntry(token_id.clone(), seq);
+    if env.storage().persistent().has(&key) {
+        env.storage().persistent().extend_ttl(
+            &key,
+            TTL_BUMP_THRESHOLD_LEDGERS,
+            TOKEN_ARCHIVE_TTL_EXTEND_LEDGERS,
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Inline unit tests
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1053,4 +1513,58 @@ mod tests {
         );
         assert_eq!(TransferRestriction::KycRequired.as_str(), "KYC_REQUIRED");
     }
+
+    // ── Bounds, Overflow Safety, RBAC & Storage TTL (#824, #825, #826) ──────
+
+    #[test]
+    fn test_checked_mint_and_burn_overflow_underflow_safety() {
+        let env = soroban_sdk::Env::default();
+        let mut state = make_active_state();
+        let def = make_def_no_restriction(&env);
+        let cfg = RwaConfig::default();
+
+        assert_eq!(
+            state.checked_apply_mint(&def, &cfg, 0, false, 10),
+            Err(TokenizationError::ZeroOrNegativeAmount)
+        );
+        assert_eq!(
+            state.checked_apply_mint(&def, &cfg, 950_000, false, 10),
+            Err(TokenizationError::SupplyCapExceeded)
+        );
+        assert!(state.checked_apply_mint(&def, &cfg, 200_000, true, 10).is_ok());
+        assert_eq!(state.current_supply, 300_000);
+        assert_eq!(state.holder_count, 6);
+
+        assert_eq!(
+            state.checked_apply_burn(&cfg, 400_000, false, 20),
+            Err(TokenizationError::ArithmeticUnderflow)
+        );
+        assert!(state.checked_apply_burn(&cfg, 100_000, true, 20).is_ok());
+        assert_eq!(state.current_supply, 200_000);
+        assert_eq!(state.holder_count, 5);
+    }
+
+    #[test]
+    fn test_holder_bounds_and_checked_balance_ops() {
+        let env = soroban_sdk::Env::default();
+        let mut holder = make_holder(&env, KycStatus::Basic);
+        assert!(holder.validate_bounds().is_ok());
+        assert_eq!(
+            holder.checked_debit(60_000, 10),
+            Err(TokenizationError::ArithmeticUnderflow)
+        );
+        assert_eq!(holder.checked_credit(25_000, 15).unwrap(), 75_000);
+    }
+
+    #[test]
+    fn test_tokenization_role_permissions() {
+        assert!(!TokenizationRole::Viewer.can_mint_burn());
+        assert!(!TokenizationRole::Viewer.can_govern_lifecycle());
+        assert!(TokenizationRole::ComplianceOfficer.can_govern_lifecycle());
+        assert!(TokenizationRole::Issuer.can_mint_burn());
+        assert!(TokenizationRole::Admin.can_mint_burn());
+        assert!(TokenizationRole::Admin.can_govern_lifecycle());
+        assert!(TokenizationRole::TransferAgent.can_manage_holders());
+    }
 }
+

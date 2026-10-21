@@ -1,13 +1,16 @@
 version: 2
 updates:
-  - package-ecosystem: cargo
-    directory: /
+  - package-ecosystem: "cargo"
+    directory: "/"
     schedule:
-      interval: weekly
-      day: monday
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "UTC"
     open-pull-requests-limit: 5
     labels:
       - "dependencies"
+      - "rust"
       - "security"
     reviewers:
       - "daddygokings-art"
@@ -16,18 +19,41 @@ updates:
       prefix-development: "chore(deps)"
       include: "scope"
 
-  - package-ecosystem: github-actions
-    directory: /
+  - package-ecosystem: "cargo"
+    directory: "/sdk/rust"
     schedule:
-      interval: weekly
-      day: monday
-    open-pull-requests-limit: 3
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "rust"
+      - "sdk"
+    reviewers:
+      - "daddygokings-art"
+    commit-message:
+      prefix: "chore(deps)"
+      prefix-development: "chore(deps)"
+      include: "scope"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
     labels:
       - "dependencies"
       - "github-actions"
+      - "ci"
     reviewers:
       - "daddygokings-art"
     commit-message:
       prefix: "chore(actions)"
       prefix-development: "chore(actions)"
       include: "scope"
+
