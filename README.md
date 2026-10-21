@@ -366,3 +366,6 @@ This project follows security best practices:
 
 <!-- handsoff-issue-419 -->
 - #419: Implement event retention policies with automated enforcement
+
+<!-- handsoff-issue-881 -->
+- #881: [carbon-credits] Optimize Soroban storage TTL extension and archival rent footprint for `src/carbon_credits.rs`
