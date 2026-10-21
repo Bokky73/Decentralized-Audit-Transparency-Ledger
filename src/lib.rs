@@ -2,6 +2,7 @@
 
 pub mod capacity_planning;
 pub mod rbac;
+pub mod suptech_rules;
 
 use soroban_sdk::{
     bytes, contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Bytes,
@@ -1040,6 +1041,10 @@ impl AuditLedger {
     }
 }
 
+#[cfg(test)]
+mod concurrent_tests;
+#[cfg(test)]
+mod proptest;
 #[cfg(test)]
 mod rbac_gating_tests;
 #[cfg(test)]

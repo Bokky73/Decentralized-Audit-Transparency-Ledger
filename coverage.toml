@@ -1,8 +1,8 @@
-# Coverage configuration for Decentralized Audit & Transparency Ledger (Issue #900)
+# Coverage configuration for Decentralized Audit & Transparency Ledger (Issues #833, #900)
 
 [coverage]
 minimum_line_coverage = 90.0
-minimum_branch_coverage = 85.0
+minimum_branch_coverage = 90.0
 fail_under = 90.0
 
 [modules]
@@ -10,13 +10,25 @@ include = [
     "src/lib.rs",
     "src/rbac.rs",
     "src/capacity_planning.rs",
+    "src/suptech_rules.rs",
 ]
 test_suites = [
     "src/test.rs",
     "src/rbac_gating_tests.rs",
+    "src/proptest.rs",
+    "src/concurrent_tests.rs",
 ]
+
+[thresholds."src/suptech_rules.rs"]
+line_coverage = 90.0
+branch_coverage = 90.0
+
+[thresholds."src/capacity_planning.rs"]
+line_coverage = 90.0
+branch_coverage = 90.0
 
 [compliance]
 require_rbac_gating = true
 require_tamper_evident_audit_events = true
-
+require_suptech_proptest_invariants = true
+minimum_proptest_sequences = 1000

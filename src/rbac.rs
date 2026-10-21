@@ -338,7 +338,7 @@ pub fn record_audit_event(
     };
 
     env.storage()
-        .instance()
+        .persistent()
         .set(&RbacDataKey::AuditTrailEntry(seq), &audit_evt);
     env.storage()
         .instance()
@@ -664,7 +664,7 @@ pub fn audit_trail_count(env: &Env) -> u32 {
 /// Retrieve an [`RbacAuditEvent`] by its sequential index.
 pub fn get_audit_trail_event(env: &Env, sequence: u32) -> Option<RbacAuditEvent> {
     env.storage()
-        .instance()
+        .persistent()
         .get(&RbacDataKey::AuditTrailEntry(sequence))
 }
 
