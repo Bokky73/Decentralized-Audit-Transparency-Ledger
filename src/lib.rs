@@ -6298,10 +6298,11 @@ impl AuditLedger {
         let mut expected_prev: BytesN<32> = if from == 0 {
             BytesN::from_array(env, &[0u8; 32])
         } else {
-            let prev_id: BytesN<32> = match env.storage().instance().get(&DataKey::EventOrder(from - 1)) {
-                Some(v) => v,
-                None => return false,
-            };
+            let prev_id: BytesN<32> =
+                match env.storage().instance().get(&DataKey::EventOrder(from - 1)) {
+                    Some(v) => v,
+                    None => return false,
+                };
             let prev_evt: Event = match env.storage().instance().get(&DataKey::EventData(prev_id)) {
                 Some(v) => v,
                 None => return false,
@@ -6313,7 +6314,11 @@ impl AuditLedger {
                 Some(v) => v,
                 None => return false,
             };
-            let evt: Event = match env.storage().instance().get(&DataKey::EventData(id.clone())) {
+            let evt: Event = match env
+                .storage()
+                .instance()
+                .get(&DataKey::EventData(id.clone()))
+            {
                 Some(v) => v,
                 None => return false,
             };
