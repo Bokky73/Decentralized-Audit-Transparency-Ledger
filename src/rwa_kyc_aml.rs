@@ -1144,6 +1144,68 @@ pub fn query_compliance_profiles_page(
 }
 
 // ---------------------------------------------------------------------------
+// Safety, RBAC, and TTL Optimization (Issues #819, #820, #821)
+// ---------------------------------------------------------------------------
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum KycAmlRole {
+    Admin = 0,
+    ComplianceOfficer = 1,
+    Auditor = 2,
+    Operator = 3,
+}
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum KycAmlError {
+    InvalidRiskScore = 1,
+    OverflowError = 2,
+    UnauthorizedRole = 3,
+    NegativeValueRejected = 4,
+}
+
+/// Enforces deterministic bounds [0, 100] and checked overflow safety.
+/// Specifically rejects any negative score input.
+pub fn validate_and_normalize_risk_score(raw_score: i64) -> Result<u32, KycAmlError> {
+    if raw_score < 0 {
+        return Err(KycAmlError::NegativeValueRejected);
+    }
+    if raw_score > 100 {
+        return Err(KycAmlError::InvalidRiskScore);
+    }
+    Ok(raw_score as u32)
+}
+
+/// Checked combination of risk factors to ensure deterministic overflow safety.
+pub fn calculate_bounded_risk_score(base: u32, penalty: u32, jurisdiction_weight: u32) -> Result<u32, KycAmlError> {
+    let intermediate = base.checked_add(penalty).ok_or(KycAmlError::OverflowError)?;
+    let total = intermediate.checked_add(jurisdiction_weight).ok_or(KycAmlError::OverflowError)?;
+    Ok(total.min(100))
+}
+
+/// Granular RBAC verification for KYC/AML operations.
+pub fn verify_role_authorization(role: KycAmlRole, caller_role: KycAmlRole) -> Result<(), KycAmlError> {
+    match (role, caller_role) {
+        (KycAmlRole::Admin, KycAmlRole::Admin) => Ok(()),
+        (KycAmlRole::ComplianceOfficer, KycAmlRole::Admin | KycAmlRole::ComplianceOfficer) => Ok(()),
+        (KycAmlRole::Operator, KycAmlRole::Admin | KycAmlRole::ComplianceOfficer | KycAmlRole::Operator) => Ok(()),
+        (KycAmlRole::Auditor, _) => Ok(()), // Read-only audit access
+        _ => Err(KycAmlError::UnauthorizedRole),
+    }
+}
+
+/// Optimizes Soroban storage rent footprint by extending persistent storage TTL dynamically.
+pub fn calculate_optimized_ttl_extension(current_ttl: u32, threshold: u32, target_ttl: u32) -> u32 {
+    if current_ttl < threshold {
+        target_ttl.saturating_sub(current_ttl)
+    } else {
+        0
+    }
+}
+
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1724,6 +1786,49 @@ mod tests {
         assert_eq!(page.total_matched, 2);
         assert_eq!(page.items.len(), 2);
         assert!(page.next_cursor.is_none());
+    }
+
+    // --- Issues #819, #820, #821, #823 & User Requirement (Test with -1) ---
+
+    #[test]
+    fn test_reject_negative_one_risk_score() {
+        // Assert -1 is explicitly rejected by bounded score validation
+        let res = validate_and_normalize_risk_score(-1);
+        assert_eq!(res, Err(KycAmlError::NegativeValueRejected));
+    }
+
+    #[test]
+    fn test_deterministic_bounds_and_overflow_safety() {
+        assert_eq!(validate_and_normalize_risk_score(0), Ok(0));
+        assert_eq!(validate_and_normalize_risk_score(50), Ok(50));
+        assert_eq!(validate_and_normalize_risk_score(100), Ok(100));
+        assert_eq!(validate_and_normalize_risk_score(101), Err(KycAmlError::InvalidRiskScore));
+        assert_eq!(validate_and_normalize_risk_score(-100), Err(KycAmlError::NegativeValueRejected));
+
+        // Overflow checks
+        assert_eq!(calculate_bounded_risk_score(u32::MAX, 1, 0), Err(KycAmlError::OverflowError));
+        assert_eq!(calculate_bounded_risk_score(30, 40, 20), Ok(90));
+        assert_eq!(calculate_bounded_risk_score(50, 40, 30), Ok(100)); // Bounded at 100
+    }
+
+    #[test]
+    fn test_granular_rbac_role_gating() {
+        assert!(verify_role_authorization(KycAmlRole::ComplianceOfficer, KycAmlRole::Admin).is_ok());
+        assert!(verify_role_authorization(KycAmlRole::ComplianceOfficer, KycAmlRole::ComplianceOfficer).is_ok());
+        assert!(verify_role_authorization(KycAmlRole::ComplianceOfficer, KycAmlRole::Operator).is_err());
+        assert!(verify_role_authorization(KycAmlRole::Admin, KycAmlRole::ComplianceOfficer).is_err());
+        assert!(verify_role_authorization(KycAmlRole::Auditor, KycAmlRole::Operator).is_ok());
+    }
+
+    #[test]
+    fn test_storage_ttl_extension_optimization() {
+        // Under threshold: extends to target
+        let ext = calculate_optimized_ttl_extension(100, 500, 2000);
+        assert_eq!(ext, 1900);
+
+        // Above threshold: no unnecessary write / zero extension
+        let ext_none = calculate_optimized_ttl_extension(600, 500, 2000);
+        assert_eq!(ext_none, 0);
     }
 }
 
